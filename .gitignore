@@ -1,0 +1,8 @@
+/target/
+*.exe
+*.pdb
+/evidence/
+.env
+library.json
+listening.json
+playback.json
