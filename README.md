@@ -1,5 +1,7 @@
 # Rust Player
 
+<img width="1120" height="680" alt="image" src="https://github.com/user-attachments/assets/e49dc84f-0464-418e-ab9a-be79d1d7a1c4" />
+
 A standalone Windows x64 audio player written in Rust with egui and Rodio. It supports local music libraries, editable playlists, album artwork, synchronized lyrics, themes, and script plugins.
 
 ## Quick start
