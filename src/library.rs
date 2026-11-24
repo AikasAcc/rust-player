@@ -152,6 +152,7 @@ impl TrackInfo {
     }
 }
 
+#[derive(Clone)]
 pub enum PlaylistRow {
     Album(String),
     Track(usize),
@@ -302,7 +303,7 @@ impl Default for Library {
                 tracks: Vec::new(),
                 pinned: false,
                 sidebar_position: None,
-                sort: Sort::Added,
+                sort: Sort::Album,
                 descending: false,
             }],
             selected: 0,

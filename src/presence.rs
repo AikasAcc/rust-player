@@ -8,6 +8,8 @@ use std::{
 };
 use windows::Win32::{Foundation::HANDLE, System::Pipes::PeekNamedPipe};
 
+const PROJECT_URL: &str = "https://github.com/AikasAcc/rust-player";
+
 pub struct Activity {
     pub title: String,
     pub artist: String,
@@ -272,6 +274,7 @@ fn payload(track: &Activity, sent_at: SystemTime, artwork: &str) -> Value {
         "details": text(&track.title),
         "state": text(if track.artist.is_empty() { "Unknown artist" } else { &track.artist }),
         "timestamps": timestamps,
+        "buttons": [{"label": "Rust Player on GitHub", "url": PROJECT_URL}],
     });
     if !artwork.is_empty() {
         let hover = if track.album.is_empty() {

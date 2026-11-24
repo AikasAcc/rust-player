@@ -132,6 +132,26 @@ impl crate::ThemeDraft {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Density {
+    Compact,
+    #[default]
+    Comfortable,
+    Relaxed,
+}
+
+impl Density {
+    pub const ALL: [Self; 3] = [Self::Compact, Self::Comfortable, Self::Relaxed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Comfortable => "Comfortable",
+            Self::Relaxed => "Relaxed",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Theme {
@@ -139,17 +159,24 @@ pub struct Theme {
     pub surface: [u8; 3],
     pub text: [u8; 3],
     pub accent: [u8; 3],
+    pub density: Density,
+    pub corner_radius: u8,
+    pub font_scale_percent: u8,
+    pub surface_strength_percent: u8,
+    pub accent_strength_percent: u8,
+    pub high_contrast: bool,
 }
 
 impl Theme {
-    pub const PRESETS: [(&'static str, Self); 5] = [
+    pub const PRESETS: [(&'static str, Self); 9] = [
         (
             "Studio",
             Self {
-                background: [25, 29, 37],
-                surface: [33, 40, 50],
-                text: [228, 233, 241],
-                accent: [81, 155, 216],
+                background: [14, 18, 27],
+                surface: [25, 31, 45],
+                text: [236, 240, 247],
+                accent: [92, 161, 255],
+                ..Self::DEFAULT_STYLE
             },
         ),
         (
@@ -159,6 +186,7 @@ impl Theme {
                 surface: [26, 30, 50],
                 text: [232, 230, 250],
                 accent: [157, 132, 248],
+                ..Self::DEFAULT_STYLE
             },
         ),
         (
@@ -168,6 +196,7 @@ impl Theme {
                 surface: [38, 38, 42],
                 text: [235, 233, 229],
                 accent: [232, 165, 87],
+                ..Self::DEFAULT_STYLE
             },
         ),
         (
@@ -177,6 +206,7 @@ impl Theme {
                 surface: [30, 46, 38],
                 text: [227, 241, 230],
                 accent: [111, 192, 157],
+                ..Self::DEFAULT_STYLE
             },
         ),
         (
@@ -186,9 +216,69 @@ impl Theme {
                 surface: [228, 234, 244],
                 text: [29, 39, 56],
                 accent: [47, 90, 168],
+                ..Self::DEFAULT_STYLE
+            },
+        ),
+        (
+            "Ocean",
+            Self {
+                background: [10, 24, 35],
+                surface: [19, 43, 58],
+                text: [229, 244, 249],
+                accent: [48, 190, 204],
+                ..Self::DEFAULT_STYLE
+            },
+        ),
+        (
+            "Rosewood",
+            Self {
+                background: [35, 19, 29],
+                surface: [55, 30, 44],
+                text: [250, 236, 241],
+                accent: [239, 112, 156],
+                ..Self::DEFAULT_STYLE
+            },
+        ),
+        (
+            "Mono",
+            Self {
+                background: [20, 21, 23],
+                surface: [33, 35, 38],
+                text: [243, 243, 243],
+                accent: [224, 224, 224],
+                density: Density::Compact,
+                corner_radius: 3,
+                high_contrast: true,
+                ..Self::DEFAULT_STYLE
+            },
+        ),
+        (
+            "Windows XP",
+            Self {
+                background: [210, 232, 255],
+                surface: [126, 184, 237],
+                text: [0, 42, 104],
+                accent: [56, 151, 56],
+                density: Density::Compact,
+                corner_radius: 6,
+                high_contrast: true,
+                ..Self::DEFAULT_STYLE
             },
         ),
     ];
+
+    const DEFAULT_STYLE: Self = Self {
+        background: [0; 3],
+        surface: [0; 3],
+        text: [0; 3],
+        accent: [0; 3],
+        density: Density::Comfortable,
+        corner_radius: 10,
+        font_scale_percent: 100,
+        surface_strength_percent: 72,
+        accent_strength_percent: 32,
+        high_contrast: false,
+    };
 
     pub fn visuals(self) -> Visuals {
         let [r, g, b] = self.background.map(u32::from);
@@ -205,31 +295,63 @@ impl Theme {
 
         visuals.panel_fill = background;
         visuals.window_fill = surface;
-        visuals.faint_bg_color = color(blend(self.background, self.surface, 0.5));
+        let surface_strength = f32::from(self.surface_strength_percent.clamp(45, 90)) / 100.0;
+        let accent_strength = f32::from(self.accent_strength_percent.clamp(15, 75)) / 100.0;
+        visuals.faint_bg_color = color(blend(self.background, self.surface, surface_strength));
         let extreme = if dark { [0; 3] } else { [255; 3] };
-        visuals.extreme_bg_color = color(blend(self.background, extreme, 0.4));
+        visuals.extreme_bg_color = color(blend(self.background, extreme, 0.24));
         visuals.code_bg_color = surface;
+        visuals.text_edit_bg_color = Some(color(blend(self.background, self.surface, 0.42)));
         visuals.override_text_color = Some(text);
         visuals.weak_text_color = Some(color(blend(self.text, self.background, 0.35)));
         visuals.hyperlink_color = accent;
-        visuals.selection.bg_fill = color(blend(self.background, self.accent, 0.40));
+        visuals.selection.bg_fill = color(blend(self.background, self.accent, accent_strength));
         visuals.selection.stroke.color = accent;
-        visuals.window_stroke.color = color(blend(self.surface, self.text, 0.2));
-        visuals.widgets.noninteractive.bg_fill = surface;
+        let corner_radius = self.corner_radius.min(24);
+        visuals.window_corner_radius = eframe::egui::CornerRadius::same(corner_radius);
+        visuals.menu_corner_radius =
+            eframe::egui::CornerRadius::same(corner_radius.saturating_sub(2));
+        visuals.window_stroke.color = color(blend(
+            self.surface,
+            self.text,
+            if self.high_contrast { 0.26 } else { 0.13 },
+        ));
+        visuals.window_stroke.width = 1.0;
+        visuals.widgets.noninteractive.bg_fill = background;
         visuals.widgets.noninteractive.fg_stroke.color = text;
-        visuals.widgets.inactive.bg_fill = surface;
-        visuals.widgets.inactive.weak_bg_fill = surface;
-        visuals.widgets.hovered.bg_fill = color(blend(self.surface, self.accent, 0.25));
+        visuals.widgets.noninteractive.corner_radius =
+            eframe::egui::CornerRadius::same(corner_radius.saturating_sub(3));
+        visuals.widgets.inactive.bg_fill =
+            color(blend(self.surface, self.background, 1.0 - surface_strength));
+        visuals.widgets.inactive.weak_bg_fill = visuals.widgets.inactive.bg_fill;
+        visuals.widgets.inactive.corner_radius =
+            eframe::egui::CornerRadius::same(corner_radius.saturating_sub(3));
+        visuals.widgets.inactive.bg_stroke.color = color(blend(
+            self.surface,
+            self.text,
+            if self.high_contrast { 0.20 } else { 0.10 },
+        ));
+        visuals.widgets.hovered.bg_fill =
+            color(blend(self.surface, self.accent, accent_strength * 0.55));
         visuals.widgets.hovered.weak_bg_fill = visuals.widgets.hovered.bg_fill;
+        visuals.widgets.hovered.corner_radius =
+            eframe::egui::CornerRadius::same(corner_radius.saturating_sub(3));
+        visuals.widgets.hovered.bg_stroke.color = color(blend(
+            self.surface,
+            self.accent,
+            if self.high_contrast { 0.72 } else { 0.50 },
+        ));
         visuals.widgets.active.bg_fill = visuals.selection.bg_fill;
         visuals.widgets.active.weak_bg_fill = visuals.widgets.active.bg_fill;
+        visuals.widgets.active.corner_radius =
+            eframe::egui::CornerRadius::same(corner_radius.saturating_sub(3));
         visuals
     }
 
     pub fn album_colors(self) -> (Color32, Color32) {
         (
-            color(blend(self.surface, self.accent, 0.14)),
-            color(blend(self.text, self.accent, 0.42)),
+            color(blend(self.surface, self.accent, 0.045)),
+            color(blend(self.text, self.accent, 0.18)),
         )
     }
 }

@@ -226,6 +226,14 @@ impl Cover {
             pixels: Arc::new(pixels),
         }
     }
+
+    pub fn pixels(&self) -> Arc<image::RgbaImage> {
+        Arc::clone(&self.pixels)
+    }
+
+    pub fn save_png(&self, path: &Path) -> image::ImageResult<()> {
+        self.pixels.save_with_format(path, ImageFormat::Png)
+    }
 }
 
 #[derive(Clone)]
