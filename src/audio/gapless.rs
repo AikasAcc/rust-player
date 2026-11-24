@@ -9,8 +9,15 @@ use super::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Next {
     pub path: PathBuf,
-    pub cursor: usize,
+    pub target: NextTarget,
     pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextTarget {
+    Playlist(usize),
+    Queue(u64, crate::Track),
+    Repeat(crate::Track),
 }
 
 pub struct Transition {

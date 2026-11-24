@@ -14,12 +14,14 @@ mod library;
 mod listening;
 mod lyrics;
 mod media_keys;
+mod play_queue;
 mod playlist_io;
 mod plugins;
 mod presence;
 mod settings;
 mod taskbar;
 mod theme;
+mod window_chrome;
 
 use eframe::egui::{self, RichText};
 use library::{Library, Media, Playlist, PlaylistRow, PlaylistView, Sort, TrackInfo, file_title};
@@ -89,6 +91,22 @@ enum ActivityTab {
     History,
     Songs,
     Artists,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectorTab {
+    Queue,
+    Track,
+}
+
+#[derive(Clone, Copy)]
+enum HeaderAction {
+    Settings,
+    Files,
+    Folder,
+    Theme,
+    Plugins,
+    Discord,
 }
 
 struct ThemeDraft {
@@ -173,6 +191,64 @@ impl SavedTrack {
     }
 }
 
+struct SearchResults {
+    list: usize,
+    query: String,
+    rows: Vec<PlaylistRow>,
+    count: usize,
+}
+
+impl SearchResults {
+    fn new(list: usize, query: &str, playlist: &Playlist, view: Option<&PlaylistView>) -> Self {
+        let needle = query.to_lowercase();
+        let mut rows = Vec::new();
+        let mut count = 0;
+        let mut indexed = 0;
+        if let Some(view) = view {
+            indexed = view.tracks.len();
+            let mut album = None;
+            for row in &view.rows {
+                match row {
+                    PlaylistRow::Album(label) => album = Some(label),
+                    PlaylistRow::Track(index) => {
+                        let track = &view.tracks[*index];
+                        if [
+                            &track.title,
+                            &track.artist,
+                            &track.album,
+                            &track.album_artist,
+                        ]
+                        .into_iter()
+                        .any(|field| field.to_lowercase().contains(&needle))
+                            || file_title(&playlist.tracks[*index])
+                                .to_lowercase()
+                                .contains(&needle)
+                        {
+                            if let Some(label) = album.take() {
+                                rows.push(PlaylistRow::Album(label.clone()));
+                            }
+                            rows.push(PlaylistRow::Track(*index));
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for (index, path) in playlist.tracks.iter().enumerate().skip(indexed) {
+            if file_title(path).to_lowercase().contains(&needle) {
+                rows.push(PlaylistRow::Track(index));
+                count += 1;
+            }
+        }
+        Self {
+            list,
+            query: query.into(),
+            rows,
+            count,
+        }
+    }
+}
+
 struct Player {
     background: background::Preview,
     setup: audio_setup::Setup,
@@ -198,16 +274,22 @@ struct Player {
     plugins: plugins::Host,
     plugins_open: bool,
     taskbar: Option<taskbar::Taskbar>,
+    window_chrome: Option<window_chrome::NativeChrome>,
     media_keys: Result<media_keys::MediaKeys, String>,
     settings_page: Option<settings::Page>,
     activity_tab: ActivityTab,
     discord_settings: bool,
     artwork_url: String,
     track_search: String,
+    search_results: Option<SearchResults>,
     rpc: presence::Presence,
     lastfm: lastfm::Client,
     order: Vec<usize>,
     cursor: usize,
+    order_list: Option<usize>,
+    queue_order_edited: bool,
+    play_queue: play_queue::PlayQueue,
+    inspector_tab: InspectorTab,
     imports: Vec<(usize, mpsc::Receiver<ImportResult>)>,
     views: HashMap<usize, PlaylistView>,
     indexing: HashMap<usize, mpsc::Receiver<Vec<TrackInfo>>>,
@@ -245,6 +327,11 @@ impl Player {
             audio_devices: None,
             audio_retry_after: None,
             gapless_generation: 0,
+            search_results: None,
+            order_list: None,
+            queue_order_edited: false,
+            play_queue: Default::default(),
+            inspector_tab: InspectorTab::Queue,
             audio_release: None,
             playing: None,
             library,
@@ -264,6 +351,7 @@ impl Player {
             plugins,
             plugins_open: false,
             taskbar: None,
+            window_chrome: None,
             media_keys: Err("Windows media session not initialized".into()),
             settings_page: None,
             activity_tab: ActivityTab::default(),
@@ -273,7 +361,7 @@ impl Player {
             rpc: presence::Presence::new(),
             lastfm,
             order: Vec::new(),
-            cursor: 0,
+            cursor: usize::MAX,
             imports: Vec::new(),
             views: HashMap::new(),
             indexing: HashMap::new(),
@@ -281,6 +369,7 @@ impl Player {
     }
 
     fn save(&mut self) {
+        self.search_results = None;
         self.volume_save_at = None;
         if self.library_needs_backup {
             match Library::back_up_invalid_file(&self.library_path) {
@@ -378,20 +467,26 @@ impl Player {
     }
 
     fn remap_playback(&mut self, saved: Option<SavedTrack>, map: impl Fn(Track) -> Option<Track>) {
+        self.play_queue.remap(&map);
+        if let Some(list) = self.order_list {
+            let mut order = Vec::with_capacity(self.order.len());
+            let mut cursor = 0;
+            let mut new_list = None;
+            for (position, &index) in self.order.iter().enumerate() {
+                if let Some((list, index)) = map((list, index)) {
+                    new_list = Some(list);
+                    order.push(index);
+                    cursor += usize::from(self.cursor != usize::MAX && position <= self.cursor);
+                }
+            }
+            self.order = order;
+            self.order_list = new_list;
+            self.cursor = cursor.wrapping_sub(1);
+        }
         if let Some(playing) = &mut self.playing {
             let old = playing.track;
             if let Some(new) = map(old) {
                 playing.track = new;
-                self.order = self
-                    .order
-                    .iter()
-                    .filter_map(|&index| map((old.0, index)).map(|track| track.1))
-                    .collect();
-                self.cursor = self
-                    .order
-                    .iter()
-                    .position(|&index| index == new.1)
-                    .unwrap_or(0);
                 let position = playing.sink.get_pos();
                 self.save_playback(position);
                 return;
@@ -399,8 +494,7 @@ impl Player {
             self.observe_lastfm();
             self.lastfm.track_changed();
             self.playing = None;
-            self.order.clear();
-            self.cursor = 0;
+            self.clear_order();
             self.sync_presence();
             self.write_playback(None);
         } else if let Some(mut saved) = saved {
@@ -656,12 +750,7 @@ impl Player {
             }
         });
         if matches!(edit, TrackEdit::Move(_)) && !self.library.shuffle {
-            if let Some(track) = self
-                .playing
-                .as_ref()
-                .map(|playing| playing.track)
-                .filter(|track| track.0 == list)
-            {
+            if let Some(track) = self.order_track().filter(|track| track.0 == list) {
                 self.plan(track);
             }
         }
@@ -840,11 +929,7 @@ impl Player {
                     let playlist = &mut self.library.playlists[list];
                     let first_new = playlist.tracks.len();
                     playlist.tracks.extend(tracks);
-                    if self
-                        .playing
-                        .as_ref()
-                        .is_some_and(|playing| playing.track.0 == list)
-                    {
+                    if self.order_list == Some(list) {
                         let mut extra: Vec<_> = (first_new..playlist.tracks.len()).collect();
                         if self.library.shuffle {
                             extra.shuffle(&mut rand::rng());
@@ -870,6 +955,8 @@ impl Player {
     }
 
     fn plan(&mut self, (list, index): Track) {
+        self.queue_order_edited = false;
+        self.order_list = Some(list);
         let len = self.library.playlists[list].tracks.len();
         self.order.clear();
         if self.library.shuffle {
@@ -928,10 +1015,15 @@ impl Player {
             Err(mpsc::TryRecvError::Disconnected) => false,
             Err(mpsc::TryRecvError::Empty) => true,
         });
-        if let Some(playing) = &self.playing {
-            if !self.library.shuffle && changed.contains(&playing.track.0) {
-                self.plan(playing.track);
-            }
+        if !changed.is_empty() {
+            self.search_results = None;
+        }
+        if let Some(track) = self.order_track()
+            && !self.queue_order_edited
+            && !self.library.shuffle
+            && changed.contains(&track.0)
+        {
+            self.plan(track);
         }
     }
 
@@ -1174,14 +1266,31 @@ impl Player {
     }
 
     fn step(&mut self, offset: isize, ctx: &egui::Context) {
-        let Some(list) = self.playing.as_ref().map(|p| p.track.0) else {
+        let failed = if offset > 0 {
+            match self.play_next_queued(ctx) {
+                Ok(()) => return,
+                Err(warning) => warning,
+            }
+        } else {
+            None
+        };
+        self.step_playlist(offset, ctx, failed);
+    }
+
+    fn step_playlist(&mut self, offset: isize, ctx: &egui::Context, mut failed: Option<String>) {
+        let Some(list) = self.order_list else {
+            if let Some(warning) = failed {
+                self.status = warning;
+            }
+            if self.playing.as_ref().is_some_and(|p| p.sink.empty()) {
+                self.stop();
+            }
             return;
         };
-        let Some(mut cursor) = self.cursor.checked_add_signed(offset) else {
-            return;
-        };
-        let mut failed = None;
-        while let Some(&track) = self.order.get(cursor) {
+        let mut candidate = self.adjacent_cursor(offset);
+        while let Some(cursor) = candidate
+            && let Some(&track) = self.order.get(cursor)
+        {
             match self.open((list, track), ctx, None) {
                 Ok(()) => {
                     self.cursor = cursor;
@@ -1196,13 +1305,15 @@ impl Player {
                     failed = Some(self.status.clone());
                 }
             }
-            let Some(next) = cursor.checked_add_signed(offset) else {
-                break;
-            };
-            cursor = next;
+            candidate = cursor.checked_add_signed(offset);
         }
         if self.playing.as_ref().is_some_and(|p| p.sink.empty()) {
+            if let Some(warning) = failed {
+                self.status = warning;
+            }
             self.stop();
+        } else if let Some(warning) = failed {
+            self.status = warning;
         }
     }
 
@@ -1218,7 +1329,21 @@ impl Player {
         if self.previous_restarts_track() && self.seek(Duration::ZERO, ctx) {
             return;
         }
-        self.step(-1, ctx);
+        if let Some(anchor) = self.order_track()
+            && self.playing.as_ref().is_some_and(|p| p.track != anchor)
+        {
+            match self.open(anchor, ctx, None) {
+                Ok(()) => {
+                    self.status.clear();
+                    self.save_playback(Duration::ZERO);
+                    self.sync_presence();
+                    self.refresh_gapless();
+                }
+                Err(error) => self.status = format!("Could not play previous track: {error}"),
+            }
+        } else {
+            self.step(-1, ctx);
+        }
     }
 
     fn seek(&mut self, target: Duration, ctx: &egui::Context) -> bool {
@@ -1249,6 +1374,10 @@ impl Player {
             self.record_play();
             self.sync_presence();
         } else {
+            let warning = match self.play_next_queued(ctx) {
+                Ok(()) => return,
+                Err(warning) => warning,
+            };
             let list = self.library.selected;
             let len = self.library.playlists[list].tracks.len();
             if len > 0 {
@@ -1262,6 +1391,9 @@ impl Player {
                 };
                 self.start((list, index), ctx);
             }
+            if let Some(warning) = warning {
+                self.status = warning;
+            }
         }
     }
 
@@ -1270,6 +1402,7 @@ impl Player {
         self.lastfm.track_changed();
         self.save_playback(Duration::ZERO);
         self.playing = None;
+        self.clear_order();
         self.sync_presence();
     }
 
@@ -1282,8 +1415,8 @@ impl Player {
 
     fn toggle_shuffle(&mut self) {
         self.library.shuffle = !self.library.shuffle;
-        if let Some(playing) = &self.playing {
-            self.plan(playing.track);
+        if let Some(track) = self.order_track() {
+            self.plan(track);
         }
         self.save();
     }
@@ -1291,13 +1424,19 @@ impl Player {
     fn taskbar_buttons(&self) -> taskbar::Buttons {
         let loaded = self.playing.is_some();
         taskbar::Buttons {
-            previous: (loaded && self.cursor > 0) || self.previous_restarts_track(),
+            previous: (loaded
+                && (self.adjacent_cursor(-1).is_some()
+                    || self.order_track().is_some_and(|anchor| {
+                        self.playing.as_ref().is_some_and(|p| p.track != anchor)
+                    })))
+                || self.previous_restarts_track(),
             can_play: loaded
+                || !self.play_queue.is_empty()
                 || !self.library.playlists[self.library.selected]
                     .tracks
                     .is_empty(),
             playing: self.playing.as_ref().is_some_and(|p| !p.sink.is_paused()),
-            next: loaded && self.cursor + 1 < self.order.len(),
+            next: !self.play_queue.is_empty() || (loaded && self.adjacent_cursor(1).is_some()),
             shuffle: self.library.shuffle,
         }
     }
@@ -1338,27 +1477,60 @@ impl Player {
     fn transport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let active = self.playing.is_some();
         let paused = self.playing.as_ref().is_some_and(|p| p.sink.is_paused());
-        ui.horizontal_wrapped(|ui| {
-            ui.scope(|ui| {
+        let center_width = (ui.available_width() - 324.0).clamp(245.0, 440.0);
+        let [mut track_ui, mut transport_ui, mut volume_ui] = desk_sections(ui, 56.0, center_width);
+        track_ui.horizontal_centered(|ui| {
+            if let Some(cover) = self.playing.as_ref().and_then(Playing::cover) {
+                let size = cover.texture.size_vec2();
+                ui.add(egui::Image::new((
+                    cover.texture.id(),
+                    size * (35.0 / size.x.max(size.y)),
+                )));
+            }
+            let label_width = (ui.available_width() - 32.0).max(35.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(label_width, 34.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_max_width(label_width);
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    if let Some(playing) = &self.playing {
+                        ui.add(
+                            egui::Label::new(RichText::new(&playing.media.title).strong())
+                                .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(RichText::new(&playing.media.artist).weak().small())
+                                .truncate(),
+                        );
+                    } else {
+                        ui.weak("Nothing playing");
+                    }
+                },
+            );
+            if ui
+                .add_enabled(
+                    active,
+                    egui::Button::new(if self.current_is_favorite() {
+                        "♥"
+                    } else {
+                        "♡"
+                    })
+                    .frame(false),
+                )
+                .on_hover_text("Toggle favorite")
+                .clicked()
+            {
+                self.toggle_favorite();
+            }
+        });
+        transport_ui.vertical_centered(|ui| {
+            ui.horizontal(|ui| {
+                // Equal gutters keep the central play/pause control above the timeline.
+                ui.add_space((ui.available_width() - 158.0).max(0.0) * 0.5);
                 ui.spacing_mut().item_spacing.x = 2.0;
                 if icon(ui, Icon::Stop, "Stop", active, false) {
                     self.stop();
-                }
-                if icon(
-                    ui,
-                    Icon::Play,
-                    "Play",
-                    paused
-                        || (!active
-                            && !self.library.playlists[self.library.selected]
-                                .tracks
-                                .is_empty()),
-                    false,
-                ) {
-                    self.resume(ctx);
-                }
-                if icon(ui, Icon::Pause, "Pause", active && !paused, false) {
-                    self.pause();
                 }
                 if icon(
                     ui,
@@ -1369,11 +1541,25 @@ impl Player {
                 ) {
                     self.previous(ctx);
                 }
+                let show_pause = active && !paused;
+                if icon(
+                    ui,
+                    if show_pause { Icon::Pause } else { Icon::Play },
+                    if show_pause { "Pause" } else { "Play" },
+                    self.taskbar_buttons().can_play,
+                    false,
+                ) {
+                    if show_pause {
+                        self.pause();
+                    } else {
+                        self.resume(ctx);
+                    }
+                }
                 if icon(
                     ui,
                     Icon::Next,
                     "Next track",
-                    self.playing.is_some() && self.cursor + 1 < self.order.len(),
+                    self.taskbar_buttons().next,
                     false,
                 ) {
                     self.step(1, ctx);
@@ -1382,54 +1568,98 @@ impl Player {
                     self.toggle_shuffle();
                 }
             });
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
+            if let Some(playing) = &self.playing {
+                let elapsed = playing.sink.get_pos();
+                if let Some(duration) = playing.duration.filter(|d| !d.is_zero()) {
+                    let target = ui
+                        .push_id(("seek", playing.track), |ui| {
+                            seek_bar(ui, elapsed, duration)
+                        })
+                        .inner;
+                    if let Some(target) = target {
+                        self.seek(target, ctx);
+                    }
+                } else {
+                    ui.weak(time(elapsed));
+                }
+            }
+        });
+        volume_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let volume = ui
                 .add_enabled_ui(self.software_volume_available(), |ui| {
-                    volume_slider(ui, &mut self.library.volume)
+                    desk_volume(ui, &mut self.library.volume)
                 })
                 .inner;
             if volume.changed() {
                 self.volume_adjusted();
             }
-            let starred = self.playing.as_ref().is_some_and(|playing| {
-                let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
-                self.library
-                    .favorites
-                    .is_some_and(|index| self.library.playlists[index].tracks.contains(path))
-            });
-            let label = if starred {
-                "Remove from Favorites"
-            } else {
-                "Add to Favorites"
-            };
-            if ui
-                .add_enabled(
-                    self.playing.is_some(),
-                    egui::Button::new(if starred { "♥" } else { "♡" })
-                        .min_size(egui::vec2(34.0, 30.0)),
-                )
-                .on_hover_text(label)
-                .clicked()
-            {
-                self.toggle_favorite();
-            }
         });
-        if let Some(playing) = &self.playing {
-            let elapsed = playing.sink.get_pos();
-            if let Some(duration) = playing.duration.filter(|d| !d.is_zero()) {
-                let target = ui
-                    .push_id(("seek", playing.track), |ui| {
-                        seek_bar(ui, elapsed, duration)
-                    })
-                    .inner;
-                if let Some(target) = target {
-                    self.seek(target, ctx);
-                }
-            } else {
-                ui.label(time(elapsed));
+    }
+
+    fn current_is_favorite(&self) -> bool {
+        self.playing.as_ref().is_some_and(|playing| {
+            let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
+            self.library
+                .favorites
+                .is_some_and(|index| self.library.playlists[index].tracks.contains(path))
+        })
+    }
+
+    fn header_actions(&mut self, ui: &mut egui::Ui) {
+        use HeaderAction::*;
+        const ADD: &[(&str, HeaderAction)] = &[("Audio files", Files), ("Folder", Folder)];
+        const TOOLS: &[(&str, HeaderAction)] = &[
+            ("Theme editor", Theme),
+            ("Plugins", Plugins),
+            ("Discord", Discord),
+        ];
+        let mut selection = None;
+        if ui.available_width() >= 185.0 {
+            if ui.button("Settings").clicked() {
+                selection = Some(Settings);
             }
+            for (name, items) in [("Add…", ADD), ("Tools", TOOLS)] {
+                ui.menu_button(name, |ui| {
+                    for &(label, action) in items {
+                        if ui.button(label).clicked() {
+                            selection = Some(action);
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        } else {
+            ui.menu_button("Menu", |ui| {
+                for &(label, action) in [("Settings", Settings)].iter().chain(ADD).chain(TOOLS) {
+                    if ui.button(label).clicked() {
+                        selection = Some(action);
+                        ui.close();
+                    }
+                }
+            });
+        }
+        match selection {
+            Some(Settings) => {
+                self.settings_page
+                    .get_or_insert_with(settings::Page::default);
+            }
+            Some(Files) => {
+                if let Some(files) = rfd::FileDialog::new()
+                    .add_filter("Audio and CUE sheets", library::AUDIO)
+                    .pick_files()
+                {
+                    self.import(files, ui.ctx());
+                }
+            }
+            Some(Folder) => {
+                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                    self.import(vec![folder], ui.ctx());
+                }
+            }
+            Some(Theme) => self.open_theme_editor(),
+            Some(Plugins) => self.plugins_open = true,
+            Some(Discord) => self.discord_settings = true,
+            None => {}
         }
     }
 
@@ -1585,154 +1815,133 @@ impl Player {
             });
     }
 
-    fn theme_editor(&mut self, ctx: &egui::Context) {
+    fn theme_editor(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         let Some(mut draft) = self.theme_draft.take() else {
             return;
         };
         let previous = draft.theme;
-        let mut open = true;
-        let mut apply = false;
-        let mut cancel = false;
-        egui::Window::new("Theme Editor")
-            .open(&mut open)
-            .collapsible(false)
-            .default_width(440.0)
-            .show(ctx, |ui| {
-                let max_height = (ctx.content_rect().height() * 0.70).clamp(180.0, 560.0);
-                egui::ScrollArea::vertical()
-                    .max_height(max_height)
-                    .show(ui, |ui| {
-                        draft.saved_theme_settings(ui);
-                        ui.separator();
-                        let name = theme::Theme::PRESETS
-                            .iter()
-                            .find(|(_, preset)| *preset == draft.theme)
-                            .map_or("Custom", |(name, _)| *name);
-                        egui::ComboBox::from_label("Preset")
-                            .selected_text(name)
-                            .show_ui(ui, |ui| {
-                                for (name, preset) in theme::Theme::PRESETS {
-                                    ui.selectable_value(&mut draft.theme, preset, name);
-                                }
-                            });
-                        ui.separator();
-                        ui.group(|ui| {
-                            ui.strong("Colors");
-                            ui.weak("Tune the overall palette. Changes preview immediately.");
-                            egui::Grid::new("theme colors")
-                                .spacing([20.0, 8.0])
-                                .show(ui, |ui| {
-                                    for (label, color) in [
-                                        ("Background", &mut draft.theme.background),
-                                        ("Panels and buttons", &mut draft.theme.surface),
-                                        ("Text", &mut draft.theme.text),
-                                        ("Accent", &mut draft.theme.accent),
-                                    ] {
-                                        ui.label(label);
-                                        ui.color_edit_button_srgb(color);
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                        ui.separator();
-                        ui.group(|ui| {
-                            ui.strong("Layout");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Density");
-                                for density in theme::Density::ALL {
-                                    ui.selectable_value(
-                                        &mut draft.theme.density,
-                                        density,
-                                        density.label(),
-                                    );
-                                }
-                            });
-                            ui.add(
-                                egui::Slider::new(&mut draft.theme.corner_radius, 0..=20)
-                                    .text("Corner roundness"),
-                            );
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut draft.theme.surface_strength_percent,
-                                    45..=90,
-                                )
-                                .text("Panel contrast")
-                                .suffix("%"),
-                            );
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut draft.theme.accent_strength_percent,
-                                    15..=75,
-                                )
-                                .text("Highlight strength")
-                                .suffix("%"),
-                            );
-                            ui.checkbox(&mut draft.theme.high_contrast, "Increase border contrast")
-                                .on_hover_text("Makes panel and button boundaries more visible.");
-                        });
-                        ui.separator();
-                        ui.group(|ui| {
-                            ui.strong("Typography");
-                            ui.add(
-                                egui::Slider::new(&mut draft.theme.font_scale_percent, 85..=135)
-                                    .text("Text size")
-                                    .suffix("%"),
-                            );
-                            let font = draft
-                                .font
-                                .as_ref()
-                                .and_then(|path| path.file_name())
-                                .map(|name| name.to_string_lossy())
-                                .unwrap_or_else(|| "Default font".into());
-                            ui.label(format!("Font: {font}"));
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("Choose font…").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("Fonts", &["ttf", "otf"])
-                                        .pick_file()
-                                    {
-                                        match fonts::load(Some(&path)) {
-                                            Ok(fonts) => {
-                                                ctx.set_fonts(fonts);
-                                                draft.font = Some(path);
-                                                draft.font_error.clear();
-                                            }
-                                            Err(error) => {
-                                                draft.font_error =
-                                                    format!("Could not load font: {error}")
-                                            }
-                                        }
-                                    }
-                                }
-                                if ui.button("Use default font").clicked() {
-                                    ctx.set_fonts(egui::FontDefinitions::default());
-                                    draft.font = None;
-                                    draft.font_error.clear();
-                                }
-                            });
-                            if !draft.font_error.is_empty() {
-                                ui.label(&draft.font_error);
-                            }
-                        });
-                        ui.separator();
-                        ui.group(|ui| {
-                            ui.strong("Background");
-                            ui.weak(
-                                "Use a wallpaper or let the current album artwork set the mood.",
-                            );
-                            draft.background.settings(
-                                ui,
-                                &mut draft.copy_background,
-                                self.background.status(),
-                            );
-                        });
+        let max_height = (ctx.content_rect().height() - 155.0).clamp(100.0, 520.0);
+        egui::ScrollArea::vertical()
+            .id_salt("appearance settings")
+            .max_height(max_height)
+            .show(ui, |ui| {
+                draft.saved_theme_settings(ui);
+                ui.separator();
+                let name = theme::Theme::PRESETS
+                    .iter()
+                    .find(|(_, preset)| *preset == draft.theme)
+                    .map_or("Custom", |(name, _)| *name);
+                egui::ComboBox::from_label("Preset")
+                    .selected_text(name)
+                    .show_ui(ui, |ui| {
+                        for (name, preset) in theme::Theme::PRESETS {
+                            ui.selectable_value(&mut draft.theme, preset, name);
+                        }
                     });
                 ui.separator();
-                ui.horizontal(|ui| {
-                    apply = ui.button("Apply").clicked();
-                    cancel = ui.button("Cancel").clicked();
+                ui.group(|ui| {
+                    ui.strong("Colors");
+                    ui.weak("Tune the overall palette. Changes preview immediately.");
+                    egui::Grid::new("theme colors")
+                        .spacing([20.0, 8.0])
+                        .show(ui, |ui| {
+                            for (label, color) in [
+                                ("Background", &mut draft.theme.background),
+                                ("Panels and buttons", &mut draft.theme.surface),
+                                ("Text", &mut draft.theme.text),
+                                ("Accent", &mut draft.theme.accent),
+                            ] {
+                                ui.label(label);
+                                ui.color_edit_button_srgb(color);
+                                ui.end_row();
+                            }
+                        });
+                });
+                ui.separator();
+                ui.group(|ui| {
+                    ui.strong("Layout");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Density");
+                        for density in theme::Density::ALL {
+                            ui.selectable_value(&mut draft.theme.density, density, density.label());
+                        }
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut draft.theme.corner_radius, 0..=20)
+                            .text("Corner roundness"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut draft.theme.surface_strength_percent, 45..=90)
+                            .text("Panel contrast")
+                            .suffix("%"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut draft.theme.accent_strength_percent, 15..=75)
+                            .text("Highlight strength")
+                            .suffix("%"),
+                    );
+                    ui.checkbox(&mut draft.theme.high_contrast, "Increase border contrast")
+                        .on_hover_text("Makes panel and button boundaries more visible.");
+                });
+                ui.separator();
+                ui.group(|ui| {
+                    ui.strong("Typography");
+                    ui.add(
+                        egui::Slider::new(&mut draft.theme.font_scale_percent, 85..=135)
+                            .text("Text size")
+                            .suffix("%"),
+                    );
+                    let font = draft
+                        .font
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_else(|| "Default font".into());
+                    ui.label(format!("Font: {font}"));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Choose font…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Fonts", &["ttf", "otf"])
+                                .pick_file()
+                            {
+                                match fonts::load(Some(&path)) {
+                                    Ok(fonts) => {
+                                        ctx.set_fonts(fonts);
+                                        draft.font = Some(path);
+                                        draft.font_error.clear();
+                                    }
+                                    Err(error) => {
+                                        draft.font_error = format!("Could not load font: {error}")
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("Use default font").clicked() {
+                            ctx.set_fonts(fonts::defaults());
+                            draft.font = None;
+                            draft.font_error.clear();
+                        }
+                    });
+                    if !draft.font_error.is_empty() {
+                        ui.label(&draft.font_error);
+                    }
+                });
+                ui.separator();
+                ui.group(|ui| {
+                    ui.strong("Background");
+                    ui.weak("Use a wallpaper or let the current album artwork set the mood.");
+                    draft.background.settings(
+                        ui,
+                        &mut draft.copy_background,
+                        self.background.status(),
+                    );
                 });
             });
+        ui.separator();
+        let (apply, cancel) = ui
+            .horizontal(|ui| (ui.button("Apply").clicked(), ui.button("Cancel").clicked()))
+            .inner;
         if apply {
             if draft.copy_background
                 && draft.background.uses_file()
@@ -1760,19 +1969,28 @@ impl Player {
             self.library.named_themes = std::mem::take(&mut draft.themes);
             self.save();
         }
-        if !open || apply || cancel {
-            if !apply && draft.font != self.library.font {
-                ctx.set_fonts(fonts::load(self.library.font.as_deref()).unwrap_or_default());
-            }
-            apply_ui_chrome(ctx, self.library.theme);
+        if apply {
+            apply_ui_chrome(&ctx, self.library.theme);
             ctx.request_repaint();
+        } else if cancel {
+            self.restore_applied_theme(&ctx, &draft);
         } else {
             if draft.theme != previous {
-                apply_ui_chrome(ctx, draft.theme);
+                apply_ui_chrome(&ctx, draft.theme);
                 ctx.request_repaint();
             }
             self.theme_draft = Some(draft);
         }
+    }
+
+    fn restore_applied_theme(&self, ctx: &egui::Context, draft: &ThemeDraft) {
+        if draft.font != self.library.font {
+            ctx.set_fonts(
+                fonts::load(self.library.font.as_deref()).unwrap_or_else(|_| fonts::defaults()),
+            );
+        }
+        apply_ui_chrome(ctx, self.library.theme);
+        ctx.request_repaint();
     }
 
     fn plugin_manager(&mut self, ctx: &egui::Context) {
@@ -1885,7 +2103,9 @@ impl eframe::App for Player {
                 .filter_map(|file| file.path.clone())
                 .collect()
         });
-        if let Some(draft) = &mut self.theme_draft {
+        if self.settings_page == Some(settings::Page::Appearance)
+            && let Some(draft) = &mut self.theme_draft
+        {
             dropped.retain(|path| {
                 if !background::supported(path) {
                     return true;
@@ -1914,65 +2134,116 @@ impl eframe::App for Player {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
+        let focus_search =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::K));
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(5.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(RichText::new("Rust Player").size(16.0));
-                ui.weak("Local library");
-                ui.add_space(6.0);
-                if ui
-                    .add(egui::Button::new("Add files").min_size(egui::vec2(78.0, 27.0)))
-                    .clicked()
-                {
-                    if let Some(files) = rfd::FileDialog::new()
-                        .add_filter("Audio and CUE sheets", library::AUDIO)
-                        .pick_files()
-                    {
-                        self.import(files, ctx);
-                    }
-                }
-                if ui
-                    .add(egui::Button::new("Add folder").min_size(egui::vec2(84.0, 27.0)))
-                    .clicked()
-                {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        self.import(vec![folder], ctx);
-                    }
-                }
+            let [mut brand, mut search_ui, mut actions] = desk_sections(ui, 48.0, 244.0);
+            if let Some(chrome) = &self.window_chrome {
+                chrome.set_caption(brand.max_rect(), ctx.pixels_per_point());
+            } else {
+                window_chrome::title_drag(&brand, brand.max_rect());
+            }
+            brand.horizontal_centered(|ui| {
+                let (mark, family) = fonts::brand_mark();
+                ui.label(
+                    RichText::new(mark)
+                        .font(egui::FontId::new(18.0, family))
+                        .color(ui.visuals().selection.stroke.color),
+                );
+                ui.strong("Rust Player");
+            });
+            search_ui.horizontal_centered(|ui| {
+                egui::Frame::new()
+                    .fill(ui.visuals().window_fill)
+                    .stroke(ui.visuals().window_stroke)
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin::symmetric(7, 2))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            let center = rect.center() - egui::vec2(1.0, 1.0);
+                            let stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
+                            ui.painter().circle_stroke(center, 4.0, stroke);
+                            ui.painter().line_segment(
+                                [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
+                                stroke,
+                            );
+                            let search = ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.track_search)
+                                        .frame(false)
+                                        .desired_width(142.0)
+                                        .hint_text("Search playlist"),
+                                )
+                                .on_hover_text(
+                                    "Search titles, artists, albums and file names (Ctrl+K)",
+                                );
+                            if focus_search {
+                                search.request_focus();
+                            }
+                            if self.track_search.is_empty() {
+                                ui.label(RichText::new("Ctrl K").small().weak());
+                            } else if ui.small_button("×").on_hover_text("Clear search").clicked()
+                            {
+                                self.track_search.clear();
+                            }
+                        });
+                    });
+            });
+            actions.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                window_chrome::buttons(ui);
                 ui.separator();
-                if ui.button("Discord").clicked() {
-                    self.discord_settings = true;
-                }
-                if ui.button("Theme").clicked() {
-                    self.open_theme_editor();
-                }
-                if ui.button("Plugins").clicked() {
-                    self.plugins_open = true;
-                }
-                if ui.button("Settings").clicked() {
-                    self.settings_page
-                        .get_or_insert_with(settings::Page::default);
+                self.header_actions(ui);
+            });
+        });
+
+        egui::TopBottomPanel::bottom("transport")
+            .frame(desk_surface(&ctx.style().visuals))
+            .show(ctx, |ui| {
+                self.transport(ui, ctx);
+                if !self.status.is_empty() {
+                    ui.weak(&self.status);
                 }
             });
-            ui.add_space(5.0);
-        });
 
-        egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
-            ui.add_space(6.0);
-            self.transport(ui, ctx);
-            if !self.status.is_empty() {
-                ui.label(&self.status);
-            }
-            ui.add_space(6.0);
-        });
-
+        let mut requested_sort = None;
         egui::SidePanel::left("playlists")
-            .default_width(210.0)
-            .min_width(175.0)
+            .default_width(147.0)
+            .min_width(125.0)
+            .frame(desk_surface(&ctx.style().visuals))
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                ui.add_space(12.0);
+                ui.label(RichText::new("LIBRARY").strong().small().weak());
+                let by_album = self.library.playlists[self.library.selected].sort == Sort::Album;
+                if ui
+                    .selectable_label(!by_album, "♫  Tracks")
+                    .on_hover_text("Show this playlist sorted by track title")
+                    .clicked()
+                {
+                    requested_sort = Some(Sort::Title);
+                }
+                if ui
+                    .selectable_label(by_album, "◎  Albums")
+                    .on_hover_text("Show this playlist grouped by album")
+                    .clicked()
+                {
+                    requested_sort = Some(Sort::Album);
+                }
+                if ui
+                    .add_enabled(
+                        self.library.favorites.is_some(),
+                        egui::Button::selectable(false, "♡  Favorites"),
+                    )
+                    .clicked()
+                    && let Some(index) = self.library.favorites
+                {
+                    self.library.selected = index;
+                    self.save();
+                }
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("PLAYLISTS").strong().size(12.0));
+                    ui.label(RichText::new("PLAYLISTS").strong().small().weak());
                     if ui.button("+").on_hover_text("New playlist").clicked() {
                         self.playlist_dialog = Some(PlaylistDialog::Name {
                             target: None,
@@ -1981,22 +2252,24 @@ impl eframe::App for Player {
                     }
                 });
                 let mut selected = self.library.selected;
-                egui::Frame::new()
-                    .fill(ui.visuals().widgets.inactive.weak_bg_fill)
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(7, 5))
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.button("Import…").clicked() {
-                                self.import_playlists();
-                                selected = self.library.selected;
-                            }
-                            if ui.button("Listening activity").clicked() {
-                                self.activity_open = true;
-                            }
-                        });
-                    });
-                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .small_button("Import…")
+                        .on_hover_text("Import playlists")
+                        .clicked()
+                    {
+                        self.import_playlists();
+                        selected = self.library.selected;
+                    }
+                    if ui
+                        .small_button("Activity")
+                        .on_hover_text("Listening history and statistics")
+                        .clicked()
+                    {
+                        self.activity_open = true;
+                    }
+                });
+                ui.separator();
                 let mut action = None;
                 let mut reorder = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2037,10 +2310,13 @@ impl eframe::App for Player {
                                 } else {
                                     egui::Sense::click_and_drag()
                                 };
-                                ui.add(
+                                ui.add_sized(
+                                    [ui.available_width(), ui.spacing().interact_size.y],
                                     egui::Button::selectable(selected == index, &list.name)
+                                        .wrap_mode(egui::TextWrapMode::Truncate)
                                         .sense(sense),
                                 )
+                                .on_hover_text(&list.name)
                                 .union(gutter)
                             })
                             .inner;
@@ -2109,45 +2385,60 @@ impl eframe::App for Player {
 
         let mut cover_open = None;
         egui::SidePanel::right("now_playing")
-            .default_width(290.0)
-            .min_width(220.0)
+            .default_width(235.0)
+            .min_width(185.0)
+            .frame(desk_surface(&ctx.style().visuals))
             .show(ctx, |ui| {
-                ui.heading("Now playing");
-                self.online_lyrics_setting(ui);
-                let mut search = false;
-                let mut save = false;
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (tab, label) in [
+                        (InspectorTab::Queue, "Queue"),
+                        (InspectorTab::Track, "Track"),
+                    ] {
+                        let caption = if tab == InspectorTab::Queue && self.queue_count() > 0 {
+                            format!("Queue {}", self.queue_count())
+                        } else {
+                            label.to_owned()
+                        };
+                        ui.selectable_value(&mut self.inspector_tab, tab, caption);
+                    }
+                });
+                ui.separator();
+                if self.inspector_tab == InspectorTab::Queue {
+                    self.queue_panel(ui);
+                    return;
+                }
                 if let Some(playing) = &self.playing {
+                    let cover_edge = ui
+                        .available_width()
+                        .min(ui.available_height() * 0.48)
+                        .clamp(1.0, 300.0);
                     egui::Frame::new()
                         .fill(ui.visuals().faint_bg_color)
-                        .corner_radius(12)
-                        .inner_margin(egui::Margin::same(10))
+                        .corner_radius(5)
+                        .inner_margin(egui::Margin::same(8))
                         .show(ui, |ui| {
-                            if let Some(cover) = playing.cover() {
-                                let cover = &cover.texture;
-                                let size = cover.size_vec2();
+                            let cover_edge = cover_edge.min(ui.available_width());
+                            if let Some(artwork) = playing.cover() {
+                                let size = artwork.texture.size_vec2();
                                 let response = ui.add(
                                     egui::Image::new((
-                                        cover.id(),
-                                        size * (ui
-                                            .available_width()
-                                            .min(ui.available_height() * 0.48)
-                                            .min(380.0)
-                                            / size.x.max(size.y)),
+                                        artwork.texture.id(),
+                                        size * (cover_edge / size.x.max(size.y)),
                                     ))
                                     .sense(egui::Sense::click()),
                                 );
                                 if response.double_clicked() {
                                     cover_open = Some((
-                                        playing.cover().expect("visible cover").pixels(),
+                                        artwork.pixels(),
                                         playing.media.title.clone(),
                                         playing.media.artist.clone(),
                                     ));
                                 }
                                 response.on_hover_text("Double-click to open artwork");
                             } else {
-                                let edge = ui.available_width().min(380.0);
                                 ui.allocate_ui_with_layout(
-                                    egui::vec2(edge, edge),
+                                    egui::vec2(cover_edge, cover_edge),
                                     egui::Layout::top_down(egui::Align::Center)
                                         .with_main_justify(true),
                                     |ui| ui.weak("No cover artwork"),
@@ -2162,29 +2453,15 @@ impl eframe::App for Player {
                                 ui.weak(&playing.media.album);
                             }
                         });
-                    if (0..self.library.plugins.len())
-                        .any(|index| !self.plugins.output(index).is_empty())
-                    {
-                        egui::CollapsingHeader::new("Plugin details")
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt("plugin output")
-                                    .max_height(85.0)
-                                    .show(ui, |ui| {
-                                        for (index, plugin) in
-                                            self.library.plugins.iter().enumerate()
-                                        {
-                                            let output = self.plugins.output(index);
-                                            if !output.is_empty() {
-                                                ui.label(output).on_hover_text(plugin.name());
-                                            }
-                                        }
-                                    });
-                            });
-                    }
+                }
+                let mut search = false;
+                let mut save = false;
+                if self.playing.is_some() {
                     ui.separator();
                     ui.heading("Lyrics");
+                    self.online_lyrics_setting(ui);
+                }
+                if let Some(playing) = &self.playing {
                     ui.horizontal_wrapped(|ui| {
                         search = ui
                             .add_enabled(
@@ -2236,6 +2513,18 @@ impl eframe::App for Player {
                             } else {
                                 ui.label(&playing.media.lyrics);
                             }
+                            if (0..self.library.plugins.len())
+                                .any(|index| !self.plugins.output(index).is_empty())
+                            {
+                                egui::CollapsingHeader::new("Plugin details").show(ui, |ui| {
+                                    for (index, plugin) in self.library.plugins.iter().enumerate() {
+                                        let output = self.plugins.output(index);
+                                        if !output.is_empty() {
+                                            ui.label(output).on_hover_text(plugin.name());
+                                        }
+                                    }
+                                });
+                            }
                         });
                 } else {
                     ui.weak("Nothing playing");
@@ -2266,28 +2555,46 @@ impl eframe::App for Player {
             let list = self.library.selected;
             let playlist = &mut self.library.playlists[list];
             let old_sort = (playlist.sort, playlist.descending);
-            ui.horizontal_wrapped(|ui| {
-                egui::ComboBox::from_label("Sort by")
-                    .selected_text(playlist.sort.label())
-                    .show_ui(ui, |ui| {
-                        for sort in [
-                            Sort::Added,
-                            Sort::Title,
-                            Sort::Artist,
-                            Sort::Album,
-                            Sort::Duration,
-                        ] {
-                            ui.selectable_value(&mut playlist.sort, sort, sort.label());
-                        }
-                    });
-                ui.add_enabled_ui(playlist.sort != Sort::Added, |ui| {
-                    let (ascending, descending) = if playlist.sort == Sort::Duration {
-                        ("Shortest first", "Longest first")
-                    } else {
-                        ("A–Z", "Z–A")
-                    };
-                    ui.selectable_value(&mut playlist.descending, false, ascending);
-                    ui.selectable_value(&mut playlist.descending, true, descending);
+            if let Some(sort) = requested_sort {
+                playlist.sort = sort;
+                playlist.descending = false;
+            }
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                let name_width = (ui.available_width() - 137.0).max(55.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(name_width, 48.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(name_width);
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.add(
+                            egui::Label::new(RichText::new(&playlist.name).strong().size(23.0))
+                                .truncate(),
+                        )
+                        .on_hover_text(&playlist.name);
+                        ui.weak(format!("{} tracks", playlist.tracks.len()));
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if sort_direction_button(ui, playlist.sort != Sort::Added, playlist.descending)
+                    {
+                        playlist.descending = !playlist.descending;
+                    }
+                    egui::ComboBox::from_id_salt("playlist sort")
+                        .width(88.0)
+                        .selected_text(playlist.sort.label())
+                        .show_ui(ui, |ui| {
+                            for sort in [
+                                Sort::Added,
+                                Sort::Title,
+                                Sort::Artist,
+                                Sort::Album,
+                                Sort::Duration,
+                            ] {
+                                ui.selectable_value(&mut playlist.sort, sort, sort.label());
+                            }
+                        });
                 });
             });
             if old_sort != (playlist.sort, playlist.descending) {
@@ -2298,12 +2605,7 @@ impl eframe::App for Player {
                     );
                 }
                 if !self.library.shuffle {
-                    if let Some(track) = self
-                        .playing
-                        .as_ref()
-                        .map(|p| p.track)
-                        .filter(|track| track.0 == list)
-                    {
+                    if let Some(track) = self.order_track().filter(|track| track.0 == list) {
                         self.plan(track);
                     }
                 }
@@ -2311,26 +2613,6 @@ impl eframe::App for Player {
                 self.save();
             }
             let playlist = &self.library.playlists[list];
-            egui::Frame::new()
-                .fill(ui.visuals().widgets.inactive.weak_bg_fill)
-                .corner_radius(10)
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(&playlist.name).strong().size(18.0));
-                        ui.weak(format!("{} tracks", playlist.tracks.len()));
-                        ui.add_space(8.0);
-                        let search = ui.add_sized(
-                            egui::vec2(250.0, ui.spacing().interact_size.y),
-                            egui::TextEdit::singleline(&mut self.track_search)
-                                .hint_text("Search songs or artists…"),
-                        );
-                        if !self.track_search.is_empty() && ui.small_button("Clear").clicked() {
-                            self.track_search.clear();
-                        }
-                        search.on_hover_text("Filters by title, artist, album, or file name");
-                    });
-                });
             ui.add_space(6.0);
             if self.indexing.contains_key(&list) {
                 ui.weak("Reading track information…");
@@ -2342,73 +2624,34 @@ impl eframe::App for Player {
             let mut edit = None;
             let mut properties = None;
             let mut folder = None;
-            let (album_fill, album_text) = self
+            let (_, album_text) = self
                 .theme_draft
                 .as_ref()
                 .map(|draft| draft.theme)
                 .unwrap_or(self.library.theme)
                 .album_colors();
             let view = self.views.get(&list);
-            let query = self.track_search.trim().to_lowercase();
-            let filtered_rows = (!query.is_empty()).then(|| {
-                let mut rows = Vec::new();
-                if let Some(view) = view {
-                    let mut pending_album = None;
-                    for row in &view.rows {
-                        match row {
-                            PlaylistRow::Album(album) => pending_album = Some(album.clone()),
-                            PlaylistRow::Track(index) => {
-                                let track = &view.tracks[*index];
-                                let matches = [
-                                    track.title.as_str(),
-                                    track.artist.as_str(),
-                                    track.album.as_str(),
-                                    track.album_artist.as_str(),
-                                ]
-                                .into_iter()
-                                .any(|value| value.to_lowercase().contains(&query));
-                                if matches {
-                                    if let Some(album) = pending_album.take() {
-                                        rows.push(PlaylistRow::Album(album));
-                                    }
-                                    rows.push(PlaylistRow::Track(*index));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    rows.extend(
-                        playlist
-                            .tracks
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, path)| file_title(path).to_lowercase().contains(&query))
-                            .map(|(index, _)| PlaylistRow::Track(index)),
-                    );
-                }
-                rows
-            });
-            if let Some(rows) = &filtered_rows {
-                let matches = rows
-                    .iter()
-                    .filter(|row| matches!(row, PlaylistRow::Track(_)))
-                    .count();
-                ui.weak(format!("{matches} matching tracks"));
+            let query = self.track_search.trim();
+            if query.is_empty() {
+                self.search_results = None;
+            } else if !self
+                .search_results
+                .as_ref()
+                .is_some_and(|cached| cached.list == list && cached.query == query)
+            {
+                self.search_results = Some(SearchResults::new(list, query, playlist, view));
             }
-            let height = ui.text_style_height(&egui::TextStyle::Body) + 7.0;
-            playlist_columns(
-                ui,
-                height,
-                ["", "Track", "Title / Artist", "Time"],
-                true,
-                false,
-                false,
-                "",
-            );
+            let filtered_rows = self.search_results.as_ref().map(|results| {
+                ui.weak(format!("{} matching tracks", results.count));
+                &results.rows
+            });
+            let height = ui.spacing().interact_size.y;
+            let mut enqueue = None;
+            playlist_columns(ui, height, ["", "#", "Title", "Time"], true, false, "");
             egui::ScrollArea::vertical().show_rows(
                 ui,
                 height,
-                filtered_rows.as_ref().map_or_else(
+                filtered_rows.map_or_else(
                     || {
                         view.map_or(playlist.tracks.len(), |view| {
                             view.row_count(playlist.tracks.len())
@@ -2419,7 +2662,6 @@ impl eframe::App for Player {
                 |ui, rows| {
                     for row_index in rows {
                         let row = filtered_rows
-                            .as_ref()
                             .and_then(|rows| rows.get(row_index))
                             .or_else(|| view.and_then(|view| view.rows.get(row_index)));
                         let index = match row {
@@ -2430,7 +2672,11 @@ impl eframe::App for Player {
                                 );
                                 let painter =
                                     ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-                                painter.rect_filled(rect, 3.0, album_fill);
+                                painter.hline(
+                                    rect.x_range(),
+                                    rect.bottom(),
+                                    ui.visuals().window_stroke,
+                                );
                                 painter.text(
                                     rect.left_center() + egui::vec2(9.0, 0.0),
                                     egui::Align2::LEFT_CENTER,
@@ -2475,13 +2721,17 @@ impl eframe::App for Player {
                             [marker, &number, &title, &duration],
                             false,
                             active,
-                            row_index % 2 == 0,
                             &path.display().to_string(),
                         );
                         if response.double_clicked() {
                             play = Some(index);
                         }
                         response.context_menu(|ui| {
+                            if ui.button("Add to Play Queue").clicked() {
+                                enqueue = Some((index, title.clone()));
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui.button("Properties").clicked() {
                                 properties = Some(path.clone());
                                 ui.close();
@@ -2518,6 +2768,10 @@ impl eframe::App for Player {
                     }
                 },
             );
+            if let Some((index, title)) = enqueue {
+                self.play_queue.push((list, index), title);
+                self.status.clear();
+            }
             if let Some((index, change)) = edit {
                 self.edit_track((list, index), change);
             } else if let Some(index) = play {
@@ -2609,9 +2863,6 @@ impl eframe::App for Player {
         if self.activity_open {
             self.activity_dialog(ctx);
         }
-        if self.theme_draft.is_some() {
-            self.theme_editor(ctx);
-        }
         if self.plugins_open {
             self.plugin_manager(ctx);
         }
@@ -2635,13 +2886,72 @@ impl eframe::App for Player {
     }
 }
 
+fn desk_sections(ui: &mut egui::Ui, height: f32, center_width: f32) -> [egui::Ui; 3] {
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    let edge = (row.width() - center_width).max(0.0) * 0.5;
+    let stops = [
+        row.left(),
+        row.left() + edge,
+        row.right() - edge,
+        row.right(),
+    ];
+    std::array::from_fn(|index| {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(stops[index], row.top()),
+            egui::pos2(stops[index + 1], row.bottom()),
+        )
+        .shrink2(egui::vec2(3.0, 0.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().id_salt(index).max_rect(rect));
+        child.set_clip_rect(rect.intersect(ui.clip_rect()));
+        child
+    })
+}
+
+fn desk_surface(visuals: &egui::Visuals) -> egui::Frame {
+    egui::Frame::new()
+        .fill(visuals.window_fill)
+        .stroke(visuals.window_stroke)
+        .inner_margin(egui::Margin::symmetric(11, 7))
+}
+
+fn sort_direction_button(ui: &mut egui::Ui, enabled: bool, descending: bool) -> bool {
+    let response = ui
+        .add_enabled(
+            enabled,
+            egui::Button::new("")
+                .frame(false)
+                .min_size(egui::vec2(22.0, ui.spacing().interact_size.y)),
+        )
+        .on_hover_text("Reverse sort order");
+    let center = response.rect.center();
+    let direction = if descending { -1.0 } else { 1.0 };
+    let tip = center + egui::vec2(0.0, 4.0 * direction);
+    let tint = if enabled {
+        ui.visuals().text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let stroke = egui::Stroke::new(1.0_f32, tint);
+    ui.painter()
+        .line_segment([center - egui::vec2(0.0, 4.0 * direction), tip], stroke);
+    for side in [-1.0, 1.0] {
+        ui.painter().line_segment(
+            [tip, tip + egui::vec2(side * 3.0, -3.0 * direction)],
+            stroke,
+        );
+    }
+    response.clicked()
+}
+
 fn playlist_columns(
     ui: &mut egui::Ui,
     height: f32,
     text: [&str; 4],
     header: bool,
     active: bool,
-    alternate: bool,
     tooltip: &str,
 ) -> egui::Response {
     use egui::{Align2, FontId, Rect, Sense, pos2, vec2};
@@ -2652,27 +2962,16 @@ fn playlist_columns(
     };
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), sense);
     let painter = ui.painter();
-    let fill = if active || response.hovered() && !header {
-        ui.visuals().selection.bg_fill
-    } else if header {
-        ui.visuals().widgets.inactive.bg_fill
-    } else if alternate {
-        ui.visuals().widgets.inactive.weak_bg_fill
-    } else {
-        ui.visuals().panel_fill
-    };
-    let row_rect = if header {
-        rect
-    } else {
-        rect.shrink2(vec2(1.0, 2.0))
-    };
-    painter.rect_filled(row_rect, if header { 6 } else { 5 }, fill);
+    if active || response.hovered() && !header {
+        painter.rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
+    }
+    painter.hline(rect.x_range(), rect.bottom(), ui.visuals().window_stroke);
     let left = rect.left();
     let boundaries = [
         left,
-        left + 28.0,
-        left + 78.0,
-        rect.right() - 54.0,
+        left + 22.0,
+        left + 70.0,
+        (rect.right() - 46.0).max(left + 70.0),
         rect.right(),
     ];
     for (column, content) in text.into_iter().enumerate() {
@@ -2691,6 +2990,8 @@ fn playlist_columns(
         };
         let color = if header {
             ui.visuals().weak_text_color()
+        } else if active {
+            ui.visuals().selection.stroke.color
         } else {
             ui.visuals().text_color()
         };
@@ -2702,7 +3003,11 @@ fn playlist_columns(
             color,
         );
     }
-    response.on_hover_text(tooltip)
+    if tooltip.is_empty() {
+        response
+    } else {
+        response.on_hover_text(tooltip)
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -2753,12 +3058,23 @@ fn icon(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool, selected: boo
                 .min_size(vec2(25.0, 28.0)),
         )
         .on_hover_text(label);
-    if response.hovered() || selected {
+    let main = matches!(icon, Icon::Play | Icon::Pause);
+    let accent = ui.visuals().selection.stroke.color;
+    if main && enabled {
+        ui.painter()
+            .circle_filled(response.rect.center(), 12.5, accent);
+    } else if response.hovered() || selected {
         ui.painter()
             .rect_filled(response.rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
     }
     let center = response.rect.center();
-    let color = if enabled {
+    let color = if main && enabled {
+        if accent.intensity() > 0.57 {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        }
+    } else if enabled {
         ui.visuals().text_color()
     } else {
         ui.visuals().weak_text_color().gamma_multiply(0.55)
@@ -2832,6 +3148,104 @@ fn volume_slider(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
                 label
             }),
     );
+    volume_wheel(ui, volume, &mut response);
+    response
+}
+
+fn desk_volume(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
+    use egui::{Align2, Sense, Stroke, pos2, vec2};
+
+    let (label, label_response) = ui.allocate_exact_size(vec2(35.0, 24.0), Sense::hover());
+    let slider = ui
+        .scope(|ui| {
+            ui.spacing_mut().slider_width = (ui.available_width() - 25.0).clamp(52.0, 85.0);
+            ui.spacing_mut().interact_size.y = 20.0;
+            // Keep egui's mouse and keyboard handling; paint the compact track separately.
+            ui.set_opacity(0.0);
+            ui.add(
+                egui::Slider::new(volume, 0.0..=1.0)
+                    .show_value(false)
+                    .step_by(0.01)
+                    .handle_shape(egui::style::HandleShape::Circle),
+            )
+        })
+        .inner;
+    let (speaker, speaker_response) = ui.allocate_exact_size(vec2(16.0, 20.0), Sense::hover());
+    let mut response = slider
+        .clone()
+        .union(label_response)
+        .union(speaker_response)
+        .on_hover_text("Volume · scroll to adjust");
+    volume_wheel(ui, volume, &mut response);
+
+    let mut accent = ui.visuals().selection.stroke.color;
+    let muted = ui.visuals().weak_text_color();
+    if !response.enabled() {
+        accent = muted;
+    }
+    let painter = ui.painter();
+    painter.text(
+        label.right_center(),
+        Align2::RIGHT_CENTER,
+        format!("{:.0}%", *volume * 100.0),
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+    let track = slider.rect.x_range().shrink(slider.rect.height() / 2.5);
+    let y = slider.rect.center().y;
+    let knob = pos2(egui::lerp(track, *volume), y);
+    painter.hline(
+        track,
+        y,
+        Stroke::new(3.0_f32, ui.visuals().window_stroke.color),
+    );
+    if *volume > 0.0 {
+        painter.hline(track.min..=knob.x, y, Stroke::new(3.0_f32, accent));
+    }
+    painter.circle_filled(
+        knob,
+        if slider.hovered() || slider.dragged() {
+            4.5
+        } else {
+            3.5
+        },
+        accent,
+    );
+    if slider.has_focus() {
+        painter.circle_stroke(knob, 6.0, Stroke::new(1.0_f32, accent));
+    }
+
+    let center = speaker.center();
+    let outline = [
+        (-6.0, -2.0),
+        (-3.0, -2.0),
+        (0.0, -5.0),
+        (0.0, 5.0),
+        (-3.0, 2.0),
+        (-6.0, 2.0),
+        (-6.0, -2.0),
+    ];
+    painter.add(egui::Shape::line(
+        outline
+            .into_iter()
+            .map(|(x, y)| center + vec2(x, y))
+            .collect(),
+        Stroke::new(1.0_f32, muted),
+    ));
+    if *volume > 0.0 {
+        painter.add(egui::Shape::line(
+            vec![
+                center + vec2(3.0, -3.0),
+                center + vec2(5.0, 0.0),
+                center + vec2(3.0, 3.0),
+            ],
+            Stroke::new(1.0_f32, muted),
+        ));
+    }
+    response
+}
+
+fn volume_wheel(ui: &egui::Ui, volume: &mut f32, response: &mut egui::Response) {
     if response.enabled() && response.hovered() {
         let steps: f32 = ui.input(|input| {
             input
@@ -2853,7 +3267,6 @@ fn volume_slider(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
             ui.ctx().request_repaint();
         }
     }
-    response
 }
 
 fn seek_bar(ui: &mut egui::Ui, elapsed: Duration, duration: Duration) -> Option<Duration> {
@@ -2864,8 +3277,9 @@ fn seek_bar(ui: &mut egui::Ui, elapsed: Duration, duration: Duration) -> Option<
         vec2(ui.available_width().max(1.0), height),
         Sense::click_and_drag(),
     );
+    let rail = rect.shrink2(vec2(38.0, (height - 3.0) * 0.5));
     let position = response.interact_pointer_pos().map(|pointer| {
-        let fraction = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+        let fraction = ((pointer.x - rail.left()) / rail.width().max(1.0)).clamp(0.0, 1.0);
         duration.mul_f64(f64::from(fraction))
     });
     let button = PointerButton::Primary;
@@ -2877,19 +3291,25 @@ fn seek_bar(ui: &mut egui::Ui, elapsed: Duration, duration: Duration) -> Option<
     };
     let fraction = (preview.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0) as f32;
     let painter = ui.painter();
-    let rounding = (height / 2.0) as u8;
-    painter.rect_filled(rect, rounding, ui.visuals().extreme_bg_color);
+    painter.rect_filled(rail, 0.0, ui.visuals().window_stroke.color);
     if fraction > 0.0 {
-        let mut fill = rect;
-        fill.max.x = rect.left() + rect.width() * fraction;
-        painter.rect_filled(fill, rounding, ui.visuals().selection.bg_fill);
+        let mut fill = rail;
+        fill.max.x = rail.left() + rail.width() * fraction;
+        painter.rect_filled(fill, 0.0, ui.visuals().selection.stroke.color);
     }
     painter.text(
-        rect.left_center() + vec2(8.0, 0.0),
+        rect.left_center(),
         Align2::LEFT_CENTER,
-        format!("{} / {}", time(preview), time(duration)),
+        time(preview),
         FontId::proportional(10.5),
-        ui.visuals().text_color(),
+        ui.visuals().weak_text_color(),
+    );
+    painter.text(
+        rect.right_center(),
+        Align2::RIGHT_CENTER,
+        time(duration),
+        FontId::proportional(10.5),
+        ui.visuals().weak_text_color(),
     );
     response
         .on_hover_cursor(CursorIcon::PointingHand)
@@ -2941,6 +3361,7 @@ fn apply_ui_chrome(ctx: &egui::Context, theme: theme::Theme) {
 fn main() -> eframe::Result {
     diagnostics::install();
     let viewport = egui::ViewportBuilder::default()
+        .with_decorations(false)
         .with_inner_size([1120.0, 680.0])
         .with_min_inner_size([680.0, 420.0]);
     let options = eframe::NativeOptions {
@@ -2954,12 +3375,14 @@ fn main() -> eframe::Result {
             let mut player = Player::new(&creation.egui_ctx);
             player.audio_devices = Some(audio::DeviceMonitor::new(&creation.egui_ctx));
             player.taskbar = taskbar::Taskbar::new(creation, &creation.egui_ctx);
+            player.window_chrome = window_chrome::NativeChrome::new(creation);
             player.media_keys = media_keys::MediaKeys::new(creation, &creation.egui_ctx);
             apply_ui_chrome(&creation.egui_ctx, player.library.theme);
-            if let Some(path) = player.library.font.as_deref() {
-                match fonts::load(Some(path)) {
-                    Ok(fonts) => creation.egui_ctx.set_fonts(fonts),
-                    Err(error) => player.status = format!("Could not load saved font: {error}"),
+            match fonts::load(player.library.font.as_deref()) {
+                Ok(fonts) => creation.egui_ctx.set_fonts(fonts),
+                Err(error) => {
+                    creation.egui_ctx.set_fonts(fonts::defaults());
+                    player.status = format!("Could not load saved font: {error}");
                 }
             }
             Ok(Box::new(player))

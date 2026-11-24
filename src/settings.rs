@@ -25,7 +25,6 @@ impl Player {
             .open(&mut open)
             .collapsible(false)
             .default_width(480.0)
-            .vscroll(page == Page::Audio)
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for (section, label) in [
@@ -47,7 +46,13 @@ impl Player {
                             .changed();
                         self.media_key_status(ui);
                     }
-                    Page::Audio => self.audio_settings(ui),
+                    Page::Audio => {
+                        let height = (ctx.content_rect().height() - 120.0).clamp(100.0, 560.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("audio settings")
+                            .max_height(height)
+                            .show(ui, |ui| self.audio_settings(ui));
+                    }
                     Page::Playback => {
                         changed |= self.gapless_settings(ui);
                         changed |= ui
@@ -64,9 +69,8 @@ impl Player {
                             .changed();
                     }
                     Page::Appearance => {
-                        if ui.button("Theme and fonts").clicked() {
-                            self.open_theme_editor();
-                        }
+                        self.begin_theme_edit();
+                        self.theme_editor(ui);
                     }
                     Page::Integrations => {
                         self.online_lyrics_setting(ui);
@@ -94,6 +98,9 @@ impl Player {
                 }
             });
         self.settings_page = open.then_some(page);
+        if !open && let Some(draft) = self.theme_draft.take() {
+            self.restore_applied_theme(ctx, &draft);
+        }
         if changed {
             self.save();
         }
@@ -140,6 +147,10 @@ impl Player {
     }
 
     pub(super) fn open_theme_editor(&mut self) {
+        self.settings_page = Some(Page::Appearance);
+    }
+
+    fn begin_theme_edit(&mut self) {
         if self.theme_draft.is_none() {
             self.theme_draft = Some(ThemeDraft {
                 theme: self.library.theme,

@@ -33,7 +33,7 @@ use self::{
 };
 use decoder::SampleKind;
 pub use decoder::container_duration;
-pub use gapless::{Next, Transition};
+pub use gapless::{Next, NextTarget, Transition};
 
 const NO_SEEK: u64 = u64::MAX;
 

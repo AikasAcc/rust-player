@@ -48,6 +48,10 @@ The decoder writes to a bounded ring buffer on a worker thread. The output callb
 
 ## Playlists and playback
 
+The right panel switches between **Queue** and **Track**. Lyrics appear beneath the artwork and song details in **Track**. The playback bar keeps the current song, timeline, and volume in view. Use **Ctrl+K** to focus the playlist search in the toolbar.
+
+The queue shows the remaining tracks in the current playlist pass, including the actual shuffle order. Right-click a song and select **Add to Play Queue** to play it before the upcoming playlist tracks. In the queue, drag songs within their group or right-click to move or remove them. Edits to upcoming tracks apply to the current playback order. The queue lasts until Rust Player closes.
+
 The file picker accepts the formats listed under [Audio output](#audio-output). Click **+** next to **Playlists** and enter a name. Drop audio files and folders anywhere in the window to add them to the selected playlist. Folder import scans subfolders. You can also use **Add files** and **Add folder**. Double-click a track to play it. The shuffle button randomizes the remaining order without repeating tracks within that run. Playlists and settings are saved in `%LOCALAPPDATA%\Rust Player\library.json`.
 
 The **Now playing** panel reads title, artist, album, cover and lyrics from available tags. If a cover is missing, put a file such as `cover.jpg` or `folder.png` next to the track. For lyrics, put a same-name `.lrc` or `.txt` file next to the track. Timestamped LRC lyrics highlight and follow the current line.
@@ -72,7 +76,9 @@ The local-first lyrics workflow takes inspiration from [OpenLyrics](https://gith
 
 ## Themes
 
-Open **Theme** in the toolbar to preview a preset or edit the background, panel and button, text, and accent colors. **Choose font…** previews a local TTF or OTF as the interface font. **Apply** saves the theme and font path for the next start. **Cancel** restores the previously applied theme. If a font file becomes unavailable, the player uses its default font.
+**Library Desk** is the default palette. Its header mark follows the current theme accent and uses the locally installed Guifx v2 Transports font when available.
+
+Open **Settings → Appearance** to preview a preset or edit the background, panel and button, text, and accent colors. **Choose font…** previews a local TTF or OTF as the interface font. **Apply** saves the theme and font path for the next start. **Cancel** or closing Settings restores the last applied theme. If a font file becomes unavailable, the player uses its default font.
 
 Browse and share palettes through the [Rust Player community theme gallery](https://aikasacc.github.io/rust-player/). Community submissions include their color and layout settings so they can be recreated in the Theme Editor.
 

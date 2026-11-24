@@ -260,6 +260,8 @@ pub struct Library {
     pub audio_output: crate::audio::OutputOptions,
     pub audio_dsp: crate::audio::dsp::Settings,
     pub theme: crate::theme::Theme,
+    #[serde(default)]
+    library_desk_theme_seen: bool,
     pub font: Option<PathBuf>,
     pub background: crate::background::Settings,
     pub named_themes: Vec<crate::theme::NamedTheme>,
@@ -294,6 +296,7 @@ impl Default for Library {
             background: Default::default(),
             named_themes: Vec::new(),
             theme: crate::theme::Theme::default(),
+            library_desk_theme_seen: true,
             font: None,
             plugins: Vec::new(),
             favorites: None,
@@ -379,6 +382,12 @@ impl Library {
             Err(error) => return Err(error),
         };
         let mut data: Self = serde_json::from_slice(&bytes)?;
+        if !data.library_desk_theme_seen {
+            if data.theme == crate::theme::Theme::STUDIO {
+                data.theme = crate::theme::Theme::LIBRARY_DESK;
+            }
+            data.library_desk_theme_seen = true;
+        }
         data.volume = data.volume.clamp(0.0, 1.0);
         if data.playlists.is_empty() {
             data.playlists = Self::default().playlists;

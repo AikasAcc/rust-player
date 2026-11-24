@@ -227,7 +227,7 @@ fn check_continuous_output(output_rate: u32) -> Result<(), Box<dyn std::error::E
     };
     let next = Next {
         path: temp.path().join("second.wav"),
-        cursor: 1,
+        target: super::NextTarget::Playlist(1),
         generation: 0,
     };
     let state = Arc::new(RenderState::new(Duration::ZERO, 1.0, false));

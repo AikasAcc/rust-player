@@ -70,7 +70,7 @@ impl crate::ThemeDraft {
                             self.font_error.clear();
                         }
                         Err(error) => {
-                            ui.ctx().set_fonts(Default::default());
+                            ui.ctx().set_fonts(crate::fonts::defaults());
                             self.font_error = format!("Could not load font: {error}");
                         }
                     }
@@ -168,17 +168,27 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub const PRESETS: [(&'static str, Self); 9] = [
-        (
-            "Studio",
-            Self {
-                background: [14, 18, 27],
-                surface: [25, 31, 45],
-                text: [236, 240, 247],
-                accent: [92, 161, 255],
-                ..Self::DEFAULT_STYLE
-            },
-        ),
+    pub const LIBRARY_DESK: Self = Self {
+        background: [23, 24, 22],
+        surface: [30, 32, 27],
+        text: [243, 244, 233],
+        accent: [195, 221, 154],
+        corner_radius: 7,
+        accent_strength_percent: 15,
+        ..Self::DEFAULT_STYLE
+    };
+
+    pub const STUDIO: Self = Self {
+        background: [14, 18, 27],
+        surface: [25, 31, 45],
+        text: [236, 240, 247],
+        accent: [92, 161, 255],
+        ..Self::DEFAULT_STYLE
+    };
+
+    pub const PRESETS: [(&'static str, Self); 10] = [
+        ("Library Desk", Self::LIBRARY_DESK),
+        ("Studio", Self::STUDIO),
         (
             "Midnight",
             Self {
@@ -358,7 +368,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::PRESETS[0].1
+        Self::LIBRARY_DESK
     }
 }
 
