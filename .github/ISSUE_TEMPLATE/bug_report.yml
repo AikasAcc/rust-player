@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a problem with Rust Player.
+title: "[Bug] "
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Rust Player.
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual behavior
+      placeholder: |
+        Expected:
+        Actual:
+    validations:
+      required: true
+  - type: input
+    id: player
+    attributes:
+      label: Rust Player version
+      description: Available in Settings → About.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and build
+      description: Run winver to find the version and build number.
+    validations:
+      required: true
+  - type: input
+    id: audio
+    attributes:
+      label: Audio device and output mode
+      placeholder: Audient iD4 MKII, WASAPI Shared
+  - type: input
+    id: format
+    attributes:
+      label: Audio file format
+      placeholder: FLAC, stereo, 24-bit, 48 kHz
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or log excerpts
+      description: Remove personal file paths and track information before attaching files or text.

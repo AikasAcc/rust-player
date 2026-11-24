@@ -13,6 +13,7 @@ pub struct Activity {
     pub artist: String,
     pub album: String,
     pub artwork: String,
+    pub fallback_artwork: String,
     pub elapsed: Duration,
     pub duration: Option<Duration>,
 }
@@ -83,19 +84,29 @@ fn run(rx: mpsc::Receiver<Update>, status: Arc<Mutex<String>>) {
                         connection = Some((id.clone(), Rpc::connect(id)?));
                     }
                     let (_, rpc) = connection.as_mut().expect("connection established");
-                    let mut activity = payload(track, update.sent_at);
-                    match rpc.set_activity(activity.clone()) {
-                        Err(RpcError::Rejected(_)) if activity.get("assets").is_some() => {
-                            activity
-                                .as_object_mut()
-                                .expect("activity is an object")
-                                .remove("assets");
-                            rpc.set_activity(activity)?;
-                            Ok("Discord confirmed activity (artwork was rejected)")
+                    let mut rejected = false;
+                    for image in [&track.artwork, &track.fallback_artwork] {
+                        if image.is_empty() || (rejected && image == &track.artwork) {
+                            continue;
                         }
-                        Err(error) => Err(error),
-                        Ok(()) => Ok("Discord confirmed activity"),
+                        match rpc.set_activity(payload(track, update.sent_at, image)) {
+                            Ok(()) => {
+                                return Ok(if rejected {
+                                    "Discord accepted the fallback artwork."
+                                } else {
+                                    "Discord accepted the activity with artwork."
+                                });
+                            }
+                            Err(RpcError::Rejected(_)) => rejected = true,
+                            Err(error) => return Err(error),
+                        }
                     }
+                    rpc.set_activity(payload(track, update.sent_at, ""))?;
+                    Ok(if rejected {
+                        "Discord rejected the artwork."
+                    } else {
+                        "Discord activity has no artwork URL or asset."
+                    })
                 })();
                 current = Some(update);
                 match result {
@@ -237,7 +248,19 @@ impl Rpc {
     }
 }
 
-fn payload(track: &Activity, sent_at: SystemTime) -> Value {
+pub fn public_artwork_url(input: &str) -> bool {
+    input.len() <= 300
+        && !input.chars().any(char::is_whitespace)
+        && url::Url::parse(input).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none()
+        })
+}
+
+fn payload(track: &Activity, sent_at: SystemTime, artwork: &str) -> Value {
     let now = sent_at.duration_since(UNIX_EPOCH).unwrap_or_default();
     let start = now.saturating_sub(track.elapsed).as_secs();
     let mut timestamps = json!({ "start": start });
@@ -250,13 +273,13 @@ fn payload(track: &Activity, sent_at: SystemTime) -> Value {
         "state": text(if track.artist.is_empty() { "Unknown artist" } else { &track.artist }),
         "timestamps": timestamps,
     });
-    if !track.artwork.is_empty() {
+    if !artwork.is_empty() {
         let hover = if track.album.is_empty() {
             &track.title
         } else {
             &track.album
         };
-        activity["assets"] = json!({"large_image": track.artwork, "large_text": text(hover)});
+        activity["assets"] = json!({"large_image": artwork, "large_text": text(hover)});
     }
     activity
 }

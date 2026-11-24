@@ -1,23 +1,31 @@
 #![windows_subsystem = "windows"]
 
 mod artwork;
+mod audio;
+mod audio_setup;
+mod audio_ui;
+mod background;
+mod cue;
+mod diagnostics;
 mod fonts;
+mod gapless_ui;
+mod lastfm;
 mod library;
 mod listening;
 mod lyrics;
+mod media_keys;
 mod playlist_io;
 mod plugins;
 mod presence;
+mod settings;
 mod taskbar;
 mod theme;
 
 use eframe::egui::{self, RichText};
 use library::{Library, Media, Playlist, PlaylistRow, PlaylistView, Sort, TrackInfo, file_title};
 use rand::seq::SliceRandom;
-use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
     collections::HashMap,
-    fs::File,
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -28,18 +36,26 @@ type ImportResult = (Vec<PathBuf>, usize);
 
 struct Playing {
     counted: bool,
+    lastfm: lastfm::Listen,
     track: Track,
-    sink: Sink,
+    sink: audio::AudioTrack,
     duration: Option<Duration>,
     media: Media,
-    cover: Option<egui::TextureHandle>,
-    online_cover: Option<egui::TextureHandle>,
+    cover: Option<background::Cover>,
+    online_cover: Option<background::Cover>,
     online_url: Option<String>,
-    lookup: Option<mpsc::Receiver<Option<artwork::Artwork>>>,
+    lookup: Option<mpsc::Receiver<Result<Option<artwork::Artwork>, &'static str>>>,
+    artwork_status: &'static str,
     timed_lyrics: Vec<(Duration, String)>,
     lyrics_lookup: Option<mpsc::Receiver<Result<Option<String>, String>>>,
     lyrics_status: String,
     lyrics_online: bool,
+}
+
+impl Playing {
+    fn cover(&self) -> Option<&background::Cover> {
+        self.cover.as_ref().or(self.online_cover.as_ref())
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -79,6 +95,12 @@ struct ThemeDraft {
     theme: theme::Theme,
     font: Option<PathBuf>,
     font_error: String,
+    background: background::Settings,
+    themes: Vec<theme::NamedTheme>,
+    selected: Option<usize>,
+    name: String,
+    theme_error: String,
+    copy_background: bool,
 }
 
 impl SavedTrack {
@@ -107,10 +129,16 @@ impl SavedTrack {
 }
 
 struct Player {
-    audio: Option<OutputStream>,
+    background: background::Preview,
+    setup: audio_setup::Setup,
+    audio_devices: Option<audio::DeviceMonitor>,
+    audio_retry_after: Option<Instant>,
+    gapless_generation: u64,
+    audio_release: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     playing: Option<Playing>,
     library: Library,
     library_path: PathBuf,
+    library_needs_backup: bool,
     restore_track: bool,
     volume_changed: bool,
     volume_save_at: Option<Instant>,
@@ -123,10 +151,13 @@ struct Player {
     plugins: plugins::Host,
     plugins_open: bool,
     taskbar: Option<taskbar::Taskbar>,
+    media_keys: Result<media_keys::MediaKeys, String>,
+    settings_page: Option<settings::Page>,
     activity_tab: ActivityTab,
     discord_settings: bool,
     artwork_url: String,
     rpc: presence::Presence,
+    lastfm: lastfm::Client,
     order: Vec<usize>,
     cursor: usize,
     imports: Vec<(usize, mpsc::Receiver<ImportResult>)>,
@@ -135,16 +166,17 @@ struct Player {
 }
 
 impl Player {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         let library_path = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join("Rust Player")
             .join("library.json");
-        let (library, mut status) = match Library::load(&library_path) {
-            Ok(library) => (library, String::new()),
+        let (library, library_needs_backup, mut status) = match Library::load(&library_path) {
+            Ok(library) => (library, false, String::new()),
             Err(error) => (
                 Library::default(),
+                true,
                 format!("Could not load playlists: {error}"),
             ),
         };
@@ -157,11 +189,19 @@ impl Player {
                 }
             };
         let plugins = plugins::Host::load(&library.plugins);
+        let lastfm = lastfm::Client::new(ctx, &library_path, &library);
+        let setup = audio_setup::Setup::new(!library_path.exists() && !library.audio_setup_done);
         Self {
-            audio: None,
+            background: background::Preview::default(),
+            setup,
+            audio_devices: None,
+            audio_retry_after: None,
+            gapless_generation: 0,
+            audio_release: None,
             playing: None,
             library,
             library_path,
+            library_needs_backup,
             restore_track: true,
             volume_changed: false,
             volume_save_at: None,
@@ -174,10 +214,13 @@ impl Player {
             plugins,
             plugins_open: false,
             taskbar: None,
+            media_keys: Err("Windows media session not initialized".into()),
+            settings_page: None,
             activity_tab: ActivityTab::default(),
             discord_settings: false,
             artwork_url: String::new(),
             rpc: presence::Presence::new(),
+            lastfm,
             order: Vec::new(),
             cursor: 0,
             imports: Vec::new(),
@@ -188,6 +231,21 @@ impl Player {
 
     fn save(&mut self) {
         self.volume_save_at = None;
+        if self.library_needs_backup {
+            match Library::back_up_invalid_file(&self.library_path) {
+                Ok(backup) => {
+                    self.library_needs_backup = false;
+                    self.status = format!(
+                        "Saved a copy of unreadable settings to {}",
+                        backup.display()
+                    );
+                }
+                Err(error) => {
+                    self.status = format!("Could not back up unreadable settings: {error}");
+                    return;
+                }
+            }
+        }
         match self.library.save(&self.library_path) {
             Ok(()) => self.volume_changed = false,
             Err(error) => self.status = format!("Could not save playlists or settings: {error}"),
@@ -287,6 +345,8 @@ impl Player {
                 self.save_playback(position);
                 return;
             }
+            self.observe_lastfm();
+            self.lastfm.track_changed();
             self.playing = None;
             self.order.clear();
             self.cursor = 0;
@@ -484,7 +544,7 @@ impl Player {
         let Some(playing) = &mut self.playing else {
             return;
         };
-        if playing.counted {
+        if playing.counted || playing.sink.is_paused() || playing.sink.output.is_none() {
             return;
         }
         playing.counted = true;
@@ -683,43 +743,60 @@ impl Player {
         ctx: &egui::Context,
         restore: Option<Duration>,
     ) -> Result<(), String> {
-        if self.audio.is_none() {
-            self.audio =
-                Some(OutputStreamBuilder::open_default_stream().map_err(|e| e.to_string())?);
-        }
+        self.setup.stop_tone();
         let path = &self.library.playlists[track.0].tracks[track.1];
-        let source = File::open(path)
-            .map_err(|e| e.to_string())
-            .and_then(|file| Decoder::try_from(file).map_err(|e| e.to_string()))?;
-        let duration = source.total_duration();
+        let sink = audio::AudioTrack::open(
+            path,
+            self.output_request(),
+            restore.unwrap_or_default(),
+            self.library.volume,
+            true,
+            ctx,
+        )?;
+        self.audio_release = Some(sink.release_gate());
+        self.audio_retry_after = None;
+        if let Some(previous) = &self.playing {
+            previous.sink.pause();
+        }
+        self.observe_lastfm();
+        self.show_track(track, sink, ctx);
+        if restore.is_none()
+            && let Some(playing) = &self.playing
+        {
+            playing.sink.play();
+        }
+        Ok(())
+    }
+
+    fn show_track(&mut self, track: Track, sink: audio::AudioTrack, ctx: &egui::Context) {
+        let duration = sink.duration;
+        let path = &self.library.playlists[track.0].tracks[track.1];
         let mut media = Media::read(path);
         let timed_lyrics = library::timed_lyrics(&media.lyrics);
         let cover = media
             .cover
-            .take()
             .as_deref()
             .and_then(cover_image)
-            .map(|image| ctx.load_texture("Album artwork", image, egui::TextureOptions::LINEAR));
+            .map(|image| background::Cover::new(ctx, image));
+        if cover.is_none()
+            || media
+                .cover
+                .as_ref()
+                .is_some_and(|data| data.len() > media_keys::MAX_COVER_BYTES)
+        {
+            media.cover = None;
+        }
         self.artwork_url = self
             .library
             .artwork_urls
             .get(path)
             .cloned()
             .unwrap_or_default();
-        let sink = Sink::connect_new(self.audio.as_ref().expect("audio stream opened").mixer());
-        sink.pause();
-        sink.set_volume(self.library.volume);
-        sink.append(source);
-        if let Some(position) = restore {
-            if !position.is_zero()
-                && duration.is_none_or(|end| position < end)
-                && sink.try_seek(position).is_err()
-            {
-                let _ = sink.try_seek(Duration::ZERO);
-            }
-        }
+        self.gapless_generation = self.gapless_generation.wrapping_add(1);
+        self.lastfm.track_changed();
         self.playing = Some(Playing {
             counted: false,
+            lastfm: lastfm::Listen::default(),
             track,
             sink,
             duration,
@@ -728,6 +805,7 @@ impl Player {
             online_cover: None,
             online_url: None,
             lookup: None,
+            artwork_status: "",
             timed_lyrics,
             lyrics_lookup: None,
             lyrics_status: String::new(),
@@ -736,8 +814,8 @@ impl Player {
         if let Some(playing) = &self.playing {
             self.plugins.track_changed(&playing.media);
         }
-        if restore.is_none() {
-            self.playing.as_ref().expect("track opened").sink.play();
+        if let Ok(media_keys) = &mut self.media_keys {
+            media_keys.track_changed();
         }
         self.lookup_artwork(ctx);
         if self.library.online_lyrics
@@ -748,7 +826,6 @@ impl Player {
         {
             self.lookup_lyrics(ctx);
         }
-        Ok(())
     }
 
     fn lookup_lyrics(&mut self, ctx: &egui::Context) {
@@ -825,6 +902,7 @@ impl Player {
             playing.lookup = None;
             playing.online_url = None;
             playing.online_cover = None;
+            playing.artwork_status = "";
             return;
         }
         if playing.lookup.is_some()
@@ -836,12 +914,20 @@ impl Player {
         let title = playing.media.title.clone();
         let artist = playing.media.artist.clone();
         let album = playing.media.album.clone();
+        let duration = playing.duration;
         let download_image = playing.cover.is_none();
         let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
         playing.lookup = Some(rx);
+        playing.artwork_status = "Looking up artwork…";
         std::thread::spawn(move || {
-            let _ = tx.send(artwork::lookup(&title, &artist, &album, download_image));
+            let _ = tx.send(artwork::lookup(
+                &title,
+                &artist,
+                &album,
+                duration,
+                download_image,
+            ));
             ctx.request_repaint();
         });
     }
@@ -856,17 +942,19 @@ impl Player {
         match lookup.try_recv() {
             Ok(result) => {
                 playing.lookup = None;
-                if let Some(result) = result {
+                if let Ok(Some(result)) = result {
                     playing.online_url = Some(result.url);
-                    playing.online_cover =
-                        result.image.as_deref().and_then(cover_image).map(|image| {
-                            ctx.load_texture(
-                                "Online album artwork",
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            )
-                        });
+                    playing.artwork_status = "Found Apple Music artwork.";
+                    playing.online_cover = result
+                        .image
+                        .as_deref()
+                        .and_then(cover_image)
+                        .map(|image| background::Cover::new(ctx, image));
                     self.sync_presence();
+                } else {
+                    playing.artwork_status = result
+                        .err()
+                        .unwrap_or("No matching Apple Music artwork found.");
                 }
             }
             Err(mpsc::TryRecvError::Disconnected) => playing.lookup = None,
@@ -878,9 +966,9 @@ impl Player {
         match self.open(track, ctx, None) {
             Ok(()) => {
                 self.plan(track);
+                self.refresh_gapless();
                 self.status.clear();
                 self.save_playback(Duration::ZERO);
-                self.record_play();
                 self.sync_presence();
             }
             Err(error) => self.status = format!("Could not play track: {error}"),
@@ -894,17 +982,21 @@ impl Player {
         let Some(mut cursor) = self.cursor.checked_add_signed(offset) else {
             return;
         };
+        let mut failed = None;
         while let Some(&track) = self.order.get(cursor) {
             match self.open((list, track), ctx, None) {
                 Ok(()) => {
                     self.cursor = cursor;
-                    self.status.clear();
+                    self.refresh_gapless();
+                    self.status = failed.unwrap_or_default();
                     self.save_playback(Duration::ZERO);
-                    self.record_play();
                     self.sync_presence();
                     return;
                 }
-                Err(error) => self.status = format!("Could not play track: {error}"),
+                Err(error) => {
+                    self.status = format!("Skipped unreadable track: {error}");
+                    failed = Some(self.status.clone());
+                }
             }
             let Some(next) = cursor.checked_add_signed(offset) else {
                 break;
@@ -916,7 +1008,44 @@ impl Player {
         }
     }
 
+    fn previous_restarts_track(&self) -> bool {
+        self.library.restart_track_on_previous
+            && self
+                .playing
+                .as_ref()
+                .is_some_and(|playing| playing.sink.get_pos() > Duration::from_secs(3))
+    }
+
+    fn previous(&mut self, ctx: &egui::Context) {
+        if self.previous_restarts_track() && self.seek(Duration::ZERO, ctx) {
+            return;
+        }
+        self.step(-1, ctx);
+    }
+
+    fn seek(&mut self, target: Duration, ctx: &egui::Context) -> bool {
+        let Some(playing) = &self.playing else {
+            return false;
+        };
+        match playing.sink.try_seek(target) {
+            Ok(()) => {
+                self.status.clear();
+                self.sync_presence();
+                ctx.request_repaint();
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not seek: {error}");
+                false
+            }
+        }
+    }
+
     fn resume(&mut self, ctx: &egui::Context) {
+        if self.playing.as_ref().is_some_and(|p| p.sink.failed) {
+            self.reopen_audio(ctx, false);
+            return;
+        }
         if let Some(playing) = &self.playing {
             playing.sink.play();
             self.record_play();
@@ -939,6 +1068,8 @@ impl Player {
     }
 
     fn stop(&mut self) {
+        self.observe_lastfm();
+        self.lastfm.track_changed();
         self.save_playback(Duration::ZERO);
         self.playing = None;
         self.sync_presence();
@@ -962,7 +1093,7 @@ impl Player {
     fn taskbar_buttons(&self) -> taskbar::Buttons {
         let loaded = self.playing.is_some();
         taskbar::Buttons {
-            previous: loaded && self.cursor > 0,
+            previous: (loaded && self.cursor > 0) || self.previous_restarts_track(),
             can_play: loaded
                 || !self.library.playlists[self.library.selected]
                     .tracks
@@ -970,25 +1101,6 @@ impl Player {
             playing: self.playing.as_ref().is_some_and(|p| !p.sink.is_paused()),
             next: loaded && self.cursor + 1 < self.order.len(),
             shuffle: self.library.shuffle,
-        }
-    }
-
-    fn run_taskbar_commands(&mut self, ctx: &egui::Context) {
-        let commands = self
-            .taskbar
-            .as_ref()
-            .map(taskbar::Taskbar::commands)
-            .unwrap_or_default();
-        for command in commands {
-            let state = self.taskbar_buttons();
-            match command {
-                taskbar::Command::Previous if state.previous => self.step(-1, ctx),
-                taskbar::Command::PlayPause if state.playing => self.pause(),
-                taskbar::Command::PlayPause if state.can_play => self.resume(ctx),
-                taskbar::Command::Next if state.next => self.step(1, ctx),
-                taskbar::Command::Shuffle => self.toggle_shuffle(),
-                _ => {}
-            }
         }
     }
 
@@ -1008,13 +1120,15 @@ impl Player {
                     .artwork_urls
                     .get(path)
                     .map(String::as_str)
+                    .filter(|url| presence::public_artwork_url(url))
                     .or(playing.online_url.as_deref())
-                    .unwrap_or_else(|| self.library.fallback_asset.trim());
+                    .unwrap_or_default();
                 presence::Activity {
                     title: playing.media.title.clone(),
                     artist: playing.media.artist.clone(),
                     album: playing.media.album.clone(),
                     artwork: artwork.into(),
+                    fallback_artwork: self.library.fallback_asset.trim().into(),
                     elapsed: playing.sink.get_pos(),
                     duration: playing.duration,
                 }
@@ -1050,10 +1164,10 @@ impl Player {
                 ui,
                 Icon::Previous,
                 "Previous track",
-                self.playing.is_some() && self.cursor > 0,
+                self.taskbar_buttons().previous,
                 false,
             ) {
-                self.step(-1, ctx);
+                self.previous(ctx);
             }
             if icon(
                 ui,
@@ -1068,7 +1182,11 @@ impl Player {
                 self.toggle_shuffle();
             }
             ui.separator();
-            let volume = volume_slider(ui, &mut self.library.volume);
+            let volume = ui
+                .add_enabled_ui(self.software_volume_available(), |ui| {
+                    volume_slider(ui, &mut self.library.volume)
+                })
+                .inner;
             if volume.changed() {
                 self.volume_adjusted();
             }
@@ -1103,14 +1221,7 @@ impl Player {
                     })
                     .inner;
                 if let Some(target) = target {
-                    match playing.sink.try_seek(target) {
-                        Ok(()) => {
-                            self.status.clear();
-                            self.sync_presence();
-                            ctx.request_repaint();
-                        }
-                        Err(error) => self.status = format!("Could not seek: {error}"),
-                    }
+                    self.seek(target, ctx);
                 }
             } else {
                 ui.label(time(elapsed));
@@ -1122,10 +1233,11 @@ impl Player {
         let mut open = self.discord_settings;
         let mut save = false;
         let mut lookup_changed = false;
+        let mut refresh = false;
         egui::Window::new("Discord Rich Presence").open(&mut open).show(ctx, |ui| {
             save |= ui.checkbox(&mut self.library.discord_enabled, "Share what I’m listening to").changed();
             lookup_changed = ui.checkbox(&mut self.library.online_artwork, "Look up artwork via Apple Music").changed();
-            ui.weak("Artwork lookup sends the artist and title to Apple's music catalog.");
+            ui.weak("Artwork lookup sends track metadata to Apple's music catalog.");
             ui.label("Discord Application ID");
             save |= ui.text_edit_singleline(&mut self.library.discord_id).lost_focus();
             if self.library.discord_enabled && (self.library.discord_id.trim().is_empty()
@@ -1143,28 +1255,33 @@ impl Player {
                     if url.is_empty() {
                         self.library.artwork_urls.remove(path);
                         save = true;
-                    } else if url.starts_with("https://") && !url.chars().any(char::is_whitespace) {
+                    } else if presence::public_artwork_url(url) {
                         self.library.artwork_urls.insert(path.clone(), url.to_owned());
                         save = true;
                     } else {
                         ui.label("Enter a public HTTPS image URL.");
                     }
                 }
+                if !playing.artwork_status.is_empty() {
+                    ui.weak(playing.artwork_status);
+                }
             }
             ui.label("Discord displays public images or uploaded assets. Local cover files stay on this device.");
             ui.label(self.rpc.status());
             ui.horizontal(|ui| {
                 if ui.button("Save settings").clicked() { save = true; }
-                if ui.button("Refresh presence").clicked() { self.sync_presence(); }
+                if ui.button("Refresh presence").clicked() { refresh = true; }
             });
         });
         self.discord_settings = open;
-        if lookup_changed {
+        if lookup_changed || refresh {
             self.lookup_artwork(ctx);
-            save = true;
+            save |= lookup_changed;
         }
         if save {
             self.save();
+        }
+        if save || refresh {
             self.sync_presence();
         }
     }
@@ -1275,69 +1392,83 @@ impl Player {
         egui::Window::new("Theme Editor")
             .open(&mut open)
             .collapsible(false)
-            .default_width(310.0)
+            .default_width(440.0)
             .show(ctx, |ui| {
-                let name = theme::Theme::PRESETS
-                    .iter()
-                    .find(|(_, preset)| *preset == draft.theme)
-                    .map_or("Custom", |(name, _)| *name);
-                egui::ComboBox::from_label("Preset")
-                    .selected_text(name)
-                    .show_ui(ui, |ui| {
-                        for (name, preset) in theme::Theme::PRESETS {
-                            ui.selectable_value(&mut draft.theme, preset, name);
-                        }
-                    });
-                ui.separator();
-                egui::Grid::new("theme colors")
-                    .spacing([20.0, 8.0])
+                let max_height = (ctx.content_rect().height() * 0.70).clamp(180.0, 560.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
                     .show(ui, |ui| {
-                        for (label, color) in [
-                            ("Background", &mut draft.theme.background),
-                            ("Panels and buttons", &mut draft.theme.surface),
-                            ("Text", &mut draft.theme.text),
-                            ("Accent", &mut draft.theme.accent),
-                        ] {
-                            ui.label(label);
-                            ui.color_edit_button_srgb(color);
-                            ui.end_row();
-                        }
-                    });
-                ui.separator();
-                let font = draft
-                    .font
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy())
-                    .unwrap_or_else(|| "Default font".into());
-                ui.label(format!("Font: {font}"));
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Choose font…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Fonts", &["ttf", "otf"])
-                            .pick_file()
-                        {
-                            match fonts::load(Some(&path)) {
-                                Ok(fonts) => {
-                                    ctx.set_fonts(fonts);
-                                    draft.font = Some(path);
-                                    draft.font_error.clear();
+                        draft.saved_theme_settings(ui);
+                        ui.separator();
+                        let name = theme::Theme::PRESETS
+                            .iter()
+                            .find(|(_, preset)| *preset == draft.theme)
+                            .map_or("Custom", |(name, _)| *name);
+                        egui::ComboBox::from_label("Preset")
+                            .selected_text(name)
+                            .show_ui(ui, |ui| {
+                                for (name, preset) in theme::Theme::PRESETS {
+                                    ui.selectable_value(&mut draft.theme, preset, name);
                                 }
-                                Err(error) => {
-                                    draft.font_error = format!("Could not load font: {error}")
+                            });
+                        ui.separator();
+                        egui::Grid::new("theme colors")
+                            .spacing([20.0, 8.0])
+                            .show(ui, |ui| {
+                                for (label, color) in [
+                                    ("Background", &mut draft.theme.background),
+                                    ("Panels and buttons", &mut draft.theme.surface),
+                                    ("Text", &mut draft.theme.text),
+                                    ("Accent", &mut draft.theme.accent),
+                                ] {
+                                    ui.label(label);
+                                    ui.color_edit_button_srgb(color);
+                                    ui.end_row();
+                                }
+                            });
+                        ui.separator();
+                        let font = draft
+                            .font
+                            .as_ref()
+                            .and_then(|path| path.file_name())
+                            .map(|name| name.to_string_lossy())
+                            .unwrap_or_else(|| "Default font".into());
+                        ui.label(format!("Font: {font}"));
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Choose font…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Fonts", &["ttf", "otf"])
+                                    .pick_file()
+                                {
+                                    match fonts::load(Some(&path)) {
+                                        Ok(fonts) => {
+                                            ctx.set_fonts(fonts);
+                                            draft.font = Some(path);
+                                            draft.font_error.clear();
+                                        }
+                                        Err(error) => {
+                                            draft.font_error =
+                                                format!("Could not load font: {error}")
+                                        }
+                                    }
                                 }
                             }
+                            if ui.button("Use default font").clicked() {
+                                ctx.set_fonts(egui::FontDefinitions::default());
+                                draft.font = None;
+                                draft.font_error.clear();
+                            }
+                        });
+                        if !draft.font_error.is_empty() {
+                            ui.label(&draft.font_error);
                         }
-                    }
-                    if ui.button("Use default font").clicked() {
-                        ctx.set_fonts(egui::FontDefinitions::default());
-                        draft.font = None;
-                        draft.font_error.clear();
-                    }
-                });
-                if !draft.font_error.is_empty() {
-                    ui.label(&draft.font_error);
-                }
+                        ui.separator();
+                        draft.background.settings(
+                            ui,
+                            &mut draft.copy_background,
+                            self.background.status(),
+                        );
+                    });
                 ui.separator();
                 ui.horizontal(|ui| {
                     apply = ui.button("Apply").clicked();
@@ -1345,8 +1476,30 @@ impl Player {
                 });
             });
         if apply {
+            if draft.copy_background
+                && draft.background.uses_file()
+                && let Some(path) = &draft.background.path
+            {
+                match background::copy_to_profile(path, &self.library_path) {
+                    Ok(copied) => {
+                        for profile in &mut draft.themes {
+                            if profile.background.path.as_ref() == Some(path) {
+                                profile.background.path = Some(copied.clone());
+                            }
+                        }
+                        draft.background.path = Some(copied);
+                    }
+                    Err(error) => {
+                        draft.theme_error = format!("Could not copy the background: {error}");
+                        self.theme_draft = Some(draft);
+                        return;
+                    }
+                }
+            }
             self.library.theme = draft.theme;
             self.library.font = draft.font.clone();
+            self.library.background = draft.background.clone();
+            self.library.named_themes = std::mem::take(&mut draft.themes);
             self.save();
         }
         if !open || apply || cancel {
@@ -1452,11 +1605,14 @@ impl Player {
 
 impl eframe::App for Player {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        if std::mem::take(&mut self.restore_track) {
+        self.setup.update(ctx);
+        self.lastfm.poll(ctx);
+        if std::mem::take(&mut self.restore_track) && self.library.restore_last_track {
             self.restore_playback(ctx);
         }
-        self.run_taskbar_commands(ctx);
-        let dropped = ctx.input(|input| {
+        self.update_audio(ctx);
+        self.run_transport_commands(ctx);
+        let mut dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
                 .dropped_files
@@ -1464,6 +1620,15 @@ impl eframe::App for Player {
                 .filter_map(|file| file.path.clone())
                 .collect()
         });
+        if let Some(draft) = &mut self.theme_draft {
+            dropped.retain(|path| {
+                if !background::supported(path) {
+                    return true;
+                }
+                draft.background.select_file(path.clone());
+                false
+            });
+        }
         self.import(dropped, ctx);
         self.finish_imports();
         self.finish_artwork(ctx);
@@ -1478,7 +1643,7 @@ impl eframe::App for Player {
             .as_ref()
             .is_some_and(|playing| playing.sink.empty())
         {
-            self.step(1, ctx);
+            self.advance_automatic(ctx);
         }
         if self.playing.as_ref().is_some_and(|p| !p.sink.is_paused()) || self.discord_settings {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -1490,7 +1655,7 @@ impl eframe::App for Player {
                 ui.heading("Rust Player");
                 if ui.button("Add files").clicked() {
                     if let Some(files) = rfd::FileDialog::new()
-                        .add_filter("Audio", library::AUDIO)
+                        .add_filter("Audio and CUE sheets", library::AUDIO)
                         .pick_files()
                     {
                         self.import(files, ctx);
@@ -1504,15 +1669,15 @@ impl eframe::App for Player {
                 if ui.button("Discord").clicked() {
                     self.discord_settings = true;
                 }
-                if ui.button("Theme").clicked() && self.theme_draft.is_none() {
-                    self.theme_draft = Some(ThemeDraft {
-                        theme: self.library.theme,
-                        font: self.library.font.clone(),
-                        font_error: String::new(),
-                    });
+                if ui.button("Theme").clicked() {
+                    self.open_theme_editor();
                 }
                 if ui.button("Plugins").clicked() {
                     self.plugins_open = true;
+                }
+                if ui.button("Settings").clicked() {
+                    self.settings_page
+                        .get_or_insert_with(settings::Page::default);
                 }
             });
             ui.add_space(8.0);
@@ -1664,27 +1829,12 @@ impl eframe::App for Player {
             .min_width(190.0)
             .show(ctx, |ui| {
                 ui.heading("Now playing");
-                let auto = ui
-                    .checkbox(
-                        &mut self.library.online_lyrics,
-                        "Find missing lyrics online",
-                    )
-                    .on_hover_text("Send track metadata to LRCLIB when local lyrics are missing.");
-                if auto.changed() {
-                    self.save();
-                    if self.library.online_lyrics
-                        && self
-                            .playing
-                            .as_ref()
-                            .is_some_and(|p| p.media.lyrics.trim().is_empty())
-                    {
-                        self.lookup_lyrics(ctx);
-                    }
-                }
+                self.online_lyrics_setting(ui);
                 let mut search = false;
                 let mut save = false;
                 if let Some(playing) = &self.playing {
-                    if let Some(cover) = playing.cover.as_ref().or(playing.online_cover.as_ref()) {
+                    if let Some(cover) = playing.cover() {
+                        let cover = &cover.texture;
                         let size = cover.size_vec2();
                         ui.image((
                             cover.id(),
@@ -1790,7 +1940,18 @@ impl eframe::App for Player {
                 }
             });
 
+        let background = self
+            .theme_draft
+            .as_ref()
+            .map_or(&self.library.background, |draft| &draft.background)
+            .clone();
+        self.background.update(
+            &background,
+            self.playing.as_ref().and_then(Playing::cover),
+            ctx,
+        );
         egui::CentralPanel::default().show(ctx, |ui| {
+            self.background.paint(&background, ui);
             let list = self.library.selected;
             let playlist = &mut self.library.playlists[list];
             let old_sort = (playlist.sort, playlist.descending);
@@ -1798,13 +1959,24 @@ impl eframe::App for Player {
                 egui::ComboBox::from_label("Sort by")
                     .selected_text(playlist.sort.label())
                     .show_ui(ui, |ui| {
-                        for sort in [Sort::Added, Sort::Title, Sort::Artist, Sort::Album] {
+                        for sort in [
+                            Sort::Added,
+                            Sort::Title,
+                            Sort::Artist,
+                            Sort::Album,
+                            Sort::Duration,
+                        ] {
                             ui.selectable_value(&mut playlist.sort, sort, sort.label());
                         }
                     });
                 ui.add_enabled_ui(playlist.sort != Sort::Added, |ui| {
-                    ui.selectable_value(&mut playlist.descending, false, "A–Z");
-                    ui.selectable_value(&mut playlist.descending, true, "Z–A");
+                    let (ascending, descending) = if playlist.sort == Sort::Duration {
+                        ("Shortest first", "Longest first")
+                    } else {
+                        ("A–Z", "Z–A")
+                    };
+                    ui.selectable_value(&mut playlist.descending, false, ascending);
+                    ui.selectable_value(&mut playlist.descending, true, descending);
                 });
             });
             if old_sort != (playlist.sort, playlist.descending) {
@@ -2041,14 +2213,15 @@ impl eframe::App for Player {
         if self.plugins_open {
             self.plugin_manager(ctx);
         }
+        self.settings_dialog(ctx);
+        self.audio_setup_dialog(ctx);
+        self.refresh_gapless();
         self.flush_volume(ctx);
-        let buttons = self.taskbar_buttons();
-        if let Some(taskbar) = &mut self.taskbar {
-            taskbar.refresh(buttons);
-        }
+        self.refresh_windows_controls();
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+        self.observe_lastfm();
         if self.volume_changed {
             self.save();
         }
@@ -2123,7 +2296,7 @@ fn playlist_columns(
     response.on_hover_text(tooltip)
 }
 
-fn cover_image(bytes: &[u8]) -> Option<egui::ColorImage> {
+fn cover_image(bytes: &[u8]) -> Option<image::RgbaImage> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
@@ -2132,11 +2305,7 @@ fn cover_image(bytes: &[u8]) -> Option<egui::ColorImage> {
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode().ok()?.thumbnail(600, 600).to_rgba8();
-    Some(egui::ColorImage::from_rgba_unmultiplied(
-        [image.width() as usize, image.height() as usize],
-        image.as_raw(),
-    ))
+    Some(reader.decode().ok()?.thumbnail(600, 600).into_rgba8())
 }
 
 #[derive(Clone, Copy)]
@@ -2238,7 +2407,7 @@ fn volume_slider(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
                 label
             }),
     );
-    if response.hovered() {
+    if response.enabled() && response.hovered() {
         let steps: f32 = ui.input(|input| {
             input
                 .events
@@ -2309,18 +2478,22 @@ fn time(duration: Duration) -> String {
 }
 
 fn main() -> eframe::Result {
+    diagnostics::install();
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1120.0, 680.0])
+        .with_min_inner_size([680.0, 420.0]);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 680.0])
-            .with_min_inner_size([680.0, 420.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
         "Rust Player",
         options,
         Box::new(|creation| {
-            let mut player = Player::new();
+            let mut player = Player::new(&creation.egui_ctx);
+            player.audio_devices = Some(audio::DeviceMonitor::new(&creation.egui_ctx));
             player.taskbar = taskbar::Taskbar::new(creation, &creation.egui_ctx);
+            player.media_keys = media_keys::MediaKeys::new(creation, &creation.egui_ctx);
             creation
                 .egui_ctx
                 .set_visuals(player.library.theme.visuals());

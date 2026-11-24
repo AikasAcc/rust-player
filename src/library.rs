@@ -39,7 +39,9 @@ pub fn timed_lyrics(text: &str) -> Vec<(Duration, String)> {
     lyrics
 }
 
-pub const AUDIO: &[&str] = &["mp3", "flac", "wav", "ogg", "m4a", "aac"];
+pub const AUDIO: &[&str] = &[
+    "mp3", "flac", "wav", "ogg", "m4a", "aac", "alac", "aiff", "aif", "aifc", "caf", "cue",
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Playlist {
@@ -62,6 +64,7 @@ pub enum Sort {
     Title,
     Artist,
     Album,
+    Duration,
 }
 
 impl Sort {
@@ -71,6 +74,7 @@ impl Sort {
             Self::Title => "Title",
             Self::Artist => "Artist",
             Self::Album => "Album",
+            Self::Duration => "Duration",
         }
     }
 }
@@ -88,6 +92,24 @@ pub struct TrackInfo {
 
 impl TrackInfo {
     pub fn read(path: &Path) -> Self {
+        if let Ok(Some(track)) = crate::cue::resolve(path) {
+            return Self {
+                title: track.title,
+                artist: track.artist.clone(),
+                album: track.album,
+                album_artist: track.artist,
+                number: Some(track.number),
+                duration: track
+                    .end
+                    .map(|end| crate::cue::duration(end - track.start))
+                    .or_else(|| {
+                        crate::audio::container_duration(&track.audio)
+                            .and_then(|end| end.checked_sub(crate::cue::duration(track.start)))
+                    })
+                    .filter(|duration| !duration.is_zero()),
+                ..Self::default()
+            };
+        }
         let mut info = Self {
             title: file_title(path),
             ..Self::default()
@@ -115,6 +137,9 @@ impl TrackInfo {
                 info.number = tag.track().filter(|&number| number > 0);
             }
         }
+        if info.duration.is_none() {
+            info.duration = crate::audio::container_duration(path);
+        }
         info
     }
 
@@ -141,7 +166,15 @@ pub struct PlaylistView {
 impl PlaylistView {
     pub fn build(tracks: Vec<TrackInfo>, sort: Sort, descending: bool) -> Self {
         let mut order: Vec<_> = (0..tracks.len()).collect();
-        if sort != Sort::Added {
+        if sort == Sort::Duration {
+            order.sort_by(
+                |&left, &right| match (tracks[left].duration, tracks[right].duration) {
+                    (Some(a), Some(b)) if descending => b.cmp(&a),
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    (a, b) => a.is_none().cmp(&b.is_none()),
+                },
+            );
+        } else if sort != Sort::Added {
             let keys: Vec<_> = tracks
                 .iter()
                 .map(|track| {
@@ -216,8 +249,19 @@ impl PlaylistView {
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Library {
+    pub media_keys: bool,
+    pub audio_setup_done: bool,
+    pub restore_last_track: bool,
+    pub restart_track_on_previous: bool,
+    pub gapless: bool,
+    pub repeat: crate::gapless_ui::Repeat,
+    pub audio_device: Option<String>,
+    pub audio_output: crate::audio::OutputOptions,
+    pub audio_dsp: crate::audio::dsp::Settings,
     pub theme: crate::theme::Theme,
     pub font: Option<PathBuf>,
+    pub background: crate::background::Settings,
+    pub named_themes: Vec<crate::theme::NamedTheme>,
     pub plugins: Vec<crate::plugins::PluginConfig>,
     pub favorites: Option<usize>,
     pub volume: f32,
@@ -225,6 +269,8 @@ pub struct Library {
     pub selected: usize,
     pub shuffle: bool,
     pub discord_enabled: bool,
+    pub lastfm_enabled: bool,
+    pub lastfm_now_playing: bool,
     pub discord_id: String,
     pub online_artwork: bool,
     pub online_lyrics: bool,
@@ -235,6 +281,17 @@ pub struct Library {
 impl Default for Library {
     fn default() -> Self {
         Self {
+            media_keys: true,
+            audio_setup_done: false,
+            restore_last_track: true,
+            restart_track_on_previous: false,
+            gapless: true,
+            repeat: crate::gapless_ui::Repeat::Off,
+            audio_device: None,
+            audio_output: crate::audio::OutputOptions::default(),
+            audio_dsp: crate::audio::dsp::Settings::default(),
+            background: Default::default(),
+            named_themes: Vec::new(),
             theme: crate::theme::Theme::default(),
             font: None,
             plugins: Vec::new(),
@@ -251,6 +308,8 @@ impl Default for Library {
             selected: 0,
             shuffle: false,
             discord_enabled: false,
+            lastfm_enabled: false,
+            lastfm_now_playing: false,
             discord_id: String::new(),
             online_artwork: false,
             online_lyrics: false,
@@ -331,6 +390,21 @@ impl Library {
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         save_json(self, path)
     }
+
+    pub fn back_up_invalid_file(path: &Path) -> std::io::Result<PathBuf> {
+        let mut original = fs::File::open(path)?;
+        let directory = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing settings folder")
+        })?;
+        let mut backup = tempfile::Builder::new()
+            .prefix("library.invalid-")
+            .suffix(".json")
+            .tempfile_in(directory)?;
+        std::io::copy(&mut original, &mut backup)?;
+        backup.as_file().sync_all()?;
+        let (_, backup_path) = backup.keep()?;
+        Ok(backup_path)
+    }
 }
 
 pub fn save_json(value: &impl Serialize, path: &Path) -> std::io::Result<()> {
@@ -351,14 +425,14 @@ pub fn collect(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
             for entry in walkdir::WalkDir::new(path).sort_by_file_name() {
                 match entry {
                     Ok(entry) if entry.file_type().is_file() && supported(entry.path()) => {
-                        tracks.push(entry.into_path())
+                        add_path(entry.into_path(), &mut tracks, &mut skipped);
                     }
                     Err(_) => skipped += 1,
                     _ => {}
                 }
             }
         } else if path.is_file() && supported(&path) {
-            tracks.push(path);
+            add_path(path, &mut tracks, &mut skipped);
         } else {
             skipped += 1;
         }
@@ -366,17 +440,34 @@ pub fn collect(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
     (tracks, skipped)
 }
 
+fn add_path(path: PathBuf, tracks: &mut Vec<PathBuf>, skipped: &mut usize) {
+    if crate::cue::is_sheet(&path) {
+        match crate::cue::entries(&path) {
+            Ok(entries) => tracks.extend(entries),
+            Err(_) => *skipped += 1,
+        }
+    } else {
+        tracks.push(path);
+    }
+}
+
 pub fn supported(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| AUDIO.iter().any(|kind| ext.eq_ignore_ascii_case(kind)))
+    crate::cue::reference(path).is_some()
+        || path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| AUDIO.iter().any(|kind| ext.eq_ignore_ascii_case(kind)))
 }
 
 #[derive(Default)]
 pub struct Media {
     pub title: String,
+    pub tagged_title: bool,
     pub artist: String,
     pub album: String,
+    pub album_artist: String,
+    pub recording_id: String,
+    pub track_number: Option<u32>,
     pub cover: Option<Vec<u8>>,
     pub lyrics: String,
 }
@@ -390,6 +481,8 @@ pub fn file_title(path: &Path) -> String {
 
 impl Media {
     pub fn read(path: &Path) -> Self {
+        let cue = crate::cue::resolve(path).ok().flatten();
+        let path = cue.as_ref().map_or(path, |track| track.audio.as_path());
         let mut media = Self {
             title: file_title(path),
             ..Self::default()
@@ -398,6 +491,7 @@ impl Media {
             for tag in file.primary_tag().into_iter().chain(file.tags()) {
                 if let Some(title) = tag.title().filter(|text| !text.trim().is_empty()) {
                     media.title = title.into_owned();
+                    media.tagged_title = true;
                     break;
                 }
             }
@@ -414,6 +508,19 @@ impl Media {
                         .map(|text| text.into_owned())
                         .unwrap_or_default();
                 }
+                if media.album_artist.is_empty() {
+                    media.album_artist = tag
+                        .get_string(ItemKey::AlbumArtist)
+                        .unwrap_or_default()
+                        .to_owned();
+                }
+                if media.recording_id.is_empty() {
+                    media.recording_id = tag
+                        .get_string(ItemKey::MusicBrainzRecordingId)
+                        .unwrap_or_default()
+                        .to_owned();
+                }
+                media.track_number = media.track_number.or_else(|| tag.track());
                 if media.lyrics.is_empty() {
                     media.lyrics = tag
                         .get_string(ItemKey::Lyrics)
@@ -452,6 +559,113 @@ impl Media {
                 .find_map(|ext| fs::read_to_string(path.with_extension(ext)).ok())
                 .unwrap_or_default();
         }
+        if let Some(track) = cue {
+            media.title = track.title;
+            media.tagged_title = track.tagged_title;
+            media.artist = track.artist;
+            media.album = track.album;
+            media.album_artist.clear();
+            media.recording_id.clear();
+            media.track_number = Some(track.number);
+            // Embedded and sidecar lyrics belong to the whole disc image.
+            media.lyrics.clear();
+        }
         media
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_sort_keeps_unknown_tracks_last_and_ties_stable() {
+        let tracks = || {
+            [Some(241), None, Some(999), Some(241), Some(150), None]
+                .into_iter()
+                .map(|duration| TrackInfo {
+                    duration: duration.map(Duration::from_millis),
+                    ..TrackInfo::default()
+                })
+                .collect()
+        };
+        assert_eq!(
+            PlaylistView::build(tracks(), Sort::Duration, false).order,
+            [4, 0, 3, 2, 1, 5]
+        );
+        assert_eq!(
+            PlaylistView::build(tracks(), Sort::Duration, true).order,
+            [2, 0, 3, 4, 1, 5]
+        );
+    }
+
+    #[test]
+    fn playback_settings_load_old_libraries_and_persist() -> std::io::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("library.json");
+        fs::write(
+            &path,
+            br#"{"volume":0.25,"playlists":[{"name":"Old","tracks":[]}]}"#,
+        )?;
+
+        let mut library = Library::load(&path)?;
+        assert_eq!(library.playlists[0].name, "Old");
+        assert_eq!(library.volume, 0.25);
+        assert!(library.media_keys);
+        assert!(library.restore_last_track);
+        assert!(!library.restart_track_on_previous);
+        assert!(!library.background.enabled);
+        assert!(library.named_themes.is_empty());
+
+        library.media_keys = false;
+        library.restore_last_track = false;
+        library.restart_track_on_previous = true;
+        library.playlists[0].sort = Sort::Duration;
+        library.playlists[0].descending = true;
+        library.background.enabled = true;
+        library.named_themes.push(crate::theme::NamedTheme {
+            name: "Night show".into(),
+            font: Some(PathBuf::from("example.ttf")),
+            theme: library.theme,
+            background: library.background.clone(),
+        });
+        library.save(&path)?;
+
+        let library = Library::load(&path)?;
+        assert_eq!(library.playlists[0].name, "Old");
+        assert_eq!(library.volume, 0.25);
+        assert!(!library.media_keys);
+        assert!(!library.restore_last_track);
+        assert!(library.restart_track_on_previous);
+        assert!(library.playlists[0].sort == Sort::Duration);
+        assert!(library.playlists[0].descending);
+        assert!(library.background.enabled);
+        assert_eq!(library.named_themes[0].name, "Night show");
+        assert_eq!(
+            library.named_themes[0].font.as_deref(),
+            Some(Path::new("example.ttf"))
+        );
+        assert!(library.named_themes[0].background.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn backup_retains_original_bytes_and_keeps_prior_backups() -> std::io::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("library.json");
+        let broken_json = b"{\xFF";
+        fs::write(&path, broken_json)?;
+        assert!(Library::load(&path).is_err());
+
+        let first = Library::back_up_invalid_file(&path)?;
+        let second = Library::back_up_invalid_file(&path)?;
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&path)?, broken_json);
+
+        Library::default().save(&path)?;
+        assert_eq!(fs::read(first)?, broken_json);
+        assert_eq!(fs::read(second)?, broken_json);
+        assert!(Library::load(&path).is_ok());
+        Ok(())
     }
 }

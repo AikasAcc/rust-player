@@ -40,7 +40,14 @@ pub fn import(path: &Path) -> io::Result<(Playlist, usize)> {
     let mut skipped = 0;
     for entry in entries {
         if let Some(track) = local_track(base, entry) {
-            tracks.push(track);
+            if crate::cue::is_sheet(&track) {
+                match crate::cue::entries(&track) {
+                    Ok(entries) => tracks.extend(entries),
+                    Err(_) => skipped += 1,
+                }
+            } else {
+                tracks.push(track);
+            }
         } else {
             skipped += 1;
         }

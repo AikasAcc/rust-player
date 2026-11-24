@@ -6,14 +6,21 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{BOOL, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
             DeleteObject, HDC,
         },
-        System::Com::{
-            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-            CoUninitialize,
+        System::{
+            Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+                CoUninitialize,
+            },
+            LibraryLoader::GetModuleHandleW,
+            SystemServices::{
+                APPCOMMAND_MEDIA_NEXTTRACK, APPCOMMAND_MEDIA_PAUSE, APPCOMMAND_MEDIA_PLAY,
+                APPCOMMAND_MEDIA_PLAY_PAUSE, APPCOMMAND_MEDIA_PREVIOUSTRACK,
+            },
         },
         UI::{
             HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
@@ -23,12 +30,14 @@ use windows::{
                 TaskbarList,
             },
             WindowsAndMessaging::{
-                CreateIconIndirect, DestroyIcon, HICON, ICONINFO, RegisterWindowMessageW,
-                SM_CXICON, SM_CYICON, WM_COMMAND, WM_DPICHANGED, WM_NCDESTROY,
+                CreateIconIndirect, DestroyIcon, FAPPCOMMAND_MASK, HICON, ICON_BIG, ICON_SMALL,
+                ICONINFO, IMAGE_FLAGS, IMAGE_ICON, LoadImageW, RegisterWindowMessageW, SM_CXICON,
+                SM_CXSMICON, SM_CYICON, SM_CYSMICON, SendMessageW, WM_APPCOMMAND, WM_COMMAND,
+                WM_DPICHANGED, WM_NCDESTROY, WM_SETICON,
             },
         },
     },
-    core::w,
+    core::{PCWSTR, w},
 };
 
 const SUBCLASS: usize = 1;
@@ -37,6 +46,8 @@ const FIRST_BUTTON: u32 = 4500;
 #[derive(Clone, Copy)]
 pub enum Command {
     Previous,
+    Play,
+    Pause,
     PlayPause,
     Next,
     Shuffle,
@@ -55,6 +66,7 @@ struct Signals {
     taskbar_created: u32,
     reset: Cell<bool>,
     dpi_changed: Cell<bool>,
+    media_key_fallback: Cell<bool>,
     alive: Cell<bool>,
     commands: RefCell<Vec<Command>>,
     ctx: egui::Context,
@@ -64,6 +76,7 @@ pub struct Taskbar {
     hwnd: HWND,
     signals: Box<Signals>,
     icons: Vec<Icon>,
+    window_icons: Option<[Icon; 2]>,
     list: Option<ITaskbarList3>,
     state: Option<Buttons>,
     retry: Instant,
@@ -83,6 +96,7 @@ impl Taskbar {
             taskbar_created,
             reset: Cell::new(false),
             dpi_changed: Cell::new(false),
+            media_key_fallback: Cell::new(false),
             alive: Cell::new(true),
             commands: RefCell::new(Vec::new()),
             ctx: ctx.clone(),
@@ -105,6 +119,7 @@ impl Taskbar {
             hwnd,
             signals,
             icons,
+            window_icons: set_window_icons(hwnd),
             list: None,
             state: None,
             retry: Instant::now(),
@@ -115,6 +130,10 @@ impl Taskbar {
 
     pub fn commands(&self) -> Vec<Command> {
         std::mem::take(&mut *self.signals.commands.borrow_mut())
+    }
+
+    pub fn use_focused_media_keys(&self, enabled: bool) {
+        self.signals.media_key_fallback.set(enabled);
     }
 
     pub fn refresh(&mut self, state: Buttons) {
@@ -128,6 +147,9 @@ impl Taskbar {
             self.retry_delay = Duration::from_secs(1);
         }
         if self.signals.dpi_changed.replace(false) {
+            if let Some(icons) = set_window_icons(self.hwnd) {
+                self.window_icons = Some(icons);
+            }
             if let Some(icons) = load_icons(self.hwnd) {
                 self.icons = icons;
                 self.state = None;
@@ -165,7 +187,11 @@ impl Taskbar {
                 CoCreateInstance::<_, ITaskbarList3>(&TaskbarList, None, CLSCTX_INPROC_SERVER)
                     .and_then(|list| {
                         list.HrInit()?;
-                        list.ThumbBarAddButtons(self.hwnd, &buttons)?;
+                        // Explorer only accepts one Add per window. A late readiness
+                        // message can arrive after a successful registration.
+                        if list.ThumbBarAddButtons(self.hwnd, &buttons).is_err() {
+                            list.ThumbBarUpdateButtons(self.hwnd, &buttons)?;
+                        }
                         Ok(list)
                     })
             }
@@ -177,10 +203,14 @@ impl Taskbar {
             self.state = Some(state);
             self.retry_delay = Duration::from_secs(1);
         } else {
+            self.list = None;
+            self.state = None;
             let delay = self.retry_delay;
             self.retry = Instant::now() + delay;
             self.retry_delay = (delay * 2).min(Duration::from_secs(30));
-            self.signals.ctx.request_repaint_after(delay);
+            self.signals
+                .ctx
+                .request_repaint_after_for(delay, egui::ViewportId::ROOT);
         }
     }
 }
@@ -190,6 +220,11 @@ impl Drop for Taskbar {
         if self.signals.alive.get() {
             unsafe {
                 let _ = RemoveWindowSubclass(self.hwnd, Some(subclass), SUBCLASS);
+                if self.window_icons.is_some() {
+                    for kind in [ICON_SMALL, ICON_BIG] {
+                        SendMessageW(self.hwnd, WM_SETICON, WPARAM(kind as usize), LPARAM(0));
+                    }
+                }
             }
         }
         drop(self.list.take());
@@ -217,11 +252,17 @@ unsafe extern "system" fn subclass(
         }
     } else if message == signals.taskbar_created && message != 0 {
         signals.reset.set(true);
-        signals.ctx.request_repaint();
+        signals.ctx.request_repaint_of(egui::ViewportId::ROOT);
     } else if message == WM_DPICHANGED {
         signals.dpi_changed.set(true);
         signals.ctx.request_repaint();
-    } else if message == WM_COMMAND && (wparam.0 >> 16) as u32 == THBN_CLICKED {
+    } else if message == WM_APPCOMMAND
+        && signals.media_key_fallback.get()
+        && let Some(command) = app_command(lparam)
+    {
+        enqueue(signals, command);
+        return LRESULT(1);
+    } else if message == WM_COMMAND && ((wparam.0 >> 16) & 0xffff) as u32 == THBN_CLICKED {
         let button = (wparam.0 as u32 & 0xffff).checked_sub(FIRST_BUTTON);
         if let Some(command) = match button {
             Some(0) => Some(Command::Previous),
@@ -230,16 +271,32 @@ unsafe extern "system" fn subclass(
             Some(3) => Some(Command::Shuffle),
             _ => None,
         } {
-            if let Ok(mut queue) = signals.commands.try_borrow_mut() {
-                if queue.len() < 16 {
-                    queue.push(command);
-                }
-            }
-            signals.ctx.request_repaint();
+            enqueue(signals, command);
             return LRESULT(0);
         }
     }
     unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
+fn enqueue(signals: &Signals, command: Command) {
+    if let Ok(mut queue) = signals.commands.try_borrow_mut() {
+        if queue.len() < 16 {
+            queue.push(command);
+        }
+    }
+    signals.ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
+fn app_command(lparam: LPARAM) -> Option<Command> {
+    let id = ((lparam.0 as usize >> 16) as u32 & 0xffff) & !FAPPCOMMAND_MASK;
+    match id {
+        id if id == APPCOMMAND_MEDIA_PREVIOUSTRACK.0 => Some(Command::Previous),
+        id if id == APPCOMMAND_MEDIA_NEXTTRACK.0 => Some(Command::Next),
+        id if id == APPCOMMAND_MEDIA_PLAY_PAUSE.0 => Some(Command::PlayPause),
+        id if id == APPCOMMAND_MEDIA_PLAY.0 => Some(Command::Play),
+        id if id == APPCOMMAND_MEDIA_PAUSE.0 => Some(Command::Pause),
+        _ => None,
+    }
 }
 
 fn make_button(index: u32, icon: HICON, tip: &str, enabled: bool) -> THUMBBUTTON {
@@ -285,6 +342,41 @@ fn load_icons(hwnd: HWND) -> Option<Vec<Icon>> {
 }
 
 struct Icon(HICON);
+
+fn set_window_icons(hwnd: HWND) -> Option<[Icon; 2]> {
+    // Resource group 1 is written by build.rs. Load the nearest size for this monitor's DPI.
+    unsafe {
+        let module = GetModuleHandleW(PCWSTR::null()).ok()?;
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let load = |cx, cy| {
+            LoadImageW(
+                HINSTANCE(module.0),
+                PCWSTR(std::ptr::without_provenance(1)),
+                IMAGE_ICON,
+                GetSystemMetricsForDpi(cx, dpi),
+                GetSystemMetricsForDpi(cy, dpi),
+                IMAGE_FLAGS(0),
+            )
+            .ok()
+            .map(|handle| Icon(HICON(handle.0)))
+        };
+        let small = load(SM_CXSMICON, SM_CYSMICON)?;
+        let large = load(SM_CXICON, SM_CYICON)?;
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_SMALL as usize),
+            LPARAM(small.0.0),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            WPARAM(ICON_BIG as usize),
+            LPARAM(large.0.0),
+        );
+        Some([small, large])
+    }
+}
 
 impl Icon {
     fn new(glyph: Glyph, width: i32, height: i32) -> Option<Self> {

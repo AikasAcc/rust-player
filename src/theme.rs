@@ -1,5 +1,136 @@
 use eframe::egui::{Color32, Visuals};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NamedTheme {
+    pub name: String,
+    pub theme: Theme,
+    pub font: Option<PathBuf>,
+    #[serde(default)]
+    pub background: crate::background::Settings,
+}
+
+impl crate::ThemeDraft {
+    pub(super) fn saved_theme_settings(&mut self, ui: &mut eframe::egui::Ui) {
+        use eframe::egui::{Button, ComboBox, TextEdit};
+        self.selected = self.selected.filter(|&index| index < self.themes.len());
+        let title = self.selected.map_or("Choose a saved theme", |index| {
+            self.themes[index].name.as_str()
+        });
+        ComboBox::from_label("Saved themes")
+            .selected_text(title)
+            .show_ui(ui, |ui| {
+                for (index, theme) in self.themes.iter().enumerate() {
+                    if ui
+                        .selectable_value(&mut self.selected, Some(index), &theme.name)
+                        .clicked()
+                    {
+                        self.name.clone_from(&theme.name);
+                        self.theme_error.clear();
+                    }
+                }
+            });
+        ui.add(
+            TextEdit::singleline(&mut self.name)
+                .hint_text("Theme name")
+                .char_limit(48),
+        );
+        let name = self.name.trim().to_owned();
+        let taken = self
+            .themes
+            .iter()
+            .position(|theme| theme.name.to_lowercase() == name.to_lowercase());
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !name.is_empty() && taken.is_none(),
+                    Button::new("Save as new"),
+                )
+                .clicked()
+            {
+                let theme = NamedTheme {
+                    name: name.clone(),
+                    theme: self.theme,
+                    font: self.font.clone(),
+                    background: self.background.clone(),
+                };
+                self.selected = Some(self.themes.len());
+                self.themes.push(theme);
+                self.theme_error.clear();
+            }
+            if let Some(index) = self.selected {
+                if ui.button("Load").clicked() {
+                    let theme = &self.themes[index];
+                    self.theme = theme.theme;
+                    self.background = theme.background.clone();
+                    match crate::fonts::load(theme.font.as_deref()) {
+                        Ok(fonts) => {
+                            ui.ctx().set_fonts(fonts);
+                            self.font_error.clear();
+                        }
+                        Err(error) => {
+                            ui.ctx().set_fonts(Default::default());
+                            self.font_error = format!("Could not load font: {error}");
+                        }
+                    }
+                    self.font = theme.font.clone();
+                    self.copy_background = false;
+                }
+                if ui
+                    .button("Update")
+                    .on_hover_text(
+                        "Save the current colors, font and background to the selected theme.",
+                    )
+                    .clicked()
+                {
+                    let saved = &mut self.themes[index];
+                    saved.theme = self.theme;
+                    saved.font.clone_from(&self.font);
+                    saved.background.clone_from(&self.background);
+                }
+                if ui
+                    .add_enabled(
+                        !name.is_empty()
+                            && (taken.is_none() || taken == Some(index))
+                            && name != self.themes[index].name,
+                        Button::new("Rename"),
+                    )
+                    .clicked()
+                {
+                    self.themes[index].name = name.clone();
+                }
+                if ui.button("Duplicate").clicked() {
+                    let mut duplicate = self.themes[index].clone();
+                    let base: String = duplicate.name.chars().take(34).collect();
+                    duplicate.name = (1..)
+                        .map(|number| format!("{base} copy {number}"))
+                        .find(|name| {
+                            self.themes
+                                .iter()
+                                .all(|theme| theme.name.to_lowercase() != name.to_lowercase())
+                        })
+                        .expect("an unused theme name");
+                    self.name.clone_from(&duplicate.name);
+                    self.selected = Some(self.themes.len());
+                    self.themes.push(duplicate);
+                }
+                if ui
+                    .button("Delete")
+                    .on_hover_text("Remove this saved theme when you apply the editor changes.")
+                    .clicked()
+                {
+                    self.themes.remove(index);
+                    self.selected = None;
+                    self.name.clear();
+                }
+            }
+        });
+        if !self.theme_error.is_empty() {
+            ui.weak(&self.theme_error);
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
