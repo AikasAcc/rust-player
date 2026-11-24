@@ -1,0 +1,37 @@
+name: Submit a community theme
+description: Share a Rust Player theme with the gallery.
+title: "Theme: "
+labels: ["theme-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing a theme. Include a screenshot and the color/layout settings used in Rust Player's Theme Editor. Do not include local font paths or background-image paths.
+  - type: input
+    id: author
+    attributes:
+      label: Author name
+      placeholder: Your GitHub handle or display name
+    validations:
+      required: true
+  - type: input
+    id: description
+    attributes:
+      label: Short description
+      placeholder: A sentence about the mood or use case.
+    validations:
+      required: true
+  - type: textarea
+    id: theme
+    attributes:
+      label: Theme settings
+      description: Paste the theme colors and layout settings (or JSON) here.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: screenshot
+    attributes:
+      label: Screenshot (optional)
+      description: Drag a PNG or JPEG here if you would like it considered for the gallery.
+

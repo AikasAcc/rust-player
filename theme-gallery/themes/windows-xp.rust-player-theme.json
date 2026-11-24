@@ -1,0 +1,18 @@
+{
+  "format": "rust-player-theme",
+  "version": 1,
+  "name": "Windows XP",
+  "theme": {
+    "background": [210, 232, 255],
+    "surface": [126, 184, 237],
+    "text": [0, 42, 104],
+    "accent": [56, 151, 56],
+    "density": "Compact",
+    "corner_radius": 6,
+    "font_scale_percent": 100,
+    "surface_strength_percent": 72,
+    "accent_strength_percent": 32,
+    "high_contrast": true
+  }
+}
+

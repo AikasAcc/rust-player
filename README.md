@@ -74,6 +74,8 @@ The local-first lyrics workflow takes inspiration from [OpenLyrics](https://gith
 
 Open **Theme** in the toolbar to preview a preset or edit the background, panel and button, text, and accent colors. **Choose font…** previews a local TTF or OTF as the interface font. **Apply** saves the theme and font path for the next start. **Cancel** restores the previously applied theme. If a font file becomes unavailable, the player uses its default font.
 
+Browse and share palettes through the [Rust Player community theme gallery](https://aikasacc.github.io/rust-player/). Community submissions include their color and layout settings so they can be recreated in the Theme Editor.
+
 Use **Saved themes** to save your current colors, font and playlist background under a name, then load, update, rename, duplicate or delete it. Changes in the editor take effect permanently with **Apply**.
 
 Choose or drop an image while the Theme Editor is open. The playlist supports PNG, JPEG, WebP, GIF, BMP, TIFF and ICO, with Cover, Contain, Stretch, Tile and Center, as well as opacity, darkening and blur. Backgrounds and blur are off by default. GIF and animated WebP play at up to 30 FPS and can pause when the window loses focus. The player falls back to the theme color if the file is missing or invalid. Select **Copy the image into the player profile on Apply** to keep a local copy independent of your original file.
@@ -128,3 +130,4 @@ WavPack, Monkey's Audio, DSD/DoP, ASIO output, and video backgrounds are outside
 ## License
 
 Rust Player is available under the [MIT License](LICENSE). Windows release archives include the third-party dependency notices.
+
