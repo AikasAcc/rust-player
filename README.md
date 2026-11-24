@@ -1,6 +1,6 @@
 # Rust Player
 
-<img width="1120" height="680" alt="image" src="https://github.com/user-attachments/assets/7756e401-8275-47af-87b2-ae6a769be733" />
+<img width="1120" height="680" alt="image" src="https://github.com/user-attachments/assets/29bd29ea-cb4e-4e38-b205-746b3cadfa1e" />
 
 A standalone Windows x64 audio player written in Rust with egui, Symphonia, and WASAPI. It supports local music libraries, editable playlists, album artwork, synchronized lyrics, themes, and script plugins.
 
