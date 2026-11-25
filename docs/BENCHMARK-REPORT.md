@@ -1,16 +1,16 @@
-# Benchmark-Bericht
+# Benchmark report
 
-Zweck: reproduzierbare, maschinell auswertbare Mikromessungen als Grundlage für den
-UI-Thread-Offload (Audit-Punkt 6). **Grenze:** hier wird keine echte UI-Frame-Time gemessen.
-Die Zahlen zeigen Rechenzeit im Release-Build, nicht das gefühlte Verhalten der Oberfläche.
+Purpose: reproducible, machine-evaluable micro-measurements as the basis for the
+UI-thread offload (audit item 6). **Limitation:** no real UI frame time is measured here.
+The figures show compute time in the release build, not the perceived behavior of the interface.
 
-## Umgebung
+## Environment
 
-- Windows, AMD Ryzen 7 5700X (8 Kerne), 32 GiB RAM
-- Rust 1.100.0 (über `rust-toolchain.toml` festgelegt), Release-Profil aus `Cargo.toml`
-- Messung im Testprozess, `black_box` für den Suchbegriff, ein Thread
+- Windows, AMD Ryzen 7 5700X (8 cores), 32 GiB RAM
+- Rust 1.100.0 (pinned via `rust-toolchain.toml`), release profile from `Cargo.toml`
+- Measurement in the test process, `black_box` for the search term, one thread
 
-## Reproduktion
+## Reproduction
 
 ```powershell
 cargo test --release --locked -- --ignored --nocapture --test-threads=1 benchmarks::library_search_scale
@@ -19,107 +19,107 @@ cargo test --release --locked -- --ignored --nocapture --test-threads=1 benchmar
 cargo test --release --locked -- --ignored --nocapture --test-threads=1 benchmarks::media_read_scale
 ```
 
-Jeder Lauf überschreibt seine Rohdaten als CSV:
+Each run overwrites its raw data as CSV:
 
 - `target/benchmark-search.csv`
 - `target/benchmark-tag_scan.csv`
 - `target/benchmark-save.csv`
 - `target/benchmark-media.csv`
 
-Spalten: `scenario,size,micros`. Die Rohdaten des letzten Laufs liegen in `target/benchmark-save.csv` und `target/benchmark-media.csv`.
+Columns: `scenario,size,micros`. Raw data from the latest run is in `target/benchmark-save.csv` and `target/benchmark-media.csv`.
 
-## Bibliothekssuche und Ansichtsaufbau
+## Library search and view construction
 
-Alle Zeiten in Mikroseunden. Die Suche wurde siebenmal pro Größe ausgeführt; der erste
-Wert enthält zusätzliche Cold-Cache-Effekte.
+All times are in microseconds. The search was run seven times per size; the first
+value includes additional cold-cache effects.
 
-| Titel | Aufbau | Suche 1 | Suche 2–7 (Bereich) |
+| Tracks | Build | Search 1 | Search 2–7 (range) |
 |---:|---:|---:|---:|
 | 1.000 | 798 | 27 | 12 |
 | 10.000 | 7.949 | 248 | 125–139 |
 | 50.000 | 44.650 | 1.187 | 514–797 |
 | 100.000 | 90.453 | 2.288 | 1.625–2.634 |
 
-Deutung: der Aufbau skaliert annähernd linear. Die Suche bleibt im warmen Zustand
-selbst bei 100.000 Titeln im Bereich von etwa 1,6–2,6 ms. Das ist kein Grund, die
-Suche jetzt zu optimieren; es ist die Basis, um einen späteren Offload messbar zu machen.
+Interpretation: construction scales approximately linearly. Even with 100.000
+tracks, the search stays in the range of roughly 1,6–2,6 ms when warm. This is not a
+reason to optimize the search now; it is the baseline for making a later offload measurable.
 
-## Metadaten-Scan (1.000 Dateien)
+## Metadata scan (1.000 files)
 
-Vier Läufe über 1.000 hart verlinkte PCM-WAV-Dateien:
+Four runs over 1.000 hard-linked PCM WAV files:
 
-| Lauf | Mikroseunden |
+| Run | Microseconds |
 |---:|---:|
 | 1 (cold) | 623.562 |
 | 2 | 209.880 |
 | 3 | 198.181 |
 | 4 | 200.056 |
 
-Deutung: nach dem ersten Lauf liegt der Scan bei etwa 200 ms für 1.000 Dateien.
-Der erste Lauf ist deutlich langsamer, weil Dateien und Cache noch nicht warm sind.
-Dieser Wert war die Begründung, den Metadaten-Indexer bereits asynchron zu betreiben.
-Der ReplayGain-Scan läuft inzwischen ebenfalls im Hintergrund; die Zahlen hier betreffen
-den getrennten Metadaten-Pfad und sind keine Audio-Messung.
+Interpretation: after the first run, the scan takes about 200 ms for 1.000 files.
+The first run is significantly slower because files and cache are not warm yet.
+This figure was the reason for running the metadata indexer asynchronously already.
+The ReplayGain scan now also runs in the background; the figures here concern
+the separate metadata path and are not an audio measurement.
 
-## Persistenz-Pfad — vor und nach dem Offload
+## Persistence path — before and after the offload
 
-`library_save_scale` misst drei Szenarien pro Größe (je drei Wiederholungen):
+`library_save_scale` measures three scenarios per size (three repetitions each):
 
-- `save_json`: alter Pfad, Serialisieren + `tempfile` + `fsync` + `persist` **im aufrufenden Thread**.
-- `serialize`: nur `serde_json::to_vec`.
-- `ui_path`: Serialisieren + Einreihen in den Hintergrund-Schreiber — das, was der UI-Thread heute noch tut. Die `fsync`-Arbeit des Workers zählt hier **nicht**.
+- `save_json`: old path, serialization + `tempfile` + `fsync` + `persist` **in the calling thread**.
+- `serialize`: only `serde_json::to_vec`.
+- `ui_path`: serialization + enqueuing in the background writer — what the UI thread still does today. The worker's `fsync` work is **not** counted here.
 
-Baseline (vor dem Offload, erster Lauf, warm):
+Baseline (before the offload, first run, warm):
 
-| Titel | `serialize` | `save_json` (UI-Thread) |
+| Tracks | `serialize` | `save_json` (UI thread) |
 |---:|---:|---:|
 | 1.000 | 49–67 µs | 1,39–1,87 ms |
 | 10.000 | 354–491 µs | 2,02–2,84 ms |
 | 50.000 | 1,63–1,69 ms | 4,45–4,75 ms |
 | 100.000 | 3,79–4,45 ms | 8,25–8,42 ms |
 
-Nach dem Offload (letzter Lauf, Rohdaten in `target/benchmark-save.csv`):
+After the offload (latest run, raw data in `target/benchmark-save.csv`):
 
-| Titel | `ui_path` | `save_json` (Vergleich im selben Lauf) |
+| Tracks | `ui_path` | `save_json` (comparison in the same run) |
 |---:|---:|---:|
 | 1.000 | 38–80 µs | 2,03–4,59 ms |
 | 10.000 | 392–577 µs | 2,59–7,87 ms |
 | 50.000 | 2,41–2,67 ms | 6,49–7,92 ms |
 | 100.000 | 4,84–5,41 ms | 11,19–20,33 ms |
 
-**Wichtig zur Einordnung:** die absolute Disk-Latenz schwankt zwischen Läufen stark
-(ein Zwischenlauf lag bei 100.000 Titeln bei 42–89 ms für `save_json`). Ursache ist
-vermutlich Antiviren-Scanning und Cache-Zustand, nicht der Code. Vergleichbar sind nur
-Werte aus demselben Lauf. Dort ist der UI-Thread-Aufwand durch den Offload um etwa
-Faktor 8–15 bei 100.000 Titeln und um mehr als Faktor 20 bei 1.000 Titeln gesunken.
+**Important context:** absolute disk latency varies greatly between runs
+(one intermediate run was 42–89 ms for `save_json` at 100.000 tracks). The cause is
+likely antivirus scanning and cache state, not the code. Only values from the same
+run are comparable. Within a run, the UI-thread overhead dropped by about a factor
+of 8–15 at 100.000 tracks and by more than a factor of 20 at 1.000 tracks.
 
-Deutung: Serialisieren bleibt zwangsläufig im UI-Thread, weil es den aktuellen State
-liest. Der teure und unvorhersehbare Teil (`fsync`/`persist`) läuft jetzt im Worker.
-Zusätzlich coalescht der Worker mehrere Snapshots derselben Datei — bei schnellen
-Einstellungsänderungen landet nur der neueste Zustand auf der Platte.
+Interpretation: serialization inevitably remains in the UI thread because it reads
+the current state. The expensive and unpredictable part (`fsync`/`persist`) now runs
+in the worker. In addition, the worker coalesces multiple snapshots of the same file —
+with rapid settings changes, only the latest state reaches disk.
 
-## Track-Wechsel — vor und nach dem Offload
+## Track changes — before and after the offload
 
-`media_read_scale` läuft 1.000-mal gegen dieselbe getaggte PCM-WAV-Datei (Rohdaten in
+`media_read_scale` runs 1.000 times against the same tagged PCM WAV file (raw data in
 `target/benchmark-media.csv`):
 
-| Szenario | 1.000 Läufe | pro Aufruf |
+| Scenario | 1.000 runs | per call |
 |---|---:|---:|
-| `media_placeholder` (heute im UI-Thread) | 162 µs | ~0,16 µs |
-| `media_read` (früher synchron im UI-Thread, heute Worker) | 165.429 µs | ~165 µs |
+| `media_placeholder` (used in the UI thread today) | 162 µs | ~0,16 µs |
+| `media_read` (formerly synchronous in the UI thread, now a worker) | 165.429 µs | ~165 µs |
 
-Deutung: der Tag- und Cover-Parse kostete bisher rund 165 µs **pro Trackwechsel auf dem
-UI-Thread** — bei einer FLAC mit eingebettem Cover oder einer großen CUE-Datei liegt der
-Wert höher. Der UI-Thread setzt jetzt nur einen Titel-Snapshot und reiht den vollständigen
-Lesevorgang in einen `mpsc`-Kanal ein. `finish_media_job()` übernimmt Ergebnis, Cover und
-Lyrics auf dem UI-Thread und verwirft Ergebnisse über eine Generation, wenn der Nutzer
-inzwischen schon den nächsten Track gewählt hat. Der Properties-Dialog nutzt dasselbe
-Muster über `property_jobs`, damit auch das Öffnen der Track-Eigenschaften nicht mehr
-auf den Tag-Lesevorgang wartet.
+Interpretation: tag and cover parsing previously cost around 165 µs **per
+track change on the UI thread** — higher for a FLAC with an embedded cover or a
+large CUE file. The UI thread now only sets a track snapshot and enqueues the full
+read operation on an `mpsc` channel. `finish_media_job()` takes the result, cover
+and lyrics over on the UI thread and discards results via a generation if the user
+has already selected the next track in the meantime. The properties dialog uses
+the same pattern via `property_jobs`, so opening track properties no longer waits
+for the tag read.
 
-## Offene Messpunkte
+## Open measurement points
 
-- Frame-Time der Oberfläche unter Last (egui), noch nicht gemessen. Die Zahlen oben sind Rechenzeit, keine Frame-Time.
-- Import/Export von Playlistdateien: durch das `mpsc`-Muster offloadet, aber nicht separat benchmarkt (Dateigrößen und CUE-Anteil variieren zu stark).
-- Speicher- und CPU-Profiling während des Scans, noch nicht gemessen.
-- Audio-Pump-Loop: kein Benchmark. Die Entfernung von `Mutex` + `Next`-Clone pro Iteration ist nur logisch getestet (`queue_changes_are_observed_once_without_polling_the_mutex`); ein Hörtest steht aus.
+- UI frame time under load (egui), not measured yet. The figures above are compute time, not frame time.
+- Playlist file import/export: offloaded via the `mpsc` pattern, but not benchmarked separately (file sizes and CUE share vary too much).
+- Memory and CPU profiling during the scan, not measured yet.
+- Audio pump loop: no benchmark. Removing `Mutex` + `Next` clone per iteration is only logically tested (`queue_changes_are_observed_once_without_polling_the_mutex`); a listening test is outstanding.
