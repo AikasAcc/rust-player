@@ -43,10 +43,15 @@ pub const AUDIO: &[&str] = &[
     "mp3", "flac", "wav", "ogg", "m4a", "aac", "alac", "aiff", "aif", "aifc", "caf", "cue",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TrackId(pub u64);
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub name: String,
     pub tracks: Vec<PathBuf>,
+    #[serde(default)]
+    pub ids: Vec<TrackId>,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
@@ -252,6 +257,8 @@ impl PlaylistView {
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct Library {
+    #[serde(skip)]
+    pub locations: HashMap<TrackId, crate::Track>,
     pub media_keys: bool,
     pub audio_setup_done: bool,
     pub restore_last_track: bool,
@@ -290,6 +297,7 @@ pub struct Library {
 impl Default for Library {
     fn default() -> Self {
         Self {
+            locations: Default::default(),
             media_keys: true,
             audio_setup_done: false,
             restore_last_track: true,
@@ -312,6 +320,7 @@ impl Default for Library {
             check_for_updates: true,
             track_artwork: false,
             playlists: vec![Playlist {
+                ids: Vec::new(),
                 name: "Default".into(),
                 tracks: Vec::new(),
                 pinned: false,
@@ -334,6 +343,33 @@ impl Default for Library {
 }
 
 impl Library {
+    pub fn rebuild_locations(&mut self) {
+        self.locations.clear();
+        for (list, p) in self.playlists.iter_mut().enumerate() {
+            p.ids.truncate(p.tracks.len());
+            for index in 0..p.tracks.len() {
+                let id = p
+                    .ids
+                    .get(index)
+                    .copied()
+                    .filter(|id| !self.locations.contains_key(id))
+                    .unwrap_or_else(|| {
+                        loop {
+                            let candidate = TrackId(rand::random());
+                            if !self.locations.contains_key(&candidate) {
+                                break candidate;
+                            }
+                        }
+                    });
+                if let Some(slot) = p.ids.get_mut(index) {
+                    *slot = id;
+                } else {
+                    p.ids.push(id);
+                }
+                self.locations.insert(id, (list, index));
+            }
+        }
+    }
     pub fn toggle_mute(&mut self) {
         if self.muted {
             self.volume = self.volume_before_mute;
@@ -413,6 +449,7 @@ impl Library {
         }
         data.selected = data.selected.min(data.playlists.len() - 1);
         data.favorites = data.favorites.filter(|&index| index < data.playlists.len());
+        data.rebuild_locations();
         Ok(data)
     }
 

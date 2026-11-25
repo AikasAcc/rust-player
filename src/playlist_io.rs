@@ -59,6 +59,7 @@ pub fn import(path: &Path) -> io::Result<(Playlist, usize)> {
         .unwrap_or_else(|| "Imported playlist".into());
     Ok((
         Playlist {
+            ids: Vec::new(),
             name,
             tracks,
             pinned: false,

@@ -1,10 +1,10 @@
-use crate::{Player, Track};
+use crate::{Player, Track, TrackId};
 use eframe::egui;
 use std::{collections::VecDeque, time::Duration};
 
 struct Entry {
     id: u64,
-    track: Track,
+    track: TrackId,
     title: String,
 }
 
@@ -15,7 +15,7 @@ pub(super) struct PlayQueue {
 }
 
 impl PlayQueue {
-    pub fn push(&mut self, track: Track, title: String) {
+    pub fn push(&mut self, track: TrackId, title: String) {
         self.entries.push_back(Entry {
             id: self.next_id,
             track,
@@ -28,11 +28,11 @@ impl PlayQueue {
         self.entries.is_empty()
     }
 
-    pub fn next(&self) -> Option<(u64, Track)> {
+    pub fn next(&self) -> Option<(u64, TrackId)> {
         self.entries.front().map(|entry| (entry.id, entry.track))
     }
 
-    pub fn take(&mut self, id: u64) -> Option<Track> {
+    pub fn take(&mut self, id: u64) -> Option<TrackId> {
         let index = self.entries.iter().position(|entry| entry.id == id)?;
         self.entries.remove(index).map(|entry| entry.track)
     }
@@ -46,15 +46,8 @@ impl PlayQueue {
         }
     }
 
-    pub fn remap(&mut self, map: impl Fn(Track) -> Option<Track>) {
-        self.entries.retain_mut(|entry| {
-            if let Some(track) = map(entry.track) {
-                entry.track = track;
-                true
-            } else {
-                false
-            }
-        });
+    pub fn retain(&mut self, keep: impl Fn(TrackId) -> bool) {
+        self.entries.retain(|e| keep(e.track));
     }
 }
 
@@ -84,7 +77,10 @@ impl Player {
     }
 
     pub(super) fn order_track(&self) -> Option<Track> {
-        Some((self.order_list?, *self.order.get(self.cursor)?))
+        self.library
+            .locations
+            .get(self.order.get(self.cursor)?)
+            .copied()
     }
 
     pub(super) fn adjacent_cursor(&self, offset: isize) -> Option<usize> {
@@ -100,7 +96,10 @@ impl Player {
     pub(super) fn play_next_queued(&mut self, ctx: &egui::Context) -> Result<(), Option<String>> {
         let mut warning = None;
         while let Some(entry) = self.play_queue.entries.pop_front() {
-            match self.open(entry.track, ctx, None) {
+            let Some(&location) = self.library.locations.get(&entry.track) else {
+                continue;
+            };
+            match self.open(location, ctx, None) {
                 Ok(()) => {
                     self.status = warning.unwrap_or_default();
                     self.save_playback(Duration::ZERO);
@@ -197,7 +196,7 @@ impl Player {
                                         continue;
                                     };
                                     let position = start + index - added;
-                                    let track = self.order[position];
+                                    let track = self.library.locations[&self.order[position]].1;
                                     let title = self
                                         .views
                                         .get(&list)
@@ -218,7 +217,9 @@ impl Player {
                                     )
                                 };
                             let (list, track) = match row {
-                                QueueRow::Added(_) => queue.entries[index].track,
+                                QueueRow::Added(_) => {
+                                    self.library.locations[&queue.entries[index].track]
+                                }
                                 QueueRow::Playlist(track) => track,
                             };
                             let metadata = self
@@ -349,7 +350,10 @@ impl Player {
                 }
             }
             QueueRow::Playlist((list, track)) if self.order_list == Some(list) => {
-                if let Some(offset) = self.order[start..].iter().position(|&index| index == track) {
+                if let Some(offset) = self.order[start..]
+                    .iter()
+                    .position(|&id| id == self.library.playlists[list].ids[track])
+                {
                     let track = self.order.remove(start + offset);
                     if let Some(position) = destination {
                         self.order.insert(position, track);
@@ -365,25 +369,22 @@ impl Player {
 
 #[cfg(test)]
 mod tests {
-    use super::PlayQueue;
+    use super::{PlayQueue, TrackId};
 
     #[test]
     fn reorder_and_remap_keep_duplicate_entries_independent() {
         let mut queue = PlayQueue::default();
-        queue.push((2, 0), "First".into());
+        queue.push(TrackId(2), "First".into());
         let first = queue.next().unwrap().0;
-        queue.push((3, 0), "Second".into());
-        queue.push((2, 0), "First again".into());
+        queue.push(TrackId(3), "Second".into());
+        queue.push(TrackId(2), "First again".into());
         queue.move_to(first, 2);
-        assert_eq!(queue.next().unwrap().1, (3, 0));
+        assert_eq!(queue.next().unwrap().1, TrackId(3));
 
-        queue.remap(|(list, track)| match list {
-            3 => None,
-            _ => Some((list - 1, track)),
-        });
+        queue.retain(|id| id != TrackId(3));
         let (duplicate, track) = queue.next().unwrap();
         assert_ne!(duplicate, first);
-        assert_eq!(track, (1, 0));
+        assert_eq!(track, TrackId(2));
         assert_eq!(queue.take(first), Some(track));
         assert_eq!(queue.next(), Some((duplicate, track)));
         assert_eq!(queue.take(duplicate), Some(track));

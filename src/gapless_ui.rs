@@ -34,6 +34,7 @@ impl Player {
                 return None;
             }
             let (target, track) = if let Some((id, track)) = self.play_queue.next() {
+                let track = *self.library.locations.get(&track)?;
                 (NextTarget::Queue(id, track), track)
             } else if self.library.repeat == Repeat::One {
                 (NextTarget::Repeat(playing.track), playing.track)
@@ -41,7 +42,7 @@ impl Player {
                 let cursor = self.next_cursor()?;
                 (
                     NextTarget::Playlist(cursor),
-                    (self.order_list?, *self.order.get(cursor)?),
+                    *self.library.locations.get(self.order.get(cursor)?)?,
                 )
             };
             let path = self
@@ -76,6 +77,7 @@ impl Player {
         );
         let resolve = |track| {
             SavedTrack {
+                id: None,
                 track,
                 path: event.next.path.clone(),
                 position: Duration::ZERO,
@@ -86,7 +88,11 @@ impl Player {
             NextTarget::Playlist(planned) => self.order_list.and_then(|list| {
                 let tracks = &self.library.playlists[list].tracks;
                 let matches = |cursor| {
-                    self.order.get(cursor).and_then(|&i| tracks.get(i)) == Some(&event.next.path)
+                    self.order
+                        .get(cursor)
+                        .and_then(|id| self.library.locations.get(id))
+                        .and_then(|&(_, i)| tracks.get(i))
+                        == Some(&event.next.path)
                 };
                 let cursor = if matches(planned) {
                     planned
@@ -94,9 +100,14 @@ impl Player {
                     (0..self.order.len()).find(|&cursor| matches(cursor))?
                 };
                 self.cursor = cursor;
-                Some((list, self.order[cursor]))
+                self.library.locations.get(&self.order[cursor]).copied()
             }),
-            NextTarget::Queue(id, planned) => resolve(self.play_queue.take(id).unwrap_or(planned)),
+            NextTarget::Queue(id, planned) => resolve(
+                self.play_queue
+                    .take(id)
+                    .and_then(|id| self.library.locations.get(&id).copied())
+                    .unwrap_or(planned),
+            ),
             NextTarget::Repeat(track) => resolve(track),
         };
         let Some(track) = track else {
@@ -136,13 +147,13 @@ impl Player {
                 Err(error) => warning = Some(format!("Could not repeat track: {error}")),
             }
         }
-        if let Some(list) = self.order_list
+        if self.order_list.is_some()
             && self.library.repeat == Repeat::All
             && self.adjacent_cursor(1).is_none()
         {
             for candidate in 0..self.order.len() {
-                let index = self.order[candidate];
-                match self.open((list, index), ctx, None) {
+                let location = self.library.locations[&self.order[candidate]];
+                match self.open(location, ctx, None) {
                     Ok(()) => {
                         self.cursor = candidate;
                         self.status = warning.unwrap_or_default();

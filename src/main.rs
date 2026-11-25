@@ -26,6 +26,8 @@ mod settings;
 mod taskbar;
 mod theme;
 mod thumbnails;
+#[cfg(test)]
+mod track_id_tests;
 mod update;
 mod window_chrome;
 
@@ -39,10 +41,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use library::TrackId;
 type Track = (usize, usize);
 type ImportResult = (Vec<PathBuf>, usize);
 
 struct Playing {
+    id: TrackId,
     counted: bool,
     lastfm: lastfm::Listen,
     track: Track,
@@ -68,6 +72,8 @@ impl Playing {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct SavedTrack {
+    #[serde(default)]
+    id: Option<TrackId>,
     track: Track,
     path: PathBuf,
     position: Duration,
@@ -179,6 +185,9 @@ impl TrackProperties {
 
 impl SavedTrack {
     fn resolve(&self, library: &Library) -> Option<Track> {
+        if let Some(loc) = self.id.and_then(|id| library.locations.get(&id)) {
+            return Some(*loc);
+        }
         let (list, index) = self.track;
         if let Some(playlist) = library.playlists.get(list) {
             if playlist.tracks.get(index) == Some(&self.path) {
@@ -299,7 +308,7 @@ struct Player {
     search_results: Option<SearchResults>,
     rpc: presence::Presence,
     lastfm: lastfm::Client,
-    order: Vec<usize>,
+    order: Vec<TrackId>,
     cursor: usize,
     order_list: Option<usize>,
     queue_order_edited: bool,
@@ -489,6 +498,7 @@ impl Player {
         let track = playing.track;
         let path = self.library.playlists[track.0].tracks[track.1].clone();
         let saved = SavedTrack {
+            id: Some(playing.id),
             track,
             path,
             position,
@@ -511,26 +521,25 @@ impl Player {
         Some(saved)
     }
 
-    fn remap_playback(&mut self, saved: Option<SavedTrack>, map: impl Fn(Track) -> Option<Track>) {
-        self.play_queue.remap(&map);
-        if let Some(list) = self.order_list {
-            let mut order = Vec::with_capacity(self.order.len());
-            let mut cursor = 0;
-            let mut new_list = None;
-            for (position, &index) in self.order.iter().enumerate() {
-                if let Some((list, index)) = map((list, index)) {
-                    new_list = Some(list);
-                    order.push(index);
-                    cursor += usize::from(self.cursor != usize::MAX && position <= self.cursor);
-                }
-            }
-            self.order = order;
-            self.order_list = new_list;
-            self.cursor = cursor.wrapping_sub(1);
-        }
+    fn refresh_playback_ids(&mut self, saved: Option<SavedTrack>) {
+        let locations = &self.library.locations;
+        self.play_queue.retain(|id| locations.contains_key(&id));
+        let mut cursor = 0;
+        let mut pos = 0;
+        self.order.retain(|id| {
+            let keep = locations.contains_key(id);
+            cursor += usize::from(keep && self.cursor != usize::MAX && pos <= self.cursor);
+            pos += 1;
+            keep
+        });
+        self.cursor = cursor.wrapping_sub(1);
+        self.order_list = self
+            .order
+            .first()
+            .and_then(|id| locations.get(id))
+            .map(|loc| loc.0);
         if let Some(playing) = &mut self.playing {
-            let old = playing.track;
-            if let Some(new) = map(old) {
+            if let Some(&new) = locations.get(&playing.id) {
                 playing.track = new;
                 let position = playing.sink.get_pos();
                 self.save_playback(position);
@@ -543,7 +552,7 @@ impl Player {
             self.sync_presence();
             self.write_playback(None);
         } else if let Some(mut saved) = saved {
-            if let Some(track) = map(saved.track) {
+            if let Some(track) = saved.resolve(&self.library) {
                 saved.track = track;
                 self.write_playback(Some(saved));
             } else {
@@ -576,8 +585,9 @@ impl Player {
                 false
             }
         });
+        self.library.rebuild_locations();
         self.save();
-        self.remap_playback(saved, |(old, track)| rebase(old).map(|new| (new, track)));
+        self.refresh_playback_ids(saved);
     }
 
     fn unique_playlist_name(&self, name: &str) -> String {
@@ -611,10 +621,12 @@ impl Player {
             }
             PlaylistAction::Copy => {
                 let mut playlist = self.library.playlists[index].clone();
+                playlist.ids.clear();
                 playlist.pinned = false;
                 playlist.sidebar_position = None;
                 playlist.name = self.unique_playlist_name(&format!("{} (Copy)", playlist.name));
                 self.library.playlists.push(playlist);
+                self.library.rebuild_locations();
                 self.library.selected = self.library.playlists.len() - 1;
                 self.save();
             }
@@ -653,6 +665,7 @@ impl Player {
                 Ok((mut playlist, ignored)) => {
                     playlist.name = self.unique_playlist_name(&playlist.name);
                     self.library.playlists.push(playlist);
+                    self.library.rebuild_locations();
                     self.library.selected = self.library.playlists.len() - 1;
                     imported += 1;
                     skipped += ignored;
@@ -681,6 +694,7 @@ impl Player {
         } else {
             let index = self.library.playlists.len();
             self.library.playlists.push(Playlist {
+                ids: Vec::new(),
                 name: self.unique_playlist_name("Favorites"),
                 tracks: Vec::new(),
                 pinned: false,
@@ -701,6 +715,7 @@ impl Player {
         if matches.is_empty() {
             let notice = format!("Added to {}", playlist.name);
             self.library.playlists[index].tracks.push(path);
+            self.library.rebuild_locations();
             self.save();
             self.show_notice(notice);
             return;
@@ -722,7 +737,9 @@ impl Player {
                         .map(|entry| (list, entry))
                 });
             if let Some(track) = replacement {
-                self.playing.as_mut().expect("active track").track = track;
+                let p = self.playing.as_mut().expect("active track");
+                p.track = track;
+                p.id = self.library.playlists[track.0].ids[track.1];
                 self.plan(track);
             }
         }
@@ -755,7 +772,14 @@ impl Player {
 
     fn edit_track(&mut self, (list, index): Track, edit: TrackEdit) {
         let saved = self.previously_saved();
-        let tracks = &mut self.library.playlists[list].tracks;
+        let playlist = &mut self.library.playlists[list];
+        match edit {
+            TrackEdit::Remove => {
+                playlist.ids.remove(index);
+            }
+            TrackEdit::Move(other) => playlist.ids.swap(index, other),
+        }
+        let tracks = &mut playlist.tracks;
         match edit {
             TrackEdit::Remove => {
                 tracks.remove(index);
@@ -783,19 +807,9 @@ impl Player {
                 PlaylistView::build(metadata, playlist.sort, playlist.descending),
             );
         }
+        self.library.rebuild_locations();
         self.save();
-        self.remap_playback(saved, |(old, track)| {
-            if old != list {
-                return Some((old, track));
-            }
-            match edit {
-                TrackEdit::Remove if track == index => None,
-                TrackEdit::Remove if track > index => Some((list, track - 1)),
-                TrackEdit::Move(other) if track == index => Some((list, other)),
-                TrackEdit::Move(other) if track == other => Some((list, index)),
-                _ => Some((list, track)),
-            }
-        });
+        self.refresh_playback_ids(saved);
         if matches!(edit, TrackEdit::Move(_))
             && !self.library.shuffle
             && let Some(track) = self.order_track().filter(|track| track.0 == list)
@@ -977,8 +991,10 @@ impl Player {
                     let playlist = &mut self.library.playlists[list];
                     let first_new = playlist.tracks.len();
                     playlist.tracks.extend(tracks);
+                    self.library.rebuild_locations();
+                    let playlist = &self.library.playlists[list];
                     if self.order_list == Some(list) {
-                        let mut extra: Vec<_> = (first_new..playlist.tracks.len()).collect();
+                        let mut extra: Vec<_> = playlist.ids[first_new..].to_vec();
                         if self.library.shuffle {
                             extra.shuffle(&mut rand::rng());
                         }
@@ -1005,23 +1021,25 @@ impl Player {
     fn plan(&mut self, (list, index): Track) {
         self.queue_order_edited = false;
         self.order_list = Some(list);
-        let len = self.library.playlists[list].tracks.len();
+        let ids = &self.library.playlists[list].ids;
+        let len = ids.len();
         self.order.clear();
         if self.library.shuffle {
-            self.order.extend((0..len).filter(|&track| track != index));
+            self.order
+                .extend(ids.iter().copied().filter(|&id| id != ids[index]));
             self.order.shuffle(&mut rand::rng());
-            self.order.insert(0, index);
+            self.order.insert(0, ids[index]);
             self.cursor = 0;
         } else if let Some(view) = self.views.get(&list) {
-            self.order.extend_from_slice(&view.order);
-            self.order.extend(view.tracks.len()..len);
+            self.order.extend(view.order.iter().map(|&i| ids[i]));
+            self.order.extend_from_slice(&ids[view.tracks.len()..len]);
             self.cursor = self
                 .order
                 .iter()
-                .position(|&item| item == index)
+                .position(|&item| item == ids[index])
                 .unwrap_or(index);
         } else {
-            self.order.extend(0..len);
+            self.order.extend_from_slice(ids);
             self.cursor = index;
         }
     }
@@ -1128,6 +1146,7 @@ impl Player {
         self.gapless_generation = self.gapless_generation.wrapping_add(1);
         self.lastfm.track_changed();
         self.playing = Some(Playing {
+            id: self.library.playlists[track.0].ids[track.1],
             counted: false,
             lastfm: lastfm::Listen::default(),
             track,
@@ -1321,7 +1340,7 @@ impl Player {
     }
 
     fn step_playlist(&mut self, offset: isize, ctx: &egui::Context, mut failed: Option<String>) {
-        let Some(list) = self.order_list else {
+        let Some(_) = self.order_list else {
             if let Some(warning) = failed {
                 self.status = warning;
             }
@@ -1332,9 +1351,12 @@ impl Player {
         };
         let mut candidate = self.adjacent_cursor(offset);
         while let Some(cursor) = candidate
-            && let Some(&track) = self.order.get(cursor)
+            && let Some(&track) = self
+                .order
+                .get(cursor)
+                .and_then(|id| self.library.locations.get(id))
         {
-            match self.open((list, track), ctx, None) {
+            match self.open(track, ctx, None) {
                 Ok(()) => {
                     self.cursor = cursor;
                     self.refresh_gapless();
@@ -2883,7 +2905,8 @@ impl eframe::App for Player {
                 },
             );
             if let Some((index, title)) = enqueue {
-                self.play_queue.push((list, index), title);
+                self.play_queue
+                    .push(self.library.playlists[list].ids[index], title);
                 self.status.clear();
             }
             if let Some((index, change)) = edit {
@@ -2931,6 +2954,7 @@ impl eframe::App for Player {
                             self.library.playlists[list].name = name.trim().to_owned();
                         } else {
                             self.library.playlists.push(Playlist {
+                                ids: Vec::new(),
                                 name: name.trim().to_owned(),
                                 tracks: Vec::new(),
                                 pinned: false,
