@@ -5,6 +5,8 @@ mod audio;
 mod audio_setup;
 mod audio_ui;
 mod background;
+#[cfg(test)]
+mod benchmarks;
 mod cue;
 mod diagnostics;
 mod digest;
