@@ -435,11 +435,17 @@ impl Library {
 }
 
 pub fn save_json(value: &impl Serialize, path: &Path) -> std::io::Result<()> {
-    let dir = path.parent().expect("settings file has a parent");
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Settings path has no parent"))?;
     fs::create_dir_all(dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.flush()?;
+    {
+        let mut writer = std::io::BufWriter::new(file.as_file_mut());
+        serde_json::to_writer(&mut writer, value)?;
+        writer.flush()?;
+    }
+    file.as_file().sync_all()?;
     file.persist(path)?;
     Ok(())
 }
@@ -691,6 +697,18 @@ mod tests {
             Some(Path::new("example.ttf"))
         );
         assert!(library.named_themes[0].background.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn serialization_failure_preserves_previous_file() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("library.json");
+        Library::default().save(&path)?;
+        let before = fs::read(&path)?;
+        let invalid = HashMap::from([((1, 2), true)]);
+        assert!(save_json(&invalid, &path).is_err());
+        assert_eq!(fs::read(&path)?, before);
         Ok(())
     }
 
