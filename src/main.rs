@@ -17,6 +17,7 @@ mod library;
 mod listening;
 mod lyrics;
 mod media_keys;
+mod metadata_cache;
 mod play_queue;
 mod playlist_io;
 mod plugins;
@@ -260,6 +261,7 @@ impl SearchResults {
 }
 
 struct Player {
+    indexer: metadata_cache::Indexer,
     background: background::Preview,
     setup: audio_setup::Setup,
     audio_devices: Option<audio::DeviceMonitor>,
@@ -340,6 +342,9 @@ impl Player {
         }
         Self {
             background: background::Preview::default(),
+            indexer: metadata_cache::Indexer::new(
+                library_path.with_file_name("metadata-cache.json"),
+            ),
             setup,
             audio_devices: None,
             audio_retry_after: None,
@@ -1029,13 +1034,8 @@ impl Player {
         }
         let tracks = playlist.tracks[cached..].to_vec();
 
-        let (tx, rx) = mpsc::channel();
-        self.indexing.insert(list, rx);
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(tracks.iter().map(|path| TrackInfo::read(path)).collect());
-            ctx.request_repaint();
-        });
+        self.indexing
+            .insert(list, self.indexer.request(tracks, ctx));
     }
 
     fn finish_indexes(&mut self) {

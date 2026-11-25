@@ -79,8 +79,10 @@ impl Sort {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
+    #[serde(default)]
+    pub missing: bool,
     pub title: String,
     pub artist: String,
     pub album: String,

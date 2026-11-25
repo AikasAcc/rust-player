@@ -46,10 +46,5 @@ fn tag_scan() {
             p
         })
         .collect();
-    for _ in 0..4 {
-        let start = Instant::now();
-        let out: Vec<_> = paths.iter().map(|p| TrackInfo::read(p)).collect();
-        assert!(out.iter().all(|t| t.duration.is_some()));
-        println!("scan,1000,{}", start.elapsed().as_micros());
-    }
+    crate::metadata_cache::measure(&paths, &dir.path().join("cache.json"));
 }
