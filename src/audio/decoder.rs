@@ -79,15 +79,22 @@ fn open_format(path: &Path) -> Result<Box<dyn FormatReader>, String> {
 }
 
 fn audio_track(reader: &dyn FormatReader) -> Option<&Track> {
+    // Matroska files may carry video alongside audio. Prefer a track whose
+    // codec is actually compiled in, then fall back to the old "not null"
+    // rule so a probe failure still produces the usual error message.
+    let decodable = |track: &&Track| {
+        track.codec_params.codec != CODEC_TYPE_NULL
+            && get_codecs()
+                .make(&track.codec_params, &DecoderOptions::default())
+                .is_ok()
+    };
+    let present = |track: &&Track| track.codec_params.codec != CODEC_TYPE_NULL;
     reader
         .default_track()
-        .filter(|track| track.codec_params.codec != CODEC_TYPE_NULL)
-        .or_else(|| {
-            reader
-                .tracks()
-                .iter()
-                .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
-        })
+        .filter(decodable)
+        .or_else(|| reader.tracks().iter().find(decodable))
+        .or_else(|| reader.default_track().filter(present))
+        .or_else(|| reader.tracks().iter().find(present))
 }
 
 fn duration(frames: u64, base: TimeBase) -> Option<Duration> {

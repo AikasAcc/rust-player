@@ -3,6 +3,7 @@ mod decoder;
 pub mod dsp;
 mod exclusive;
 mod gapless;
+pub mod loudness;
 mod pcm;
 pub mod replaygain;
 pub mod setup;
@@ -44,6 +45,45 @@ pub enum OutputMode {
     Exclusive,
 }
 
+/// Sinc resampler effort. `High` preserves the previous 256-tap/Cubic
+/// behaviour so existing profiles sound unchanged.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub enum ResamplerQuality {
+    Fast,
+    Balanced,
+    #[default]
+    High,
+    Maximum,
+}
+
+impl ResamplerQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast (64 taps)",
+            Self::Balanced => "Balanced (128 taps)",
+            Self::High => "High (256 taps)",
+            Self::Maximum => "Maximum (512 taps)",
+        }
+    }
+
+    pub(super) fn sinc_len(self) -> usize {
+        match self {
+            Self::Fast => 64,
+            Self::Balanced => 128,
+            Self::High => 256,
+            Self::Maximum => 512,
+        }
+    }
+
+    pub(super) fn interpolation(self) -> rubato::SincInterpolationType {
+        match self {
+            Self::Fast => rubato::SincInterpolationType::Linear,
+            Self::Balanced => rubato::SincInterpolationType::Quadratic,
+            Self::High | Self::Maximum => rubato::SincInterpolationType::Cubic,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(default)]
 pub struct OutputOptions {
@@ -55,6 +95,7 @@ pub struct OutputOptions {
     pub replay_gain: replaygain::Settings,
     pub verify_flac: bool,
     pub reject_downmix: bool,
+    pub resampler: ResamplerQuality,
     #[serde(skip)]
     pub effects_requested: bool,
 }
@@ -94,6 +135,9 @@ trait Backend {
 
 struct RenderState {
     next: Mutex<Option<Next>>,
+    /// Bumped only when `next` actually changes. The decoder loop reads this
+    /// atomic every iteration and touches the mutex only on a real update.
+    next_epoch: AtomicU64,
     options: OutputOptions,
     dsp: dsp::Settings,
     closed: AtomicBool,
@@ -121,6 +165,7 @@ impl RenderState {
     fn new(position: Duration, volume: f32, paused: bool) -> Self {
         Self {
             next: Mutex::new(None),
+            next_epoch: AtomicU64::new(0),
             options: OutputOptions::default(),
             dsp: dsp::Settings::default(),
             closed: AtomicBool::new(false),
@@ -142,6 +187,30 @@ impl RenderState {
             rate: AtomicU32::new(0),
             running: AtomicBool::new(false),
             driver_error: std::sync::atomic::AtomicI32::new(0),
+        }
+    }
+
+    /// Returns `Some(plan)` only when the queue changed since `seen`. The
+    /// caller keeps `seen` locally, so the audio loop normally performs just
+    /// one atomic load instead of locking and cloning `Next` every iteration.
+    fn changed_next(&self, seen: &mut u64) -> Option<Option<Next>> {
+        let epoch = self.next_epoch.load(Acquire);
+        if epoch == *seen {
+            return None;
+        }
+        *seen = epoch;
+        Some(self.next.lock().ok().and_then(|plan| plan.clone()))
+    }
+
+    fn set_next(&self, next: Option<Next>) {
+        if let Ok(mut plan) = self.next.lock()
+            && *plan != next
+        {
+            *plan = next;
+            drop(plan);
+            // Publish after the mutex write; the decoder's Acquire load then
+            // observes the new plan before it takes the lock.
+            self.next_epoch.fetch_add(1, Release);
         }
     }
 }
@@ -195,10 +264,10 @@ impl AudioTrack {
                     let _ = tx.send(event);
                     ctx.request_repaint();
                 };
-                if let Some(begin_after) = request.after {
-                    while !begin_after.load(Acquire) {
-                        thread::sleep(Duration::from_millis(5));
-                    }
+                if !wait_for_gate(request.after.as_deref(), Duration::from_secs(5)) {
+                    report(Event::Warning(
+                        "Gapless handoff timed out; starting track independently".into(),
+                    ));
                 }
                 if worker_state.closed.load(Acquire) {
                     return;
@@ -231,11 +300,7 @@ impl AudioTrack {
     }
 
     pub fn queue_next(&self, next: Option<Next>) {
-        if let Ok(mut plan) = self.state.next.lock()
-            && *plan != next
-        {
-            *plan = next;
-        }
+        self.state.set_next(next);
     }
 
     pub fn take_transition(&mut self) -> Option<Transition> {
@@ -416,11 +481,12 @@ fn pump<B: Backend>(
     let channels = usize::from(output.channels);
     let capacity_frames = (output.rate as usize).min(2_000_000 / channels);
     let (mut producer, consumer) = RingBuffer::new(capacity_frames * channels);
+    let resampler = state.options.resampler;
     let new_converter = |source: &SourceFormat| {
         output
             .direct
             .is_none()
-            .then(|| Converter::new(source, output.rate, output.channels))
+            .then(|| Converter::new(source, output.rate, output.channels, resampler))
             .transpose()
     };
     let mut converter = new_converter(&source.info)?;
@@ -464,6 +530,10 @@ fn pump<B: Backend>(
     let mut handoff: Option<gapless::Handoff> = None;
     let mut submitted = 0_u64;
     let mut listened_at_seek = 0_u64;
+    // Sentinel forces the first iteration to observe a plan queued before the
+    // pump started. After that only epoch changes cost a mutex + clone.
+    let mut seen_epoch = u64::MAX;
+    let mut desired = None;
     while !state.closed.load(Acquire) {
         let driver_error = state.driver_error.load(Acquire);
         if driver_error != 0 {
@@ -474,7 +544,9 @@ fn pump<B: Backend>(
         if state.output_lost.load(Relaxed) {
             return Err("Windows interrupted the audio output".into());
         }
-        let mut desired = state.next.lock().ok().and_then(|plan| plan.clone());
+        if let Some(updated) = state.changed_next(&mut seen_epoch) {
+            desired = updated;
+        }
         let mut seek = state.seek_ns.swap(NO_SEEK, AcqRel);
         let rendered = state.frames.load(Acquire);
         if let Some(pending) = &handoff {
@@ -494,7 +566,11 @@ fn pump<B: Backend>(
                     && plan.as_ref() == Some(&pending.next)
                 {
                     *plan = None;
+                    drop(plan);
+                    state.next_epoch.fetch_add(1, Release);
                 }
+                // Re-observe on the next iteration: a newer plan may already
+                // be queued, and `seen_epoch` still names the cleared one.
                 if desired.as_ref() == Some(&pending.next) {
                     desired = None;
                 }
@@ -558,7 +634,11 @@ fn pump<B: Backend>(
             // Keep the current stream supplied before touching the next file.
             if finished_decode || capacity_frames * channels - producer.slots() >= warm_samples {
                 planned = desired.clone();
-                if let Some(candidate) = desired.filter(|_| !state.drained.load(Acquire)) {
+                if let Some(candidate) = desired
+                    .as_ref()
+                    .filter(|_| !state.drained.load(Acquire))
+                    .cloned()
+                {
                     match Source::open_with_options(&candidate.path, state.options) {
                         Ok(next_source) if gapless::compatible(&source.info, &next_source.info) => {
                             prepared = Some((candidate, next_source));
@@ -713,5 +793,76 @@ impl DeviceMonitor {
 impl Drop for DeviceMonitor {
     fn drop(&mut self) {
         self.closed.store(true, Release);
+    }
+}
+
+/// Wait for a gapless handoff, but never let a stuck gate hold a decoder worker
+/// forever. Returns `false` only after the timeout; `None` means no handoff.
+fn wait_for_gate(gate: Option<&AtomicBool>, timeout: Duration) -> bool {
+    let Some(gate) = gate else {
+        return true;
+    };
+    let started = Instant::now();
+    while !gate.load(Acquire) {
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn gate_timeout_does_not_hold_the_worker_forever() {
+        let stalled = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(!wait_for_gate(Some(&stalled), Duration::from_millis(25)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(wait_for_gate(None, Duration::from_millis(25)));
+        let open = AtomicBool::new(true);
+        assert!(wait_for_gate(Some(&open), Duration::from_millis(25)));
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn next(path: &'static str, generation: u64) -> Next {
+        Next {
+            path: path.into(),
+            target: NextTarget::Playlist(generation as usize),
+            generation,
+        }
+    }
+
+    #[test]
+    fn queue_changes_are_observed_once_without_polling_the_mutex() {
+        let state = RenderState::new(Duration::ZERO, 1.0, false);
+        let mut seen = u64::MAX;
+        assert_eq!(state.changed_next(&mut seen), Some(None));
+        assert_eq!(state.changed_next(&mut seen), None);
+
+        let first = next("a.wav", 1);
+        state.set_next(Some(first.clone()));
+        assert_eq!(state.changed_next(&mut seen), Some(Some(first.clone())));
+        assert_eq!(state.changed_next(&mut seen), None);
+
+        // An identical re-queue must not dirty the decoder's cache.
+        state.set_next(Some(first));
+        assert_eq!(state.changed_next(&mut seen), None);
+
+        let second = next("b.wav", 2);
+        state.set_next(Some(second.clone()));
+        assert_eq!(state.changed_next(&mut seen), Some(Some(second)));
+        assert_eq!(state.changed_next(&mut seen), None);
+
+        state.set_next(None);
+        assert_eq!(state.changed_next(&mut seen), Some(None));
+        assert_eq!(state.changed_next(&mut seen), None);
     }
 }

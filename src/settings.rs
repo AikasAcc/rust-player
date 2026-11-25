@@ -140,9 +140,14 @@ impl Player {
                     Page::About => {
                         ui.label(concat!("Rust Player ", env!("CARGO_PKG_VERSION")));
                         self.diagnostic_settings(ui);
-                        if ui.button("Report a bug").clicked() {
-                            ctx.open_url(egui::OpenUrl::new_tab(BUG_REPORT_URL));
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("GitHub").clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(crate::PROJECT_URL));
+                            }
+                            if ui.button("Report a bug").clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(BUG_REPORT_URL));
+                            }
+                        });
                         ui.weak(
                             "Use Copy diagnostics to include audio format details in a bug report.",
                         );

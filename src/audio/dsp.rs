@@ -2,7 +2,7 @@ use super::{OutputOptions, decoder::Source};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-const MAX_TAPS: usize = 2048;
+const MAX_TAPS: usize = 16_384;
 const MAX_BANDS: usize = 24;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -216,8 +216,12 @@ impl Fir {
             let input: Vec<_> = (0..response[0].len())
                 .flat_map(|frame| response.iter().map(move |channel| channel[frame]))
                 .collect();
-            let mut resampler =
-                super::convert::Converter::new(&source.info, rate, source.info.channels)?;
+            let mut resampler = super::convert::Converter::new(
+                &source.info,
+                rate,
+                source.info.channels,
+                super::ResamplerQuality::High,
+            )?;
             let mut output = Vec::new();
             resampler.push(&input, &mut output)?;
             resampler.finish(&mut output)?;

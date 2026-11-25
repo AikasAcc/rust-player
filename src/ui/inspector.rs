@@ -105,7 +105,7 @@ impl Player {
                                     .timed_lyrics
                                     .partition_point(|(timestamp, _)| *timestamp <= position)
                                     .checked_sub(1);
-                                let id = ui.id().with(("lyric-line", playing.track));
+                                let id = ui.id().with(("lyric-line", playing.id));
                                 let last = ctx.data_mut(|data| {
                                     let last = data.get_temp::<usize>(id);
                                     if let Some(current) = current {

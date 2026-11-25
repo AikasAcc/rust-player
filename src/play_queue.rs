@@ -77,10 +77,7 @@ impl Player {
     }
 
     pub(super) fn order_track(&self) -> Option<Track> {
-        self.library
-            .locations
-            .get(self.order.get(self.cursor)?)
-            .copied()
+        self.library.locate(*self.order.get(self.cursor)?)
     }
 
     pub(super) fn adjacent_cursor(&self, offset: isize) -> Option<usize> {
@@ -96,10 +93,10 @@ impl Player {
     pub(super) fn play_next_queued(&mut self, ctx: &egui::Context) -> Result<(), Option<String>> {
         let mut warning = None;
         while let Some(entry) = self.play_queue.entries.pop_front() {
-            let Some(&location) = self.library.locations.get(&entry.track) else {
+            if self.library.locate(entry.track).is_none() {
                 continue;
-            };
-            match self.open(location, ctx, None) {
+            }
+            match self.open_id(entry.track, ctx, None) {
                 Ok(()) => {
                     self.status = warning.unwrap_or_default();
                     self.save_playback(Duration::ZERO);
@@ -196,7 +193,12 @@ impl Player {
                                         continue;
                                     };
                                     let position = start + index - added;
-                                    let track = self.library.locations[&self.order[position]].1;
+                                    let Some(id) = self.order.get(position).copied() else {
+                                        continue;
+                                    };
+                                    let Some((_, track)) = self.library.locate(id) else {
+                                        continue;
+                                    };
                                     let title = self
                                         .views
                                         .get(&list)
@@ -218,7 +220,12 @@ impl Player {
                                 };
                             let (list, track) = match row {
                                 QueueRow::Added(_) => {
-                                    self.library.locations[&queue.entries[index].track]
+                                    let Some(location) =
+                                        self.library.locate(queue.entries[index].track)
+                                    else {
+                                        continue;
+                                    };
+                                    location
                                 }
                                 QueueRow::Playlist(track) => track,
                             };
@@ -352,7 +359,7 @@ impl Player {
             QueueRow::Playlist((list, track)) if self.order_list == Some(list) => {
                 if let Some(offset) = self.order[start..]
                     .iter()
-                    .position(|&id| id == self.library.playlists[list].ids[track])
+                    .position(|&queued| self.library.track_id((list, track)) == Some(queued))
                 {
                     let track = self.order.remove(start + offset);
                     if let Some(position) = destination {

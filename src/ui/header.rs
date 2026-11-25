@@ -183,9 +183,7 @@ impl Player {
                 let elapsed = playing.sink.get_pos();
                 if let Some(duration) = playing.duration.filter(|d| !d.is_zero()) {
                     let target = ui
-                        .push_id(("seek", playing.track), |ui| {
-                            seek_bar(ui, elapsed, duration)
-                        })
+                        .push_id(("seek", playing.id), |ui| seek_bar(ui, elapsed, duration))
                         .inner;
                     if let Some(target) = target {
                         self.seek(target, ctx);
@@ -219,12 +217,7 @@ impl Player {
         {
             return value;
         }
-        let favorite = {
-            let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
-            self.library
-                .favorites
-                .is_some_and(|index| self.library.playlists[index].tracks.contains(path))
-        };
+        let favorite = self.library.is_favorite_id(playing.id);
         self.cached_favorite = Some((playing.id, favorite));
         favorite
     }
@@ -236,6 +229,7 @@ impl Player {
             ("Theme editor", Theme),
             ("Plugins", Plugins),
             ("Discord", Discord),
+            ("GitHub", GitHub),
         ];
         let mut selection = None;
         if ui.available_width() >= 185.0 {
@@ -284,6 +278,9 @@ impl Player {
             Some(Theme) => self.open_theme_editor(),
             Some(Plugins) => self.dialogs.plugins_open = true,
             Some(Discord) => self.dialogs.discord_settings = true,
+            Some(GitHub) => ui
+                .ctx()
+                .open_url(egui::OpenUrl::new_tab(crate::PROJECT_URL)),
             None => {}
         }
     }

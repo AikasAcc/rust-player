@@ -1,4 +1,4 @@
-use crate::{Player, TrackId, TrackInfo, cue};
+use crate::{Player, TrackId, TrackInfo, cue, library::same_path};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -138,8 +138,8 @@ impl Player {
         let mut lists = HashSet::new();
         let mut count = 0;
         for (id, old, new) in result.changes {
-            if let Some(&(list, i)) = self.library.locations.get(&id)
-                && self.library.playlists[list].tracks[i] == old
+            if let Some((list, i)) = self.library.locate(id)
+                && same_path(&self.library.playlists[list].tracks[i], &old)
             {
                 self.library.playlists[list].tracks[i] = new;
                 lists.insert(list);

@@ -8,6 +8,22 @@ use std::{
     time::Duration,
 };
 
+/// Compare paths the way the target filesystem does. On Windows, letter case
+/// and separator style do not distinguish a path; on other platforms they do.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let key = |path: &Path| {
+        let mut value = String::new();
+        for component in path.components() {
+            value.push_str(&component.as_os_str().to_string_lossy());
+            value.push('|');
+        }
+        #[cfg(windows)]
+        let value = value.to_lowercase();
+        value
+    };
+    key(a) == key(b)
+}
+
 pub fn timed_lyrics(text: &str) -> Vec<(Duration, String)> {
     let mut lyrics = Vec::new();
     for line in text.lines() {
@@ -40,7 +56,8 @@ pub fn timed_lyrics(text: &str) -> Vec<(Duration, String)> {
 }
 
 pub const AUDIO: &[&str] = &[
-    "mp3", "flac", "wav", "ogg", "m4a", "aac", "alac", "aiff", "aif", "aifc", "caf", "cue",
+    "mp3", "mp1", "mp2", "flac", "wav", "ogg", "m4a", "aac", "alac", "aiff", "aif", "aifc", "caf",
+    "mka", "mkv", "cue",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -62,7 +79,7 @@ pub struct Playlist {
     pub descending: bool,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sort {
     #[default]
     Added,
@@ -85,6 +102,7 @@ impl Sort {
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TrackInfo {
     #[serde(skip)]
     pub search_key: String,
@@ -289,6 +307,10 @@ pub struct Library {
     pub named_themes: Vec<crate::theme::NamedTheme>,
     pub plugins: Vec<crate::plugins::PluginConfig>,
     pub favorites: Option<usize>,
+    /// Source TrackId for each entry of the Favorites playlist.
+    /// `None` marks a legacy entry that is still matched by path.
+    #[serde(default)]
+    pub favorite_ids: Vec<Option<TrackId>>,
     pub volume: f32,
     pub muted: bool,
     pub volume_before_mute: f32,
@@ -327,6 +349,7 @@ impl Default for Library {
             font: None,
             plugins: Vec::new(),
             favorites: None,
+            favorite_ids: Vec::new(),
             volume: 0.7,
             muted: false,
             volume_before_mute: 0.7,
@@ -357,31 +380,55 @@ impl Default for Library {
 
 impl Library {
     pub fn rebuild_locations(&mut self) {
-        self.locations.clear();
-        for (list, p) in self.playlists.iter_mut().enumerate() {
-            p.ids.truncate(p.tracks.len());
-            for index in 0..p.tracks.len() {
-                let id = p
+        let mut locations = HashMap::new();
+        let mut all_ids: Vec<Vec<TrackId>> = Vec::with_capacity(self.playlists.len());
+        for (list, playlist) in self.playlists.iter().enumerate() {
+            let mut ids = Vec::with_capacity(playlist.tracks.len());
+            for (index, _) in playlist.tracks.iter().enumerate() {
+                let id = playlist
                     .ids
                     .get(index)
                     .copied()
-                    .filter(|id| !self.locations.contains_key(id))
+                    .filter(|id| !locations.contains_key(id))
                     .unwrap_or_else(|| {
                         loop {
                             let candidate = TrackId(rand::random());
-                            if !self.locations.contains_key(&candidate) {
+                            if !locations.contains_key(&candidate)
+                                && !all_ids.iter().flatten().any(|used| *used == candidate)
+                                && !playlist.ids.contains(&candidate)
+                            {
                                 break candidate;
                             }
                         }
                     });
-                if let Some(slot) = p.ids.get_mut(index) {
-                    *slot = id;
-                } else {
-                    p.ids.push(id);
-                }
-                self.locations.insert(id, (list, index));
+                locations.insert(id, (list, index));
+                ids.push(id);
             }
+            all_ids.push(ids);
         }
+        for (playlist, ids) in self.playlists.iter_mut().zip(all_ids) {
+            playlist.ids = ids;
+        }
+        self.locations = locations;
+    }
+
+    /// Stable identity of a playlist entry. Never derived from the path.
+    pub fn track_id(&self, track: crate::Track) -> Option<TrackId> {
+        self.playlists.get(track.0)?.ids.get(track.1).copied()
+    }
+
+    /// Current location of a stable ID. Locations are derived and may change.
+    pub fn locate(&self, id: TrackId) -> Option<crate::Track> {
+        self.locations.get(&id).copied()
+    }
+
+    pub fn track_path(&self, id: TrackId) -> Option<&Path> {
+        let (list, index) = self.locate(id)?;
+        self.playlists
+            .get(list)?
+            .tracks
+            .get(index)
+            .map(PathBuf::as_path)
     }
     pub fn toggle_mute(&mut self) {
         if self.muted {
@@ -402,6 +449,15 @@ impl Library {
             )
         });
         order
+    }
+
+    /// Playlists for the sidebar's PLAYLISTS section. Favorites has its own
+    /// LIBRARY entry and must not appear a second time here.
+    pub fn sidebar_playlists(&self) -> Vec<usize> {
+        self.sidebar_order()
+            .into_iter()
+            .filter(|&index| Some(index) != self.favorites)
+            .collect()
     }
 
     pub fn can_move_playlist(&self, from: usize, to: usize) -> bool {
@@ -463,43 +519,304 @@ impl Library {
         data.selected = data.selected.min(data.playlists.len() - 1);
         data.favorites = data.favorites.filter(|&index| index < data.playlists.len());
         data.rebuild_locations();
+        data.migrate_favorite_ids();
         Ok(data)
     }
 
+    /// Kept for persistence tests; production writes go through `save_worker`.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         save_json(self, path)
     }
 
+    pub fn unique_playlist_name(&self, name: &str) -> String {
+        let exists = |candidate: &str| {
+            self.playlists
+                .iter()
+                .any(|list| list.name.eq_ignore_ascii_case(candidate))
+        };
+        if !exists(name) {
+            return name.to_owned();
+        }
+        (2..)
+            .map(|number| format!("{name} ({number})"))
+            .find(|candidate| !exists(candidate))
+            .unwrap_or_else(|| format!("{name} ({})", self.playlists.len() + 1))
+    }
+
+    pub fn favorites_index_or_create(&mut self) -> usize {
+        if let Some(index) = self.favorites {
+            return index;
+        }
+        let index = self.playlists.len();
+        self.playlists.push(Playlist {
+            name: self.unique_playlist_name("Favorites"),
+            tracks: Vec::new(),
+            ids: Vec::new(),
+            pinned: false,
+            sidebar_position: None,
+            sort: Sort::Album,
+            descending: false,
+        });
+        self.favorites = Some(index);
+        index
+    }
+
+    fn source_id(&self, path: &Path) -> Option<TrackId> {
+        self.playlists
+            .iter()
+            .enumerate()
+            .filter(|(list, _)| Some(*list) != self.favorites)
+            .find_map(|(_, playlist)| {
+                playlist
+                    .tracks
+                    .iter()
+                    .position(|track| same_path(track, path))
+                    .and_then(|index| playlist.ids.get(index).copied())
+            })
+    }
+
+    pub fn migrate_favorite_ids(&mut self) {
+        let Some(index) = self.favorites else {
+            return;
+        };
+        if self.favorite_ids.len() >= self.playlists[index].tracks.len() {
+            return;
+        }
+        self.favorite_ids = self.playlists[index]
+            .tracks
+            .iter()
+            .map(|path| self.source_id(path))
+            .collect();
+    }
+
+    pub fn favorite_id_entries(&self, id: TrackId) -> Vec<usize> {
+        self.favorite_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(entry, favorite)| (*favorite == Some(id)).then_some(entry))
+            .collect()
+    }
+
+    pub fn is_favorite_id(&self, id: TrackId) -> bool {
+        !self.favorite_id_entries(id).is_empty()
+            || self
+                .favorites
+                .and_then(|index| self.playlists.get(index))
+                .is_some_and(|playlist| playlist.ids.contains(&id))
+    }
+
+    /// A row is active when it is the playing entry itself or the Favorites
+    /// copy of the playing source entry.
+    pub fn row_is_playing(&self, list: usize, index: usize, playing: TrackId) -> bool {
+        if self.track_id((list, index)) == Some(playing) {
+            return true;
+        }
+        Some(list) == self.favorites
+            && self
+                .favorite_ids
+                .get(index)
+                .is_some_and(|id| *id == Some(playing))
+    }
+
+    pub fn favorite_entries(&self, path: &Path) -> Vec<usize> {
+        let mut entries = self
+            .source_id(path)
+            .map(|id| self.favorite_id_entries(id))
+            .unwrap_or_default();
+        if let Some(index) = self.favorites
+            && let Some(playlist) = self.playlists.get(index)
+        {
+            for (entry, track) in playlist.tracks.iter().enumerate() {
+                if same_path(track, path) && !entries.contains(&entry) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.sort_unstable();
+        entries
+    }
+
+    #[cfg(test)]
+    pub fn is_favorite(&self, path: &Path) -> bool {
+        !self.favorite_entries(path).is_empty()
+    }
+
+    pub fn add_favorite(&mut self, path: &Path) {
+        let id = self.source_id(path);
+        let index = self.favorites_index_or_create();
+        self.playlists[index].tracks.push(path.to_path_buf());
+        self.favorite_ids.push(id);
+        self.rebuild_locations();
+    }
+
+    pub fn remove_favorite_entries(&mut self, entries: &[usize]) {
+        let Some(index) = self.favorites else {
+            return;
+        };
+        for &entry in entries.iter().rev() {
+            if entry < self.playlists[index].tracks.len() {
+                self.playlists[index].tracks.remove(entry);
+            }
+            if entry < self.playlists[index].ids.len() {
+                self.playlists[index].ids.remove(entry);
+            }
+            if entry < self.favorite_ids.len() {
+                self.favorite_ids.remove(entry);
+            }
+        }
+        self.rebuild_locations();
+    }
+
+    #[cfg(test)]
+    pub fn toggle_favorite_path(&mut self, path: &Path) -> bool {
+        let entries = self.favorite_entries(path);
+        if entries.is_empty() {
+            self.add_favorite(path);
+            return true;
+        }
+        self.remove_favorite_entries(&entries);
+        false
+    }
+
+    pub fn toggle_favorite_id(&mut self, id: TrackId) -> bool {
+        let entries = self.favorite_id_entries(id);
+        if !entries.is_empty() {
+            self.remove_favorite_entries(&entries);
+            return false;
+        }
+        if let Some(entry) = self
+            .favorites
+            .and_then(|index| self.playlists.get(index))
+            .and_then(|playlist| playlist.ids.iter().position(|&entry| entry == id))
+        {
+            self.remove_favorite_entries(&[entry]);
+            return false;
+        }
+        if let Some(path) = self.track_path(id).map(PathBuf::from) {
+            let legacy = self.favorite_entries(&path);
+            if !legacy.is_empty() {
+                self.remove_favorite_entries(&legacy);
+                return false;
+            }
+            self.add_favorite(&path);
+            return true;
+        }
+        false
+    }
+
+    /// Drop favorites whose source no longer exists and refresh changed paths.
+    pub fn prune_favorites(&mut self) {
+        let Some(index) = self.favorites else {
+            return;
+        };
+        let mut kept = Vec::new();
+        for (entry, favorite) in self.favorite_ids.iter().enumerate() {
+            let Some(id) = *favorite else {
+                if let Some(path) = self.playlists[index].tracks.get(entry).cloned() {
+                    kept.push((path, None));
+                }
+                continue;
+            };
+            if let Some(path) = self.track_path(id).map(PathBuf::from) {
+                kept.push((path, Some(id)));
+            }
+        }
+        let unchanged = kept.len() == self.playlists[index].tracks.len()
+            && kept
+                .iter()
+                .zip(&self.playlists[index].tracks)
+                .all(|((path, _), old)| same_path(path, old));
+        if unchanged {
+            return;
+        }
+        self.playlists[index].tracks = kept.iter().map(|(path, _)| path.clone()).collect();
+        self.playlists[index].ids.clear();
+        self.favorite_ids = kept.into_iter().map(|(_, id)| id).collect();
+        self.rebuild_locations();
+    }
+
     pub fn back_up_invalid_file(path: &Path) -> std::io::Result<PathBuf> {
+        Self::back_up_invalid_json(path, "library.invalid-")
+    }
+
+    pub fn back_up_invalid_json(path: &Path, prefix: &str) -> std::io::Result<PathBuf> {
         let mut original = fs::File::open(path)?;
         let directory = path.parent().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing settings folder")
         })?;
         let mut backup = tempfile::Builder::new()
-            .prefix("library.invalid-")
+            .prefix(prefix)
             .suffix(".json")
             .tempfile_in(directory)?;
         std::io::copy(&mut original, &mut backup)?;
         backup.as_file().sync_all()?;
         let (_, backup_path) = backup.keep()?;
+        sync_directory(directory)?;
         Ok(backup_path)
     }
 }
 
-pub fn save_json(value: &impl Serialize, path: &Path) -> std::io::Result<()> {
+/// Flush the directory entry after a rename. Syncing the temporary file only
+/// makes its contents durable; without a directory flush the rename itself can
+/// be lost after a power failure. Windows needs a directory handle opened with
+/// `FILE_FLAG_BACKUP_SEMANTICS`, while Unix can simply sync an open directory.
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::{
+            Foundation::{CloseHandle, GENERIC_WRITE, HANDLE},
+            Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
+            },
+        };
+        // `encode_wide` keeps unpaired surrogates intact, unlike a lossy
+        // conversion through `str`. `FlushFileBuffers` requires GENERIC_WRITE;
+        // a read-only directory handle opens but cannot be flushed.
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let handle = unsafe {
+            CreateFileW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                GENERIC_WRITE.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                HANDLE::default(),
+            )
+        }?;
+        let result = unsafe { FlushFileBuffers(handle) }.map_err(std::io::Error::from);
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+}
+
+/// Atomically write already serialized bytes. Kept separate from
+/// [`save_json`] so a background writer can do the slow fsync while the UI
+/// thread only prepares the snapshot.
+pub fn save_bytes(bytes: &[u8], path: &Path) -> std::io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("Settings path has no parent"))?;
     fs::create_dir_all(dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
-    {
-        let mut writer = std::io::BufWriter::new(file.as_file_mut());
-        serde_json::to_writer(&mut writer, value)?;
-        writer.flush()?;
-    }
+    file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist(path)?;
+    sync_directory(dir)?;
     Ok(())
+}
+
+pub fn save_json(value: &impl Serialize, path: &Path) -> std::io::Result<()> {
+    save_bytes(&serde_json::to_vec(value)?, path)
 }
 
 pub fn collect(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
@@ -565,6 +882,18 @@ pub fn file_title(path: &Path) -> String {
 }
 
 impl Media {
+    /// Cheap title-only snapshot for the UI thread. The full tag and cover
+    /// read runs on a worker and replaces this once it finishes. CUE entries
+    /// resolve to their audio file, matching [`Media::read`].
+    pub fn placeholder(path: &Path) -> Self {
+        let cue = crate::cue::resolve(path).ok().flatten();
+        let audio = cue.as_ref().map_or(path, |track| track.audio.as_path());
+        Self {
+            title: file_title(audio),
+            ..Self::default()
+        }
+    }
+
     pub fn read(path: &Path) -> Self {
         let cue = crate::cue::resolve(path).ok().flatten();
         let path = cue.as_ref().map_or(path, |track| track.audio.as_path());
@@ -782,5 +1111,194 @@ mod tests {
         assert_eq!(fs::read(second)?, broken_json);
         assert!(Library::load(&path).is_ok());
         Ok(())
+    }
+
+    #[test]
+    fn invalid_json_backup_uses_given_prefix() -> std::io::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("playback.json");
+        let broken_json = b"not-json";
+        fs::write(&path, broken_json)?;
+
+        let backup = Library::back_up_invalid_json(&path, "playback.invalid-")?;
+        let name = backup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        assert!(name.starts_with("playback.invalid-"));
+        assert!(name.ends_with(".json"));
+        assert_eq!(fs::read(&backup)?, broken_json);
+        assert_eq!(fs::read(&path)?, broken_json);
+        Ok(())
+    }
+
+    #[test]
+    fn save_json_creates_missing_parent_directories() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp
+            .path()
+            .join("nested")
+            .join("settings")
+            .join("library.json");
+        assert!(!path.parent().unwrap().exists());
+
+        Library::default().save(&path)?;
+
+        assert!(path.is_file());
+        assert_eq!(Library::load(&path)?.playlists.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn save_json_reports_error_when_parent_is_a_file() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let parent = temp.path().join("not-a-directory");
+        fs::write(&parent, b"occupied")?;
+        let path = parent.join("library.json");
+
+        assert!(Library::default().save(&path).is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&parent)?, b"occupied");
+        Ok(())
+    }
+
+    #[test]
+    fn save_json_failure_leaves_no_temporary_file() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("library.json");
+        fs::create_dir(&path)?;
+
+        assert!(Library::default().save(&path).is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(temp.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn save_bytes_persists_exact_payload_without_leaving_temporaries() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("nested").join("state.json");
+        let payload = br#"{"value":42}"#;
+
+        super::save_bytes(payload, &path)?;
+
+        assert_eq!(fs::read(&path)?, payload);
+        assert_eq!(fs::read_dir(path.parent().unwrap())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn favorites_create_playlist_without_physical_folder() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("library.json");
+        let mut library = Library::default();
+        assert_eq!(library.favorites, None);
+        assert!(!library.is_favorite(Path::new("song.flac")));
+
+        let index = library.favorites_index_or_create();
+        assert_eq!(library.favorites, Some(index));
+        assert_eq!(library.playlists[index].name, "Favorites");
+        assert_eq!(library.playlists[index].sort, Sort::Album);
+        assert!(!library.playlists[index].pinned);
+        assert!(library.playlists[index].sidebar_position.is_none());
+
+        library.save(&path)?;
+        let entries: Vec<String> = fs::read_dir(temp.path())?
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, ["library.json"]);
+        Ok(())
+    }
+
+    #[test]
+    fn favorites_toggle_adds_and_removes_all_duplicates() {
+        let mut library = Library::default();
+        library.playlists[0].tracks = vec![PathBuf::from("keep.flac"), PathBuf::from("song.flac")];
+        library.rebuild_locations();
+        let path = Path::new("song.flac");
+
+        assert!(library.toggle_favorite_path(path));
+        assert!(library.is_favorite(path));
+        assert_eq!(library.favorite_entries(path), [0]);
+        let index = library.favorites.unwrap();
+        assert_eq!(library.playlists[index].ids.len(), 1);
+        let favorite_id = library.playlists[index].ids[0];
+        assert_eq!(*library.locations.get(&favorite_id).unwrap(), (index, 0));
+
+        library.playlists[index].tracks.push(path.to_path_buf());
+        library.rebuild_locations();
+        assert_eq!(library.favorite_entries(path), [0, 1]);
+
+        assert!(!library.toggle_favorite_path(path));
+        assert!(!library.is_favorite(path));
+        assert!(library.playlists[index].tracks.is_empty());
+        assert!(library.playlists[index].ids.is_empty());
+        assert_eq!(library.playlists[0].tracks.len(), 2);
+        assert_eq!(library.playlists[0].ids.len(), 2);
+        assert!(!library.locations.contains_key(&favorite_id));
+    }
+
+    #[test]
+    fn favorites_persist_selection_sort_and_playable_ids() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("library.json");
+        let mut library = Library::default();
+        library.playlists[0].tracks = vec![PathBuf::from("song.flac")];
+        library.rebuild_locations();
+        library.toggle_favorite_path(Path::new("song.flac"));
+        let index = library.favorites.unwrap();
+        library.playlists[index].sort = Sort::Title;
+        library.playlists[index].descending = true;
+        library.selected = index;
+        library.save(&path)?;
+
+        let loaded = Library::load(&path)?;
+        assert_eq!(loaded.favorites, Some(index));
+        assert_eq!(loaded.selected, index);
+        assert_eq!(loaded.playlists[index].name, "Favorites");
+        assert_eq!(loaded.playlists[index].tracks, [PathBuf::from("song.flac")]);
+        assert_eq!(loaded.playlists[index].sort, Sort::Title);
+        assert!(loaded.playlists[index].descending);
+        assert!(loaded.is_favorite(Path::new("song.flac")));
+
+        let id = loaded.playlists[index].ids[0];
+        assert_eq!(*loaded.locations.get(&id).unwrap(), (index, 0));
+
+        let infos = vec![
+            TrackInfo {
+                title: "A".into(),
+                ..TrackInfo::default()
+            },
+            TrackInfo {
+                title: "B".into(),
+                ..TrackInfo::default()
+            },
+        ];
+        let view = PlaylistView::build(
+            infos,
+            loaded.playlists[index].sort,
+            loaded.playlists[index].descending,
+        );
+        assert_eq!(view.order, [1, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn favorites_name_does_not_clobber_existing_playlist() {
+        let mut library = Library::default();
+        library.playlists.push(Playlist {
+            name: "Favorites".into(),
+            tracks: Vec::new(),
+            ids: Vec::new(),
+            pinned: false,
+            sidebar_position: None,
+            sort: Sort::Added,
+            descending: false,
+        });
+
+        assert_eq!(library.unique_playlist_name("Favorites"), "Favorites (2)");
+        let index = library.favorites_index_or_create();
+        assert_eq!(library.playlists[index].name, "Favorites (2)");
+        assert_eq!(library.favorites, Some(index));
     }
 }

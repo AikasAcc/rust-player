@@ -20,17 +20,19 @@ Open **Settings** from the toolbar. **General** controls keyboard media keys. **
 
 Windows System Media Transport Controls handle **Play/Pause**, **Previous** and **Next** while Rust Player is the active Windows media session, including when its window is minimized. Windows can show the track title, artist, album and local cover in its media controls. If registration fails, **General** reports whether the keys are available while Rust Player has focus.
 
-Open **Settings → About** to view the local crash log folder or copy format and output diagnostics. **Report a bug** opens the GitHub issue chooser. Paste the diagnostics yourself if they help describe the issue.
+Track changes show the title immediately; full tags, embedded cover and lyrics are read on a background thread and applied when ready. Rapid skipping discards stale results. The **Track properties** dialog opens right away and fills in its fields once the tag read finishes; edits made in the meantime are kept.
 
-If `library.json` cannot be read, Rust Player saves a copy as `library.invalid-*.json` next to the original before saving new settings. If the backup fails, Rust Player leaves the original file in place.
+Open **Settings → About** to view the local crash log folder or copy format and output diagnostics. **GitHub** opens the project repository, and **Report a bug** opens the GitHub issue chooser. The same GitHub link is available under **Tools** in the header. Paste the diagnostics yourself if they help describe the issue.
+
+If `library.json` cannot be read, Rust Player saves a copy as `library.invalid-*.json` next to the original before saving new settings. The same applies to playback, listening history, and metadata cache files. If the backup fails, Rust Player leaves the original file in place. Old backups are never deleted automatically — you can review and remove them yourself. Settings are written by a background thread, and the directory entry is flushed after each atomic replace so the new file survives a power loss; on a clean exit Rust Player waits for pending writes to finish.
 
 ## Audio output
 
-The player decodes MP3, FLAC, WAV, Ogg Vorbis, AAC, M4A/ALAC, AIFF, and supported audio inside CAF. WavPack, Monkey's Audio and DSD are currently unsupported. CAF and AIFF containers can also hold encodings the player cannot decode.
+The player decodes MPEG audio (MP1/MP2/MP3), FLAC, WAV, Ogg Vorbis, AAC, M4A/ALAC, AIFF, and supported audio inside CAF, MKA and MKV. ADPCM inside WAV and CAF is supported as well; in MKV with video, Rust Player uses the first decodable audio track. WavPack, Monkey's Audio and DSD are currently unsupported. CAF, AIFF and MKV containers can also hold encodings the player cannot decode.
 
-Open or drop an external single-file CUE sheet to add its tracks with their `INDEX 01` boundaries and titles. The CUE sheet and its source file stay on disk. Rust Player can re-import its own M3U8 exports containing these entries. Other players can open the original CUE sheet.
+Open or drop an external CUE sheet, whether it references one file or several, to add its tracks with their `INDEX 01` boundaries and titles. Each track keeps its own source file; the last track of a file plays to that file's end. The CUE sheet and its source files stay on disk. Rust Player can re-import its own M3U8 exports containing these entries. Other players can open the original CUE sheet.
 
-**Settings → Audio** includes ReplayGain by track or album, preamp and peak-based clipping protection. ReplayGain runs before resampling and disables the bit-perfect indicator. You can also disable downmix and enable FLAC verification against the embedded MD5 during continuous playback. A seek or a CUE segment does not verify the entire FLAC.
+**Settings → Audio** includes ReplayGain by track or album, preamp and peak-based clipping protection. ReplayGain runs before resampling and disables the bit-perfect indicator. Use **Scan and write ReplayGain** in a track's properties to measure the file (ITU-R BS.1770-4) and store `REPLAYGAIN_TRACK_GAIN` and `REPLAYGAIN_TRACK_PEAK` tags; only metadata changes, and the scan runs in the background while the current track keeps playing. You can also disable downmix and enable FLAC verification against the embedded MD5 during continuous playback. A seek or a CUE segment does not verify the entire FLAC.
 
 **Gapless playback** is on by default under **Settings → Playback**. The player prepares the next item in the active playback order. Tracks with the same decoded sample format, sample rate and channel layout can share the active stream and keep the resampler running through the join. Format changes reopen the output for the next title. The **Repeat** setting can repeat the current track or the playlist.
 
@@ -44,7 +46,7 @@ Choose **Windows default** or a specific endpoint in **Settings → Audio**. A s
 
 **Audio setup and PCM check** lists the shared mix format and driver-reported stereo Exclusive rates and bit depths. You can play a quiet half-second test tone, apply the selected endpoint and mode, or verify the generated PCM against the bytes written by the software FileBackend. The PCM hash tests the software path. See [hardware loopback testing](docs/TESTING.md#exclusive-playback) for end-to-end verification.
 
-**Settings → Audio → DSP** offers AutoEQ parametric profile import, mono or stereo WAV FIR convolution, and stereo crossfeed. Effects are off by default. FIR is limited to 2,048 samples per channel at the output rate. Active DSP changes the PCM and disables the bit-perfect indicator.
+**Settings → Audio → DSP** offers AutoEQ parametric profile import, mono or stereo WAV FIR convolution, and stereo crossfeed. Effects are off by default. FIR is limited to 16,384 samples per channel at the output rate. Active DSP changes the PCM and disables the bit-perfect indicator.
 
 The decoder writes to a bounded ring buffer on a worker thread. The output callback reads the buffer without file access, locks, or allocation. The shared backend uses CPAL's Windows MMCSS audio priority. The Null backend exercises the same pipeline in `cargo test --release --locked`. See [Audio testing](docs/AUDIO-TESTING.md) for the test procedure and dependency notes.
 
@@ -54,7 +56,7 @@ The right panel switches between **Queue** and **Track**. Lyrics appear beneath 
 
 The queue shows the remaining tracks in the current playlist pass, including the actual shuffle order. Right-click a song and select **Add to Play Queue** to play it before the upcoming playlist tracks. In the queue, drag songs within their group or right-click to move or remove them. Edits to upcoming tracks apply to the current playback order. The queue lasts until Rust Player closes.
 
-The file picker accepts the formats listed under [Audio output](#audio-output). Click **+** next to **Playlists** and enter a name. Drop audio files and folders anywhere in the window to add them to the selected playlist. Folder import scans subfolders. You can also use **Add files** and **Add folder**. Double-click a track to play it. The shuffle button randomizes the remaining order without repeating tracks within that run. Playlists and settings are saved in `%LOCALAPPDATA%\Rust Player\library.json`.
+The file picker accepts the formats listed under [Audio output](#audio-output). Click **+** next to **Playlists** and enter a name. Drop audio files and folders anywhere in the window to add them to the selected playlist. Folder import scans subfolders. You can also use **Add files** and **Add folder**. Double-click a track to play it, or double-click a playlist in the sidebar to play that playlist (a random track when shuffle is on, otherwise the first track in the current sort order). The shuffle button randomizes the remaining order without repeating tracks within that run. Playlists and settings are saved in `%LOCALAPPDATA%\Rust Player\library.json`.
 
 The **Now playing** panel reads title, artist, album, cover and lyrics from available tags. If a cover is missing, put a file such as `cover.jpg` or `folder.png` next to the track. For lyrics, put a same-name `.lrc` or `.txt` file next to the track. Timestamped LRC lyrics highlight and follow the current line. Click a line to seek. Under **Settings → Appearance**, enable album covers beside track titles to show thumbnails in the playlist.
 
@@ -68,7 +70,7 @@ Right-click a playlist for **Pin**, **Rename**, **Copy**, **Delete**, and **Expo
 
 Right-click a track to remove it from the playlist. In **Date added** order, the same menu lets you move tracks up or down. These actions edit playlist entries and leave audio files on disk. The player restores your saved volume on startup.
 
-Press the heart in the playback controls to add or remove the current track from **Favorites**. Use **Listening activity** to see your latest 1,000 play starts, most played songs, and most played artists. Play counts and history are stored locally. Pausing and resuming the same loaded track in the same session keeps its existing play count.
+Press the heart in the playback controls to add or remove the current track from **Favorites**. Every track row also has its own heart between the number and the title, so you can toggle favorites directly in any playlist. Use **Listening activity** to see your latest 1,000 play starts, most played songs, and most played artists. Play counts and history are stored locally. Pausing and resuming the same loaded track in the same session keeps its existing play count.
 
 ## Lyrics search
 
@@ -122,6 +124,8 @@ Click or drag the progress bar to seek. Scroll over the **Volume** control to ad
 
 Rust Player stores playlists, playback position, listening activity, themes, fonts, plugin paths, and integration settings under `%LOCALAPPDATA%\Rust Player`. Audio files stay at their original paths. Apple Music artwork lookup, LRCLIB search, Discord sharing, and Last.fm scrobbling are separate features you can enable in the interface.
 
+Rust Player keeps a metadata cache beside those settings. It stores tags and CUE track metadata, rebuilds itself if the cache becomes unreadable, and drops entries for tracks that are no longer in the library. Audio files are never moved or deleted by this process.
+
 ## Known limits and troubleshooting
 
 | Symptom | What to check |
@@ -133,7 +137,7 @@ Rust Player stores playlists, playback position, listening activity, themes, fon
 | Discord shows a placeholder | Enable artwork lookup or supply a public HTTPS cover URL or application asset. Check the lookup and RPC status in the Discord dialog. |
 | A background falls back to the theme color | Open **Theme Editor** to check the file path and decoder message. Background files are limited to 64 MiB. An animation can contain up to 600 frames and 48 MiB of decoded image data after resizing. |
 
-WavPack, Monkey's Audio, DSD/DoP, ASIO output, and video backgrounds are outside this build. CUE support is for external single-file sheets. See the [manual regression checklist](docs/TESTING.md), [release notes draft](docs/RELEASE-NOTES-DRAFT.md), and [completion report](docs/COMPLETION-REPORT.md).
+WavPack, Monkey's Audio, DSD/DoP, ASIO output, and video backgrounds are outside this build. CUE support covers external single-file and multi-file sheets, not embedded CUE data inside FLAC tags. See the [manual regression checklist](docs/TESTING.md), [release notes for the next version](docs/RELEASE-NOTES-NEXT.md), and [completion report](docs/COMPLETION-REPORT.md).
 
 [![Star History Chart](https://api.star-history.com/svg?repos=AikasAcc/rust-player&type=Date)](https://star-history.com/#AikasAcc/rust-player&Date)
 

@@ -11,6 +11,7 @@ mod cue;
 mod diagnostics;
 mod digest;
 mod fonts;
+mod gain;
 mod gapless_ui;
 mod lastfm;
 mod library;
@@ -23,7 +24,9 @@ mod playlist_io;
 mod plugins;
 mod presence;
 mod relink;
+mod save_worker;
 mod settings;
+mod tagging;
 mod taskbar;
 mod theme;
 mod thumbnails;
@@ -34,7 +37,9 @@ mod update;
 mod window_chrome;
 
 use eframe::egui::{self, RichText};
-use library::{Library, Media, Playlist, PlaylistRow, PlaylistView, Sort, TrackInfo, file_title};
+use library::{
+    Library, Media, Playlist, PlaylistRow, PlaylistView, Sort, TrackInfo, file_title, same_path,
+};
 use rand::seq::SliceRandom;
 use std::{
     collections::HashMap,
@@ -44,8 +49,11 @@ use std::{
 };
 
 use library::TrackId;
+pub(crate) const PROJECT_URL: &str = "https://github.com/AikasAcc/rust-player";
 type Track = (usize, usize);
 type ImportResult = (Vec<PathBuf>, usize);
+type PlaylistImportResult = Result<(Playlist, usize), String>;
+type PlaylistExportResult = (String, Result<(), String>);
 
 struct Playing {
     id: TrackId,
@@ -72,7 +80,7 @@ impl Playing {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SavedTrack {
     #[serde(default)]
     id: Option<TrackId>,
@@ -121,6 +129,7 @@ enum HeaderAction {
     Theme,
     Plugins,
     Discord,
+    GitHub,
 }
 
 struct ThemeDraft {
@@ -145,6 +154,8 @@ struct TrackProperties {
     duration: String,
     format: String,
     size: String,
+    status: String,
+    loading: bool,
 }
 
 struct CoverViewer {
@@ -159,6 +170,23 @@ struct Notice {
 }
 
 impl TrackProperties {
+    /// Shown immediately while the tag read runs on a worker thread.
+    fn loading(path: PathBuf) -> Self {
+        Self {
+            path,
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            album_artist: String::new(),
+            track: String::new(),
+            duration: String::new(),
+            format: String::new(),
+            size: String::new(),
+            status: "Reading tags…".into(),
+            loading: true,
+        }
+    }
+
     fn read(path: PathBuf) -> Self {
         let info = TrackInfo::read(&path);
         let track = info.track_number();
@@ -181,35 +209,81 @@ impl TrackProperties {
             duration,
             format,
             size,
+            status: String::new(),
+            loading: false,
         }
     }
 }
 
 impl SavedTrack {
-    fn resolve(&self, library: &Library) -> Option<Track> {
-        if let Some(loc) = self.id.and_then(|id| library.locations.get(&id)) {
-            return Some(*loc);
+    /// Resolve a saved track to its stable identity. A stored ID always wins,
+    /// so renames and reorders keep the same track. Old saves without a usable
+    /// ID are matched by their original location and path; duplicates keep
+    /// their own IDs.
+    fn resolve(&self, library: &Library) -> Option<TrackId> {
+        if let Some(id) = self.id
+            && library.locate(id).is_some()
+        {
+            return Some(id);
         }
-        let (list, index) = self.track;
-        if let Some(playlist) = library.playlists.get(list) {
-            if playlist.tracks.get(index) == Some(&self.path) {
-                return Some(self.track);
-            }
-            if let Some(index) = playlist.tracks.iter().position(|path| path == &self.path) {
-                return Some((list, index));
-            }
-        }
+        let (list, _) = self.track;
         library
-            .playlists
-            .iter()
-            .enumerate()
-            .find_map(|(list, playlist)| {
-                playlist
-                    .tracks
-                    .iter()
-                    .position(|path| path == &self.path)
-                    .map(|index| (list, index))
+            .track_id(self.track)
+            .filter(|&id| {
+                library
+                    .track_path(id)
+                    .is_some_and(|path| same_path(path, &self.path))
             })
+            .or_else(|| {
+                library
+                    .playlists
+                    .get(list)
+                    .and_then(|playlist| {
+                        playlist
+                            .tracks
+                            .iter()
+                            .position(|path| same_path(path, &self.path))
+                            .map(|index| (list, index))
+                    })
+                    .and_then(|track| library.track_id(track))
+            })
+            .or_else(|| {
+                library
+                    .playlists
+                    .iter()
+                    .enumerate()
+                    .find_map(|(list, playlist)| {
+                        playlist
+                            .tracks
+                            .iter()
+                            .position(|path| same_path(path, &self.path))
+                            .and_then(|index| library.track_id((list, index)))
+                    })
+            })
+    }
+}
+
+/// Keep only IDs that still exist and point the cursor at the same entry, or
+/// at the next entry when the playing track itself was removed.
+fn remap_order(
+    order: &mut Vec<TrackId>,
+    locations: &HashMap<TrackId, Track>,
+    cursor: usize,
+) -> usize {
+    let mut position = 0usize;
+    let mut preceding = 0usize;
+    order.retain(|id| {
+        let keep = locations.contains_key(id);
+        if keep && cursor != usize::MAX && position < cursor {
+            preceding += 1;
+        }
+        position += 1;
+        keep
+    });
+    if order.is_empty() {
+        usize::MAX
+    } else {
+        preceding.min(order.len() - 1)
     }
 }
 
@@ -274,10 +348,15 @@ struct Dialogs {
 
 struct Player {
     relink: Option<mpsc::Receiver<relink::ResultSet>>,
+    gain_jobs: HashMap<PathBuf, mpsc::Receiver<Result<gain::Report, String>>>,
+    media_job: Option<(u64, mpsc::Receiver<Media>)>,
+    media_generation: u64,
+    property_jobs: HashMap<PathBuf, mpsc::Receiver<TrackProperties>>,
     cached_favorite: Option<(TrackId, bool)>,
     search_deadline: Option<Instant>,
     dialogs: Dialogs,
     indexer: metadata_cache::Indexer,
+    save_worker: save_worker::SaveWorker,
     background: background::Preview,
     setup: audio_setup::Setup,
     audio_devices: Option<audio::DeviceMonitor>,
@@ -288,6 +367,8 @@ struct Player {
     library: Library,
     library_path: PathBuf,
     library_needs_backup: bool,
+    playback_needs_backup: bool,
+    listening_needs_backup: bool,
     restore_track: bool,
     volume_changed: bool,
     volume_save_at: Option<Instant>,
@@ -318,6 +399,8 @@ struct Player {
     play_queue: play_queue::PlayQueue,
     inspector_tab: InspectorTab,
     imports: Vec<(usize, mpsc::Receiver<ImportResult>)>,
+    playlist_imports: Vec<mpsc::Receiver<Vec<PlaylistImportResult>>>,
+    playlist_exports: Vec<mpsc::Receiver<PlaylistExportResult>>,
     views: HashMap<usize, PlaylistView>,
     indexing: HashMap<usize, mpsc::Receiver<Vec<TrackInfo>>>,
 }
@@ -337,12 +420,12 @@ impl Player {
                 format!("Could not load playlists: {error}"),
             ),
         };
-        let listening =
+        let (listening, listening_needs_backup) =
             match listening::Listening::load(&library_path.with_file_name("listening.json")) {
-                Ok(data) => data,
+                Ok(data) => (data, false),
                 Err(error) => {
                     status = format!("Could not load listening activity: {error}");
-                    listening::Listening::default()
+                    (listening::Listening::default(), true)
                 }
             };
         let plugins = plugins::Host::load(&library.plugins);
@@ -352,14 +435,19 @@ impl Player {
         if library.check_for_updates {
             updater.check(ctx, env!("CARGO_PKG_VERSION"));
         }
-        Self {
+        let player = Self {
             relink: None,
+            gain_jobs: HashMap::new(),
+            media_job: None,
+            media_generation: 0,
+            property_jobs: HashMap::new(),
             cached_favorite: None,
             search_deadline: None,
             background: background::Preview::default(),
             indexer: metadata_cache::Indexer::new(
                 library_path.with_file_name("metadata-cache.json"),
             ),
+            save_worker: save_worker::SaveWorker::new(),
             dialogs: Default::default(),
             setup,
             audio_devices: None,
@@ -375,6 +463,8 @@ impl Player {
             library,
             library_path,
             library_needs_backup,
+            playback_needs_backup: false,
+            listening_needs_backup,
             restore_track: true,
             volume_changed: false,
             volume_save_at: None,
@@ -400,33 +490,75 @@ impl Player {
             order: Vec::new(),
             cursor: usize::MAX,
             imports: Vec::new(),
+            playlist_imports: Vec::new(),
+            playlist_exports: Vec::new(),
             views: HashMap::new(),
             indexing: HashMap::new(),
-        }
+        };
+        player.sync_cache_paths();
+        player
+    }
+
+    fn sync_cache_paths(&self) {
+        let paths = self
+            .library
+            .playlists
+            .iter()
+            .flat_map(|playlist| playlist.tracks.iter().cloned())
+            .collect();
+        self.indexer.set_paths(paths);
     }
 
     fn save(&mut self) {
         self.cached_favorite = None;
         self.search_results = None;
         self.volume_save_at = None;
+        self.library.prune_favorites();
+        self.sync_cache_paths();
+        let mut notices = Vec::new();
         if self.library_needs_backup {
             match Library::back_up_invalid_file(&self.library_path) {
-                Ok(backup) => {
-                    self.library_needs_backup = false;
-                    self.status = format!(
-                        "Saved a copy of unreadable settings to {}",
-                        backup.display()
-                    );
-                }
+                Ok(backup) => notices.push(format!(
+                    "Saved a copy of unreadable settings to {}",
+                    backup.display()
+                )),
                 Err(error) => {
                     self.status = format!("Could not back up unreadable settings: {error}");
                     return;
                 }
             }
         }
-        match self.library.save(&self.library_path) {
-            Ok(()) => self.volume_changed = false,
-            Err(error) => self.status = format!("Could not save playlists or settings: {error}"),
+        if self.listening_needs_backup {
+            let path = self.library_path.with_file_name("listening.json");
+            match Library::back_up_invalid_json(&path, "listening.invalid-") {
+                Ok(backup) => notices.push(format!(
+                    "Saved a copy of unreadable listening activity to {}",
+                    backup.display()
+                )),
+                Err(error) => {
+                    self.status =
+                        format!("Could not back up unreadable listening activity: {error}");
+                    return;
+                }
+            }
+        }
+        // Serialize on the UI thread, let the worker do the atomic write.
+        // The snapshot belongs to the state right now, so a later save simply
+        // replaces it in the worker's queue.
+        match serde_json::to_vec(&self.library) {
+            Ok(bytes) => {
+                self.save_worker.enqueue(self.library_path.clone(), bytes);
+                self.volume_changed = false;
+                self.library_needs_backup = false;
+                self.listening_needs_backup = false;
+                if !notices.is_empty() {
+                    self.status = notices.join(" ");
+                }
+            }
+            Err(error) => {
+                notices.push(format!("Could not save playlists or settings: {error}"));
+                self.status = notices.join(" ");
+            }
         }
     }
 
@@ -469,30 +601,75 @@ impl Player {
         }
     }
 
-    fn restore_playback(&mut self, ctx: &egui::Context) {
+    fn read_playback(&mut self) -> Option<SavedTrack> {
         let path = self.library_path.with_file_name("playback.json");
-        let saved: SavedTrack = match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(Some(saved)) => saved,
-                Ok(None) => return,
-                Err(error) => {
-                    self.status = format!("Could not read saved playback: {error}");
-                    return;
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
             Err(error) => {
                 self.status = format!("Could not read saved playback: {error}");
-                return;
+                return None;
             }
         };
-        if let Some(track) = saved.resolve(&self.library) {
-            match self.open(track, ctx, Some(saved.position)) {
-                Ok(()) => {
-                    self.library.selected = track.0;
-                    self.plan(track);
-                }
-                Err(error) => self.status = format!("Could not restore last track: {error}"),
+        let mut saved: SavedTrack = match serde_json::from_slice(&bytes) {
+            Ok(Some(saved)) => saved,
+            Ok(None) => return None,
+            Err(error) => {
+                self.status = format!("Could not read saved playback: {error}");
+                self.playback_needs_backup = true;
+                self.back_up_invalid_playback(&path);
+                return None;
+            }
+        };
+        let missing_id = saved.id.is_none();
+        let id = saved.resolve(&self.library)?;
+        let track = self.library.locate(id)?;
+        saved.id = Some(id);
+        saved.track = track;
+        saved.path = self
+            .library
+            .track_path(id)
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        if missing_id {
+            self.write_playback(Some(saved.clone()));
+        }
+        Some(saved)
+    }
+
+    fn restore_playback(&mut self, ctx: &egui::Context) {
+        let Some(saved) = self.read_playback() else {
+            return;
+        };
+        let Some(id) = saved.id else {
+            return;
+        };
+        let Some(track) = self.library.locate(id) else {
+            return;
+        };
+        match self.open_id(id, ctx, Some(saved.position)) {
+            Ok(()) => {
+                self.library.selected = track.0;
+                self.plan(track);
+            }
+            Err(error) => self.status = format!("Could not restore last track: {error}"),
+        }
+    }
+
+    fn back_up_invalid_playback(&mut self, path: &std::path::Path) {
+        if !self.playback_needs_backup {
+            return;
+        }
+        match Library::back_up_invalid_json(path, "playback.invalid-") {
+            Ok(backup) => {
+                self.playback_needs_backup = false;
+                self.status = format!(
+                    "Saved a copy of unreadable playback state to {}",
+                    backup.display()
+                );
+            }
+            Err(error) => {
+                self.status = format!("Could not back up unreadable playback state: {error}");
             }
         }
     }
@@ -500,43 +677,59 @@ impl Player {
     fn save_playback(&mut self, position: Duration) {
         let Some(playing) = &self.playing else { return };
         let track = playing.track;
-        let path = self.library.playlists[track.0].tracks[track.1].clone();
+        let id = playing.id;
         let saved = SavedTrack {
-            id: Some(playing.id),
+            id: Some(id),
             track,
-            path,
+            path: self
+                .library
+                .track_path(id)
+                .map(PathBuf::from)
+                .unwrap_or_default(),
             position,
         };
         self.write_playback(Some(saved));
     }
 
     fn write_playback(&mut self, saved: Option<SavedTrack>) {
-        if let Err(error) =
-            library::save_json(&saved, &self.library_path.with_file_name("playback.json"))
-        {
-            self.status = format!("Could not save playback: {error}");
+        let path = self.library_path.with_file_name("playback.json");
+        let mut notices = Vec::new();
+        if self.playback_needs_backup {
+            match Library::back_up_invalid_json(&path, "playback.invalid-") {
+                Ok(backup) => notices.push(format!(
+                    "Saved a copy of unreadable playback state to {}",
+                    backup.display()
+                )),
+                Err(error) => {
+                    self.status = format!("Could not back up unreadable playback state: {error}");
+                    return;
+                }
+            }
+        }
+        match serde_json::to_vec(&saved) {
+            Ok(bytes) => {
+                self.save_worker.enqueue(path.clone(), bytes);
+                self.playback_needs_backup = false;
+                if !notices.is_empty() {
+                    self.status = notices.join(" ");
+                }
+            }
+            Err(error) => {
+                notices.push(format!("Could not save playback: {error}"));
+                self.status = notices.join(" ");
+            }
         }
     }
 
-    fn previously_saved(&self) -> Option<SavedTrack> {
-        let bytes = std::fs::read(self.library_path.with_file_name("playback.json")).ok()?;
-        let mut saved: SavedTrack = serde_json::from_slice(&bytes).ok()?;
-        saved.track = saved.resolve(&self.library)?;
-        Some(saved)
+    fn previously_saved(&mut self) -> Option<SavedTrack> {
+        self.read_playback()
     }
 
     fn refresh_playback_ids(&mut self, saved: Option<SavedTrack>) {
         let locations = &self.library.locations;
         self.play_queue.retain(|id| locations.contains_key(&id));
-        let mut cursor = 0;
-        let mut pos = 0;
-        self.order.retain(|id| {
-            let keep = locations.contains_key(id);
-            cursor += usize::from(keep && self.cursor != usize::MAX && pos <= self.cursor);
-            pos += 1;
-            keep
-        });
-        self.cursor = cursor.wrapping_sub(1);
+        let cursor = self.cursor;
+        self.cursor = remap_order(&mut self.order, locations, cursor);
         self.order_list = self
             .order
             .first()
@@ -556,8 +749,14 @@ impl Player {
             self.sync_presence();
             self.write_playback(None);
         } else if let Some(mut saved) = saved {
-            if let Some(track) = saved.resolve(&self.library) {
-                saved.track = track;
+            if let Some(id) = saved.resolve(&self.library) {
+                saved.id = Some(id);
+                saved.track = self.library.locate(id).unwrap_or(saved.track);
+                saved.path = self
+                    .library
+                    .track_path(id)
+                    .map(PathBuf::from)
+                    .unwrap_or(saved.path);
                 self.write_playback(Some(saved));
             } else {
                 self.write_playback(None);
@@ -595,22 +794,10 @@ impl Player {
     }
 
     fn unique_playlist_name(&self, name: &str) -> String {
-        let exists = |name: &str| {
-            self.library
-                .playlists
-                .iter()
-                .any(|list| list.name.eq_ignore_ascii_case(name))
-        };
-        if !exists(name) {
-            return name.to_owned();
-        }
-        (2..)
-            .map(|number| format!("{name} ({number})"))
-            .find(|name| !exists(name))
-            .expect("available playlist name")
+        self.library.unique_playlist_name(name)
     }
 
-    fn playlist_action(&mut self, index: usize, action: PlaylistAction) {
+    fn playlist_action(&mut self, index: usize, action: PlaylistAction, ctx: &egui::Context) {
         match action {
             PlaylistAction::TogglePin => {
                 let playlist = &mut self.library.playlists[index];
@@ -638,7 +825,7 @@ impl Player {
                 self.dialogs.playlist_dialog = Some(PlaylistDialog::Delete(index))
             }
             PlaylistAction::Export => {
-                let playlist = &self.library.playlists[index];
+                let playlist = self.library.playlists[index].clone();
                 let name = playlist
                     .name
                     .replace(['<', '>', ':', '"', '/', '\\', '|', '?', '*'], "_");
@@ -647,88 +834,136 @@ impl Player {
                     .set_file_name(format!("{name}.m3u8"))
                     .save_file()
                 {
-                    self.status = match playlist_io::export(playlist, &path) {
-                        Ok(()) => format!("Exported “{}”", playlist.name),
-                        Err(error) => format!("Could not export playlist: {error}"),
-                    };
+                    let (send, receive) = mpsc::channel();
+                    self.playlist_exports.push(receive);
+                    let label = playlist.name.clone();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || {
+                        let result = playlist_io::export(&playlist, &path)
+                            .map_err(|error| error.to_string());
+                        let _ = send.send((label, result));
+                        ctx.request_repaint();
+                    });
+                    self.status = "Exporting playlist…".into();
                 }
             }
         }
     }
 
-    fn import_playlists(&mut self) {
+    fn import_playlists(&mut self, ctx: &egui::Context) {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter("Playlist files", playlist_io::EXTENSIONS)
             .pick_files()
         else {
             return;
         };
-        let mut imported = 0;
-        let mut skipped = 0;
-        let mut errors = Vec::new();
-        for path in paths {
-            match playlist_io::import(&path) {
-                Ok((mut playlist, ignored)) => {
-                    playlist.name = self.unique_playlist_name(&playlist.name);
-                    self.library.playlists.push(playlist);
-                    self.library.rebuild_locations();
-                    self.library.selected = self.library.playlists.len() - 1;
-                    imported += 1;
-                    skipped += ignored;
+        let (send, receive) = mpsc::channel();
+        self.playlist_imports.push(receive);
+        let ctx = ctx.clone();
+        self.status = "Importing playlists…".into();
+        std::thread::spawn(move || {
+            let results = paths
+                .into_iter()
+                .map(|path| {
+                    playlist_io::import(&path)
+                        .map_err(|error| format!("{}: {error}", path.display()))
+                })
+                .collect();
+            let _ = send.send(results);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Apply playlist file I/O results on the UI thread. Parsing and writing
+    /// happened on worker threads; only library mutation and status stay here.
+    fn finish_playlist_io(&mut self) {
+        let mut imports = Vec::new();
+        self.playlist_imports.retain(|rx| match rx.try_recv() {
+            Ok(results) => {
+                imports.push(results);
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => false,
+            Err(mpsc::TryRecvError::Empty) => true,
+        });
+        for results in imports {
+            let mut imported = 0;
+            let mut skipped = 0;
+            let mut errors = Vec::new();
+            for result in results {
+                match result {
+                    Ok((mut playlist, ignored)) => {
+                        playlist.name = self.unique_playlist_name(&playlist.name);
+                        self.library.playlists.push(playlist);
+                        self.library.rebuild_locations();
+                        self.library.selected = self.library.playlists.len() - 1;
+                        imported += 1;
+                        skipped += ignored;
+                    }
+                    Err(error) => errors.push(error),
                 }
-                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            }
+            self.status = format!("Imported {imported} playlists");
+            if skipped > 0 {
+                self.status
+                    .push_str(&format!(" · Skipped {skipped} unsupported entries"));
+            }
+            if !errors.is_empty() {
+                self.status.push_str(&format!(" · {}", errors.join(" · ")));
+            }
+            if imported > 0 {
+                self.save();
             }
         }
-        self.status = format!("Imported {imported} playlists");
-        if skipped > 0 {
-            self.status
-                .push_str(&format!(" · Skipped {skipped} unsupported entries"));
-        }
-        if !errors.is_empty() {
-            self.status.push_str(&format!(" · {}", errors.join(" · ")));
-        }
-        if imported > 0 {
-            self.save();
+
+        let mut exports = Vec::new();
+        self.playlist_exports.retain(|rx| match rx.try_recv() {
+            Ok(result) => {
+                exports.push(result);
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => false,
+            Err(mpsc::TryRecvError::Empty) => true,
+        });
+        for (name, result) in exports {
+            self.status = match result {
+                Ok(()) => format!("Exported “{name}”"),
+                Err(error) => format!("Could not export playlist: {error}"),
+            };
         }
     }
 
     fn toggle_favorite(&mut self) {
-        let Some(playing) = &self.playing else { return };
-        let path = self.library.playlists[playing.track.0].tracks[playing.track.1].clone();
-        let index = if let Some(index) = self.library.favorites {
-            index
-        } else {
-            let index = self.library.playlists.len();
-            self.library.playlists.push(Playlist {
-                ids: Vec::new(),
-                name: self.unique_playlist_name("Favorites"),
-                tracks: Vec::new(),
-                pinned: false,
-                sidebar_position: None,
-                sort: Sort::Album,
-                descending: false,
-            });
-            self.library.favorites = Some(index);
-            index
-        };
-        let playlist = &self.library.playlists[index];
-        let matches: Vec<_> = playlist
-            .tracks
-            .iter()
-            .enumerate()
-            .filter_map(|(entry, track)| (track == &path).then_some(entry))
-            .collect();
+        if let Some(playing) = &self.playing {
+            let id = playing.id;
+            self.toggle_favorite_id(id);
+        }
+    }
+
+    /// Toggle a track by identity, whether it is currently playing or only a row.
+    fn toggle_favorite_id(&mut self, id: TrackId) {
+        let playing_track = self
+            .playing
+            .as_ref()
+            .filter(|playing| playing.id == id)
+            .map(|playing| playing.track);
+        let path = self
+            .library
+            .track_path(id)
+            .map(|path| path.to_path_buf())
+            .unwrap_or_default();
+        let index = self.library.favorites_index_or_create();
+        let matches = self.library.favorite_entries(&path);
         if matches.is_empty() {
-            let notice = format!("Added to {}", playlist.name);
-            self.library.playlists[index].tracks.push(path);
-            self.library.rebuild_locations();
+            let notice = format!("Added to {}", self.library.playlists[index].name);
+            assert!(self.library.toggle_favorite_id(id));
             self.save();
             self.show_notice(notice);
             return;
         }
 
-        let notice = format!("Removed from {}", playlist.name);
-        if playing.track.0 == index {
+        let notice = format!("Removed from {}", self.library.playlists[index].name);
+        if playing_track.is_some_and(|track| track.0 == index) {
             let replacement = self
                 .library
                 .playlists
@@ -739,19 +974,34 @@ impl Player {
                     playlist
                         .tracks
                         .iter()
-                        .position(|track| track == &path)
+                        .position(|track| same_path(track, &path))
                         .map(|entry| (list, entry))
                 });
             if let Some(track) = replacement {
                 let p = self.playing.as_mut().expect("active track");
                 p.track = track;
-                p.id = self.library.playlists[track.0].ids[track.1];
+                p.id = self.library.track_id(track).unwrap_or(p.id);
                 self.plan(track);
             }
         }
-        for entry in matches.into_iter().rev() {
-            self.edit_track((index, entry), TrackEdit::Remove);
+        let saved = self.previously_saved();
+        assert!(!self.library.toggle_favorite_id(id));
+        self.indexing.remove(&index);
+        if let Some(view) = self.views.remove(&index) {
+            let mut metadata = view.tracks;
+            for entry in matches.iter().rev() {
+                if *entry < metadata.len() {
+                    metadata.remove(*entry);
+                }
+            }
+            let playlist = &self.library.playlists[index];
+            self.views.insert(
+                index,
+                PlaylistView::build(metadata, playlist.sort, playlist.descending),
+            );
         }
+        self.save();
+        self.refresh_playback_ids(saved);
         self.show_notice(notice);
     }
 
@@ -763,16 +1013,20 @@ impl Player {
             return;
         }
         playing.counted = true;
-        let track = playing.track;
-        let path = self.library.playlists[track.0].tracks[track.1].clone();
+        let Some(path) = self
+            .library
+            .track_path(playing.id)
+            .map(|path| path.to_path_buf())
+        else {
+            return;
+        };
         self.listening
             .record(path, &playing.media.title, &playing.media.artist);
         self.listening_ranks = None;
-        if let Err(error) = library::save_json(
-            &self.listening,
-            &self.library_path.with_file_name("listening.json"),
-        ) {
-            self.status = format!("Could not save listening activity: {error}");
+        let path = self.library_path.with_file_name("listening.json");
+        match serde_json::to_vec(&self.listening) {
+            Ok(bytes) => self.save_worker.enqueue(path, bytes),
+            Err(error) => self.status = format!("Could not save listening activity: {error}"),
         }
     }
 
@@ -791,6 +1045,16 @@ impl Player {
                 tracks.remove(index);
             }
             TrackEdit::Move(other) => tracks.swap(index, other),
+        }
+        if Some(list) == self.library.favorites {
+            match edit {
+                TrackEdit::Remove => {
+                    if index < self.library.favorite_ids.len() {
+                        self.library.favorite_ids.remove(index);
+                    }
+                }
+                TrackEdit::Move(other) => self.library.favorite_ids.swap(index, other),
+            }
         }
         self.indexing.remove(&list);
         if let Some(view) = self.views.remove(&list) {
@@ -864,7 +1128,8 @@ impl Player {
                     self.library.rebuild_locations();
                     let playlist = &self.library.playlists[list];
                     if self.order_list == Some(list) {
-                        let mut extra: Vec<_> = playlist.ids[first_new..].to_vec();
+                        let mut extra: Vec<_> =
+                            playlist.ids.iter().skip(first_new).copied().collect();
                         if self.library.shuffle {
                             extra.shuffle(&mut rand::rng());
                         }
@@ -914,6 +1179,57 @@ impl Player {
         }
     }
 
+    /// Re-read all playlist views after a tag or ReplayGain change.
+    fn refresh_metadata(&mut self, ctx: &egui::Context) {
+        for list in 0..self.library.playlists.len() {
+            self.views.remove(&list);
+            self.indexing.remove(&list);
+            self.request_index(list, ctx);
+        }
+        self.search_results = None;
+    }
+
+    /// Collect background ReplayGain scans without blocking the UI thread.
+    fn finish_gain_jobs(&mut self, ctx: &egui::Context) {
+        let mut finished = Vec::new();
+        self.gain_jobs.retain(|path, rx| match rx.try_recv() {
+            Ok(result) => {
+                finished.push((path.clone(), result));
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => false,
+            Err(mpsc::TryRecvError::Empty) => true,
+        });
+        for (path, result) in finished {
+            let status = match result {
+                Ok(report) => format!(
+                    "Wrote {:+.2} dB (peak {:.6}, {:.1} LUFS)",
+                    report.gain_db, report.peak, report.loudness_lufs
+                ),
+                Err(error) => format!("Scan failed: {error}"),
+            };
+            if self
+                .dialogs
+                .track_properties
+                .as_ref()
+                .is_some_and(|properties| properties.path == path)
+                && let Some(properties) = &mut self.dialogs.track_properties
+            {
+                properties.status.clone_from(&status);
+            }
+            self.show_notice(&status);
+            self.refresh_metadata(ctx);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Report disk failures from the background writer on the next frame.
+    fn finish_saves(&mut self) {
+        for error in self.save_worker.take_errors() {
+            self.status = error;
+        }
+    }
+
     fn request_index(&mut self, list: usize, ctx: &egui::Context) {
         let playlist = &self.library.playlists[list];
         let cached = self.views.get(&list).map_or(0, |view| view.tracks.len());
@@ -958,12 +1274,31 @@ impl Player {
         }
     }
 
+    /// ID-based entry point for playback. Locations are derived and may move,
+    /// the ID is not.
+    fn open_id(
+        &mut self,
+        id: TrackId,
+        ctx: &egui::Context,
+        restore: Option<Duration>,
+    ) -> Result<(), String> {
+        let track = self
+            .library
+            .locate(id)
+            .ok_or_else(|| "Track is no longer in the library".to_string())?;
+        self.open(track, ctx, restore)
+    }
+
     fn open(
         &mut self,
         track: Track,
         ctx: &egui::Context,
         restore: Option<Duration>,
     ) -> Result<(), String> {
+        let id = self
+            .library
+            .track_id(track)
+            .ok_or_else(|| "Track is no longer in the library".to_string())?;
         self.setup.stop_tone();
         let path = &self.library.playlists[track.0].tracks[track.1];
         if !relink::exists(path) {
@@ -990,7 +1325,7 @@ impl Player {
             previous.sink.pause();
         }
         self.observe_lastfm();
-        self.show_track(track, sink, ctx);
+        self.show_track(id, sink, ctx);
         if restore.is_none()
             && let Some(playing) = &self.playing
         {
@@ -999,24 +1334,16 @@ impl Player {
         Ok(())
     }
 
-    fn show_track(&mut self, track: Track, sink: audio::AudioTrack, ctx: &egui::Context) {
+    fn show_track(&mut self, id: TrackId, sink: audio::AudioTrack, ctx: &egui::Context) {
+        let Some(track) = self.library.locate(id) else {
+            return;
+        };
         let duration = sink.duration;
         let path = &self.library.playlists[track.0].tracks[track.1];
-        let mut media = Media::read(path);
-        let timed_lyrics = library::timed_lyrics(&media.lyrics);
-        let cover = media
-            .cover
-            .as_deref()
-            .and_then(cover_image)
-            .map(|image| background::Cover::new(ctx, image));
-        if cover.is_none()
-            || media
-                .cover
-                .as_ref()
-                .is_some_and(|data| data.len() > media_keys::MAX_COVER_BYTES)
-        {
-            media.cover = None;
-        }
+        // Tags, embedded cover and sidecar artwork are the slow part of a
+        // track change. Show a title-only snapshot now; finish_media_job()
+        // replaces it as soon as the worker returns.
+        let media = Media::placeholder(path);
         self.artwork_url = self
             .library
             .artwork_urls
@@ -1024,40 +1351,41 @@ impl Player {
             .cloned()
             .unwrap_or_default();
         self.gapless_generation = self.gapless_generation.wrapping_add(1);
+        self.media_generation = self.media_generation.wrapping_add(1);
+        let generation = self.media_generation;
+        let (send, receive) = mpsc::channel();
+        self.media_job = Some((generation, receive));
+        let read_path = path.clone();
+        let paint = ctx.clone();
+        std::thread::spawn(move || {
+            let media = Media::read(&read_path);
+            let _ = send.send(media);
+            paint.request_repaint();
+        });
         self.lastfm.track_changed();
         self.playing = Some(Playing {
-            id: self.library.playlists[track.0].ids[track.1],
+            id,
             counted: false,
             lastfm: lastfm::Listen::default(),
             track,
             sink,
             duration,
             media,
-            cover,
+            cover: None,
             online_cover: None,
             online_url: None,
             lookup: None,
             artwork_status: "",
-            timed_lyrics,
+            timed_lyrics: Vec::new(),
             lyrics_lookup: None,
             lyrics_status: String::new(),
             lyrics_online: false,
         });
-        if let Some(playing) = &self.playing {
-            self.plugins.track_changed(&playing.media);
-        }
         if let Ok(media_keys) = &mut self.media_keys {
             media_keys.track_changed();
         }
-        self.lookup_artwork(ctx);
-        if self.library.online_lyrics
-            && self
-                .playing
-                .as_ref()
-                .is_some_and(|p| p.media.lyrics.trim().is_empty())
-        {
-            self.lookup_lyrics(ctx);
-        }
+        // Plugins, artwork and online lyrics need the real tags, so they
+        // start in finish_media_job() instead of seeing the placeholder.
     }
 
     fn lookup_lyrics(&mut self, ctx: &egui::Context) {
@@ -1110,7 +1438,13 @@ impl Player {
         let Some(playing) = &mut self.playing else {
             return;
         };
-        let track = &self.library.playlists[playing.track.0].tracks[playing.track.1];
+        let Some(track) = self
+            .library
+            .track_path(playing.id)
+            .map(|path| path.to_path_buf())
+        else {
+            return;
+        };
         let extension = if playing.timed_lyrics.is_empty() {
             "txt"
         } else {
@@ -1194,6 +1528,98 @@ impl Player {
         }
     }
 
+    /// Apply the background tag read to the current track. The generation
+    /// makes rapid track changes discard stale results; the cover texture and
+    /// network lookups stay on the UI thread.
+    /// Open the properties dialog immediately and read tags on a worker.
+    fn open_track_properties(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let (send, receive) = mpsc::channel();
+        self.property_jobs.insert(path.clone(), receive);
+        self.dialogs.track_properties = Some(TrackProperties::loading(path.clone()));
+        let paint = ctx.clone();
+        std::thread::spawn(move || {
+            let properties = TrackProperties::read(path);
+            let _ = send.send(properties);
+            paint.request_repaint();
+        });
+    }
+
+    /// Fill a still-loading properties dialog with the worker's result.
+    fn finish_property_jobs(&mut self) {
+        let mut ready = Vec::new();
+        self.property_jobs
+            .retain(|path, receiver| match receiver.try_recv() {
+                Ok(properties) => {
+                    ready.push((path.clone(), properties));
+                    false
+                }
+                Err(mpsc::TryRecvError::Disconnected) => false,
+                Err(mpsc::TryRecvError::Empty) => true,
+            });
+        for (path, properties) in ready {
+            if self
+                .dialogs
+                .track_properties
+                .as_ref()
+                .is_some_and(|open| open.path == path && open.loading)
+            {
+                self.dialogs.track_properties = Some(properties);
+            }
+        }
+    }
+
+    fn finish_media_job(&mut self, ctx: &egui::Context) {
+        let ready = match &self.media_job {
+            Some((generation, receiver)) => match receiver.try_recv() {
+                Ok(media) => Some((*generation, media)),
+                Err(mpsc::TryRecvError::Disconnected) | Err(mpsc::TryRecvError::Empty) => return,
+            },
+            None => return,
+        };
+        self.media_job = None;
+        let Some((generation, mut media)) = ready else {
+            return;
+        };
+        if generation != self.media_generation {
+            return;
+        }
+        let cover = media
+            .cover
+            .as_deref()
+            .and_then(cover_image)
+            .map(|image| background::Cover::new(ctx, image));
+        if cover.is_none()
+            || media
+                .cover
+                .as_ref()
+                .is_some_and(|data| data.len() > media_keys::MAX_COVER_BYTES)
+        {
+            media.cover = None;
+        }
+        let timed_lyrics = library::timed_lyrics(&media.lyrics);
+        let Some(playing) = &mut self.playing else {
+            return;
+        };
+        playing.media = media;
+        playing.cover = cover;
+        playing.timed_lyrics = timed_lyrics;
+        if let Some(playing) = &self.playing {
+            self.plugins.track_changed(&playing.media);
+        }
+        if let Ok(media_keys) = &mut self.media_keys {
+            media_keys.track_changed();
+        }
+        self.lookup_artwork(ctx);
+        if self.library.online_lyrics
+            && self
+                .playing
+                .as_ref()
+                .is_some_and(|p| p.media.lyrics.trim().is_empty())
+        {
+            self.lookup_lyrics(ctx);
+        }
+    }
+
     fn start(&mut self, track: Track, ctx: &egui::Context) {
         match self.open(track, ctx, None) {
             Ok(()) => {
@@ -1204,6 +1630,16 @@ impl Player {
                 self.sync_presence();
             }
             Err(error) => self.status = format!("Could not play track: {error}"),
+        }
+    }
+
+    /// Start a whole playlist: a random entry when shuffle is on, otherwise
+    /// the first entry in the current sort order.
+    fn start_playlist(&mut self, list: usize, ctx: &egui::Context) {
+        let len = self.library.playlists[list].tracks.len();
+        let order = self.views.get(&list).map(|view| view.order.as_slice());
+        if let Some(index) = playlist_entry(len, self.library.shuffle, order) {
+            self.start((list, index), ctx);
         }
     }
 
@@ -1231,12 +1667,10 @@ impl Player {
         };
         let mut candidate = self.adjacent_cursor(offset);
         while let Some(cursor) = candidate
-            && let Some(&track) = self
-                .order
-                .get(cursor)
-                .and_then(|id| self.library.locations.get(id))
+            && let Some(&id) = self.order.get(cursor)
+            && self.library.locate(id).is_some()
         {
-            match self.open(track, ctx, None) {
+            match self.open_id(id, ctx, None) {
                 Ok(()) => {
                     self.cursor = cursor;
                     self.refresh_gapless();
@@ -1323,19 +1757,7 @@ impl Player {
                 Ok(()) => return,
                 Err(warning) => warning,
             };
-            let list = self.library.selected;
-            let len = self.library.playlists[list].tracks.len();
-            if len > 0 {
-                let index = if self.library.shuffle {
-                    rand::random_range(0..len)
-                } else {
-                    self.views
-                        .get(&list)
-                        .and_then(|view| view.order.first().copied())
-                        .unwrap_or(0)
-                };
-                self.start((list, index), ctx);
-            }
+            self.start_playlist(self.library.selected, ctx);
             if let Some(warning) = warning {
                 self.status = warning;
             }
@@ -1395,8 +1817,8 @@ impl Player {
             .playing
             .as_ref()
             .filter(|p| !p.sink.is_paused())
-            .map(|playing| {
-                let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
+            .and_then(|playing| {
+                let path = self.library.track_path(playing.id)?;
                 let artwork = self
                     .library
                     .artwork_urls
@@ -1405,7 +1827,7 @@ impl Player {
                     .filter(|url| presence::public_artwork_url(url))
                     .or(playing.online_url.as_deref())
                     .unwrap_or_default();
-                presence::Activity {
+                Some(presence::Activity {
                     title: playing.media.title.clone(),
                     artist: playing.media.artist.clone(),
                     album: playing.media.album.clone(),
@@ -1413,7 +1835,7 @@ impl Player {
                     fallback_artwork: self.library.fallback_asset.trim().into(),
                     elapsed: playing.sink.get_pos(),
                     duration: playing.duration,
-                }
+                })
             });
         self.rpc
             .update(enabled.then(|| app_id.to_owned()), activity);
@@ -1461,13 +1883,20 @@ impl eframe::App for Player {
         }
         self.import(dropped, ctx);
         self.finish_imports();
+        self.finish_playlist_io();
+        self.finish_property_jobs();
+        self.finish_media_job(ctx);
         self.finish_artwork(ctx);
         self.finish_lyrics();
         self.finish_relink();
         self.finish_indexes();
+        self.finish_gain_jobs(ctx);
+        self.finish_saves();
         self.request_index(self.library.selected, ctx);
-        if let Some(playing) = &self.playing {
-            self.request_index(playing.track.0, ctx);
+        if let Some(playing) = &self.playing
+            && let Some((list, _)) = self.library.locate(playing.id)
+        {
+            self.request_index(list, ctx);
         }
         if self
             .playing
@@ -1523,6 +1952,8 @@ impl eframe::App for Player {
         if let Some(playing) = &self.playing {
             self.save_playback(playing.sink.get_pos());
         }
+        // Drain and join: graceful exit must never lose a queued snapshot.
+        self.save_worker.shutdown();
     }
 }
 
@@ -1586,6 +2017,55 @@ fn sort_direction_button(ui: &mut egui::Ui, enabled: bool, descending: bool) -> 
     response.clicked()
 }
 
+/// Which entry of a playlist to start: random when shuffled, otherwise the
+/// first entry of the visible sort order (or the first track if no view yet).
+fn playlist_entry(len: usize, shuffle: bool, order: Option<&[usize]>) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    if shuffle {
+        Some(rand::random_range(0..len))
+    } else {
+        Some(
+            order
+                .and_then(|entries| entries.first().copied())
+                .unwrap_or(0),
+        )
+    }
+}
+
+#[cfg(test)]
+mod playlist_entry_tests {
+    use super::playlist_entry;
+
+    #[test]
+    fn empty_playlist_has_no_entry() {
+        assert_eq!(playlist_entry(0, false, None), None);
+        assert_eq!(playlist_entry(0, true, None), None);
+    }
+
+    #[test]
+    fn without_shuffle_uses_first_visible_entry() {
+        assert_eq!(playlist_entry(5, false, Some(&[3, 1, 2])), Some(3));
+        assert_eq!(playlist_entry(5, false, None), Some(0));
+    }
+
+    #[test]
+    fn with_shuffle_stays_within_bounds() {
+        for _ in 0..32 {
+            assert!(playlist_entry(5, true, Some(&[3, 1, 2])).unwrap() < 5);
+        }
+    }
+}
+
+/// The favorites heart lives between the track number and the title.
+fn favorite_column_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(row.left() + 70.0, row.top()),
+        egui::pos2(row.left() + 92.0, row.bottom()),
+    )
+}
+
 fn playlist_columns(
     ui: &mut egui::Ui,
     height: f32,
@@ -1612,22 +2092,25 @@ fn playlist_columns(
         left,
         left + 22.0,
         left + 70.0,
-        (rect.right() - 46.0).max(left + 70.0),
+        left + 92.0,
+        (rect.right() - 46.0).max(left + 92.0),
         rect.right(),
     ];
     for (column, content) in text.into_iter().enumerate() {
-        if boundaries[column + 1] <= boundaries[column] {
+        // Skip the heart gap reserved between number and title.
+        let start = if column >= 2 { column + 1 } else { column };
+        if boundaries[start + 1] <= boundaries[start] {
             continue;
         }
         let clip = Rect::from_min_max(
-            pos2(boundaries[column], rect.top()),
-            pos2(boundaries[column + 1], rect.bottom()),
+            pos2(boundaries[start], rect.top()),
+            pos2(boundaries[start + 1], rect.bottom()),
         )
         .intersect(ui.clip_rect());
         let (x, align) = if column == 1 || column == 3 {
-            (boundaries[column + 1] - 7.0, Align2::RIGHT_CENTER)
+            (boundaries[start + 1] - 7.0, Align2::RIGHT_CENTER)
         } else {
-            (boundaries[column] + 7.0, Align2::LEFT_CENTER)
+            (boundaries[start] + 7.0, Align2::LEFT_CENTER)
         };
         let x = if column == 2
             && let Some(texture) = artwork

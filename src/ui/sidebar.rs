@@ -2,6 +2,7 @@ use crate::*;
 impl Player {
     pub(crate) fn sidebar(&mut self, ctx: &egui::Context) -> Option<Sort> {
         let mut requested_sort = None;
+        let mut play = None;
         egui::SidePanel::left("playlists")
             .default_width(147.0)
             .min_width(125.0)
@@ -24,16 +25,21 @@ impl Player {
                 {
                     requested_sort = Some(Sort::Album);
                 }
-                if ui
-                    .add_enabled(
-                        self.library.favorites.is_some(),
-                        egui::Button::selectable(false, "♡  Favorites"),
-                    )
-                    .clicked()
-                    && let Some(index) = self.library.favorites
-                {
+                let favorites_selected = self
+                    .library
+                    .favorites
+                    .is_some_and(|index| self.library.selected == index);
+                let favorites =
+                    ui.add(egui::Button::selectable(favorites_selected, "♡  Favorites"));
+                if favorites.clicked() {
+                    let index = self.library.favorites_index_or_create();
                     self.library.selected = index;
                     self.save();
+                }
+                if favorites.double_clicked() {
+                    let index = self.library.favorites_index_or_create();
+                    self.library.selected = index;
+                    play = Some(index);
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
@@ -52,7 +58,7 @@ impl Player {
                         .on_hover_text("Import playlists")
                         .clicked()
                     {
-                        self.import_playlists();
+                        self.import_playlists(ctx);
                         selected = self.library.selected;
                     }
                     if ui
@@ -67,7 +73,7 @@ impl Player {
                 let mut action = None;
                 let mut reorder = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for index in self.library.sidebar_order() {
+                    for index in self.library.sidebar_playlists() {
                         let list = &self.library.playlists[index];
                         let pinned = list.pinned || Some(index) == self.library.favorites;
                         let response = ui
@@ -116,6 +122,10 @@ impl Player {
                             .inner;
                         if response.clicked() {
                             selected = index;
+                        }
+                        if response.double_clicked() {
+                            selected = index;
+                            play = Some(index);
                         }
                         if response.drag_started_by(egui::PointerButton::Primary) {
                             response.dnd_set_drag_payload(index);
@@ -169,7 +179,10 @@ impl Player {
                     self.save();
                 }
                 if let Some((index, action)) = action {
-                    self.playlist_action(index, action);
+                    self.playlist_action(index, action, ctx);
+                }
+                if let Some(index) = play {
+                    self.start_playlist(index, ctx);
                 }
             });
         requested_sort

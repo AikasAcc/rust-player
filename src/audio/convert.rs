@@ -1,6 +1,5 @@
 use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-    calculate_cutoff,
+    Resampler, SincFixedIn, SincInterpolationParameters, WindowFunction, calculate_cutoff,
 };
 
 use super::decoder::SourceFormat;
@@ -22,7 +21,12 @@ pub struct Converter {
 }
 
 impl Converter {
-    pub fn new(source: &SourceFormat, rate: u32, channels: u16) -> Result<Self, String> {
+    pub fn new(
+        source: &SourceFormat,
+        rate: u32,
+        channels: u16,
+        quality: super::ResamplerQuality,
+    ) -> Result<Self, String> {
         let source_channels = usize::from(source.channels);
         let output_channels = usize::from(channels);
         let ratio = f64::from(rate) / f64::from(source.rate);
@@ -31,11 +35,12 @@ impl Converter {
         let mut resampled = Vec::new();
         if rate != source.rate {
             let window = WindowFunction::BlackmanHarris2;
+            let sinc_len = quality.sinc_len();
             let params = SincInterpolationParameters {
-                sinc_len: 256,
-                f_cutoff: calculate_cutoff(256, window),
+                sinc_len,
+                f_cutoff: calculate_cutoff(sinc_len, window),
                 oversampling_factor: 256,
-                interpolation: SincInterpolationType::Cubic,
+                interpolation: quality.interpolation(),
                 window,
             };
             let resampler = SincFixedIn::new(ratio, 1.0, params, BLOCK, output_channels)
@@ -178,6 +183,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_quality_profile_resamples_a_sine() -> Result<(), String> {
+        let source = SourceFormat {
+            codec: "pcm",
+            rate: 48_000,
+            channels: 1,
+            mask: 4,
+            bits: Some(24),
+            kind: super::super::decoder::SampleKind::Integer(24),
+            gain: None,
+        };
+        for quality in [
+            super::super::ResamplerQuality::Fast,
+            super::super::ResamplerQuality::Balanced,
+            super::super::ResamplerQuality::High,
+            super::super::ResamplerQuality::Maximum,
+        ] {
+            let mut converter = Converter::new(&source, 44_100, 1, quality)?;
+            let input: Vec<f32> = (0..4_800)
+                .map(|frame| (frame as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin())
+                .collect();
+            let mut pcm = Vec::new();
+            converter.push(&input, &mut pcm)?;
+            converter.finish(&mut pcm)?;
+            assert!(!pcm.is_empty(), "{quality:?} produced no output");
+            assert!(pcm.iter().all(|sample| sample.is_finite()));
+            let peak = pcm
+                .iter()
+                .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+            assert!((0.8..=1.2).contains(&peak), "{quality:?} peak {peak}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sinc_flush_keeps_duration_for_short_and_long_files() -> Result<(), String> {
         let source = SourceFormat {
             codec: "pcm",
@@ -190,7 +229,8 @@ mod tests {
         };
         for rate in [8_000, 48_000, 192_000] {
             for frames in [1, 39, 512, 2_017] {
-                let mut sinc = Converter::new(&source, rate, 2)?;
+                let mut sinc =
+                    Converter::new(&source, rate, 2, super::super::ResamplerQuality::High)?;
                 let mut pcm = Vec::new();
                 sinc.push(&vec![0.0; frames], &mut pcm)?;
                 sinc.finish(&mut pcm)?;

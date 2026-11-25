@@ -89,11 +89,13 @@ impl Player {
         self.audio_setup_dialog(ctx);
     }
     pub(crate) fn track_properties_dialog(&mut self, ctx: &egui::Context) {
-        let Some(properties) = self.dialogs.track_properties.take() else {
+        let Some(mut properties) = self.dialogs.track_properties.take() else {
             return;
         };
         let mut keep_open = true;
         let mut open_folder = false;
+        let mut save_tags = false;
+        let mut scan_gain = false;
         let mut close = false;
         egui::Window::new("Track properties")
             .open(&mut keep_open)
@@ -110,14 +112,34 @@ impl Player {
                         });
                     });
                 };
-                value(ui, "Title", &properties.title);
-                value(ui, "Artist", &properties.artist);
-                value(ui, "Album", &properties.album);
-                value(ui, "Album artist", &properties.album_artist);
-                value(ui, "Track", &properties.track);
+                let field = |ui: &mut egui::Ui, label: &str, value: &mut String| -> bool {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([90.0, 0.0], egui::Label::new(label));
+                        ui.text_edit_singleline(value).changed()
+                    })
+                    .inner
+                };
+                // A user edit wins over a late worker result.
+                let mut edited = false;
+                edited |= field(ui, "Title", &mut properties.title);
+                edited |= field(ui, "Artist", &mut properties.artist);
+                edited |= field(ui, "Album", &mut properties.album);
+                edited |= field(ui, "Album artist", &mut properties.album_artist);
+                edited |= field(ui, "Track", &mut properties.track);
+                if edited {
+                    properties.loading = false;
+                }
                 value(ui, "Duration", &properties.duration);
                 value(ui, "Format", &properties.format);
                 value(ui, "File size", &properties.size);
+                ui.separator();
+                save_tags = ui.button("Save tags").clicked();
+                if ui.button("Scan and write ReplayGain").clicked() {
+                    scan_gain = true;
+                }
+                if !properties.status.is_empty() {
+                    ui.weak(&properties.status);
+                }
                 ui.separator();
                 ui.strong("Location");
                 ui.label(properties.path.display().to_string());
@@ -133,6 +155,40 @@ impl Player {
         }
         if open_folder {
             self.open_containing_folder(properties.path.clone());
+        }
+        if save_tags {
+            match crate::tagging::write(
+                &properties.path,
+                crate::tagging::Edit {
+                    title: &properties.title,
+                    artist: &properties.artist,
+                    album: &properties.album,
+                    album_artist: &properties.album_artist,
+                    track: &properties.track,
+                },
+            ) {
+                Ok(()) => {
+                    properties.status = "Tags saved".into();
+                    properties.loading = false;
+                    self.show_notice("Tags saved");
+                    self.refresh_metadata(ctx);
+                }
+                Err(error) => {
+                    properties.status = format!("Save failed: {error}");
+                    properties.loading = false;
+                    self.show_notice(format!("Could not save tags: {error}"));
+                }
+            }
+        }
+        if scan_gain {
+            let path = properties.path.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            self.gain_jobs.insert(path.clone(), receive);
+            std::thread::spawn(move || {
+                let _ = send.send(crate::gain::scan_and_write(&path));
+            });
+            properties.status = "Scanning in the background…".into();
+            properties.loading = false;
         }
         if keep_open {
             self.dialogs.track_properties = Some(properties);
@@ -243,11 +299,15 @@ impl Player {
             if let Some(playing) = &self.playing {
                 ui.label("Public HTTPS artwork URL for this track");
                 ui.text_edit_singleline(&mut self.artwork_url);
-                if ui.button("Save track artwork URL").clicked() {
-                    let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
+                if ui.button("Save track artwork URL").clicked()
+                    && let Some(path) = self
+                        .library
+                        .track_path(playing.id)
+                        .map(|path| path.to_path_buf())
+                {
                     let url = self.artwork_url.trim();
                     if url.is_empty() {
-                        self.library.artwork_urls.remove(path);
+                        self.library.artwork_urls.remove(&path);
                         save = true;
                     } else if presence::public_artwork_url(url) {
                         self.library.artwork_urls.insert(path.clone(), url.to_owned());

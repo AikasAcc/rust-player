@@ -80,7 +80,7 @@ fn parse(sheet: &Path, text: &str) -> Result<Vec<Track>, String> {
     let mut audio = None;
     let mut seen_track = false;
     let mut current = None::<Track>;
-    let mut tracks = Vec::new();
+    let mut tracks: Vec<Track> = Vec::new();
     for line in text.lines().map(str::trim) {
         let Some((command, rest)) = line.split_once(char::is_whitespace) else {
             continue;
@@ -88,9 +88,6 @@ fn parse(sheet: &Path, text: &str) -> Result<Vec<Track>, String> {
         let rest = rest.trim();
         match command.to_ascii_uppercase().as_str() {
             "FILE" => {
-                if audio.is_some() {
-                    return Err("Only single-file CUE sheets are supported".into());
-                }
                 let name = if let Some(quoted) = rest.strip_prefix('"') {
                     quoted.split_once('"').map(|(name, _)| name)
                 } else {
@@ -148,11 +145,17 @@ fn parse(sheet: &Path, text: &str) -> Result<Vec<Track>, String> {
                         track.title = format!("Track {:02}", track.number);
                     }
                     if let Some(previous) = tracks.last_mut() {
-                        let previous: &mut Track = previous;
-                        if track.start <= previous.start || track.number <= previous.number {
-                            return Err("CUE tracks or indexes are out of order".into());
+                        // A new FILE restarts its indexes at zero. Only bound a
+                        // track when the next one shares its source audio.
+                        if previous.audio == track.audio {
+                            if track.start <= previous.start {
+                                return Err("CUE indexes are out of order".into());
+                            }
+                            previous.end = Some(track.start);
                         }
-                        previous.end = Some(track.start);
+                        if track.number <= previous.number {
+                            return Err("CUE tracks are out of order".into());
+                        }
                     }
                     tracks.push(track);
                 }
@@ -202,6 +205,28 @@ mod tests {
         assert_eq!(tracks[1].title, "Second");
         assert_eq!(tracks[1].artist, "Band");
         assert_eq!(tracks[1].album, "Album");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_multiple_files_without_bounding_the_last_track_of_each_file() -> Result<(), String> {
+        let tracks = parse(
+            Path::new("Album/album.cue"),
+            "TITLE \"Album\"\nFILE \"01.flac\" WAVE\nTRACK 01 AUDIO\nTITLE \"First\"\nINDEX 01 00:00:00\nFILE \"02.flac\" WAVE\nTRACK 02 AUDIO\nTITLE \"Second\"\nINDEX 01 00:00:00\nTRACK 03 AUDIO\nTITLE \"Third\"\nINDEX 01 01:00:00",
+        )?;
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0].audio, PathBuf::from("Album/01.flac"));
+        assert_eq!(tracks[0].end, None);
+        assert_eq!(tracks[1].audio, PathBuf::from("Album/02.flac"));
+        assert_eq!(tracks[1].start, 0);
+        assert_eq!(tracks[1].end, Some(4500));
+        assert_eq!(tracks[2].audio, PathBuf::from("Album/02.flac"));
+        assert_eq!(tracks[2].end, None);
+        assert!(parse(
+            Path::new("Album/album.cue"),
+            "FILE \"a.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:10:00\nTRACK 02 AUDIO\nINDEX 01 00:05:00"
+        )
+        .is_err());
         Ok(())
     }
 }

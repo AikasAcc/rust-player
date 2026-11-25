@@ -6,3 +6,6 @@
 library.json
 listening.json
 playback.json
+metadata-cache.json
+lastfm-queue.json
+*.invalid-*.json

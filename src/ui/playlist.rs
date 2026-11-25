@@ -121,6 +121,7 @@ impl Player {
                 .y
                 .max(if show_art { 32.0 } else { 0.0 });
             let mut enqueue = None;
+            let mut toggle = None;
             playlist_columns(
                 ui,
                 height,
@@ -177,7 +178,7 @@ impl Player {
                         let active = self
                             .playing
                             .as_ref()
-                            .is_some_and(|p| p.track == (list, index));
+                            .is_some_and(|p| self.library.row_is_playing(list, index, p.id));
                         let metadata = view.and_then(|view| view.tracks.get(index));
                         let title = metadata
                             .map(|track| track.title.clone())
@@ -211,7 +212,23 @@ impl Player {
                             &path.display().to_string(),
                             show_art.then(|| self.thumbs.get(ctx, path)),
                         );
-                        if response.double_clicked() {
+                        let mut heart_hit = false;
+                        if let Some(id) = self.library.track_id((list, index)) {
+                            let heart = if self.library.is_favorite_id(id) {
+                                RichText::new("♥").color(egui::Color32::from_rgb(255, 96, 128))
+                            } else {
+                                RichText::new("♡").weak()
+                            };
+                            let heart_response = ui.put(
+                                favorite_column_rect(response.rect),
+                                egui::Button::new(heart).frame(false),
+                            );
+                            heart_hit = heart_response.hovered();
+                            if heart_response.on_hover_text("Toggle favorite").clicked() {
+                                toggle = Some(id);
+                            }
+                        }
+                        if response.double_clicked() && !heart_hit {
                             play = Some(index);
                         }
                         response.context_menu(|ui| {
@@ -266,9 +283,13 @@ impl Player {
                     }
                 },
             );
-            if let Some((index, title)) = enqueue {
-                self.play_queue
-                    .push(self.library.playlists[list].ids[index], title);
+            if let Some(id) = toggle {
+                self.toggle_favorite_id(id);
+            }
+            if let Some((index, title)) = enqueue
+                && let Some(id) = self.library.track_id((list, index))
+            {
+                self.play_queue.push(id, title);
                 self.status.clear();
             }
             if let Some((index, change)) = edit {
@@ -277,7 +298,7 @@ impl Player {
                 self.start((list, index), ctx);
             }
             if let Some(path) = properties {
-                self.dialogs.track_properties = Some(TrackProperties::read(path));
+                self.open_track_properties(path, ctx);
             }
             if find_missing {
                 self.find_missing(list, ctx);

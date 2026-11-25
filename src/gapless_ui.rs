@@ -33,25 +33,16 @@ impl Player {
             if !self.library.gapless {
                 return None;
             }
-            let (target, track) = if let Some((id, track)) = self.play_queue.next() {
-                let track = *self.library.locations.get(&track)?;
-                (NextTarget::Queue(id, track), track)
+            let (target, id) = if let Some((entry, queued)) = self.play_queue.next() {
+                let track = self.library.locate(queued)?;
+                (NextTarget::Queue(entry, track), queued)
             } else if self.library.repeat == Repeat::One {
-                (NextTarget::Repeat(playing.track), playing.track)
+                (NextTarget::Repeat(playing.track), playing.id)
             } else {
                 let cursor = self.next_cursor()?;
-                (
-                    NextTarget::Playlist(cursor),
-                    *self.library.locations.get(self.order.get(cursor)?)?,
-                )
+                (NextTarget::Playlist(cursor), *self.order.get(cursor)?)
             };
-            let path = self
-                .library
-                .playlists
-                .get(track.0)?
-                .tracks
-                .get(track.1)?
-                .clone();
+            let path = self.library.track_path(id)?.to_path_buf();
             Some(Next {
                 path,
                 target,
@@ -75,23 +66,23 @@ impl Player {
             event.listened_at_boundary,
             false,
         );
-        let resolve = |track| {
+        let resolve = |library: &crate::Library, track: crate::Track| {
             SavedTrack {
                 id: None,
                 track,
                 path: event.next.path.clone(),
                 position: Duration::ZERO,
             }
-            .resolve(&self.library)
+            .resolve(library)
         };
-        let track = match event.next.target {
+        let id = match event.next.target {
             NextTarget::Playlist(planned) => self.order_list.and_then(|list| {
                 let tracks = &self.library.playlists[list].tracks;
                 let matches = |cursor| {
                     self.order
                         .get(cursor)
-                        .and_then(|id| self.library.locations.get(id))
-                        .and_then(|&(_, i)| tracks.get(i))
+                        .and_then(|id| self.library.locate(*id))
+                        .and_then(|(_, i)| tracks.get(i))
                         == Some(&event.next.path)
                 };
                 let cursor = if matches(planned) {
@@ -100,24 +91,25 @@ impl Player {
                     (0..self.order.len()).find(|&cursor| matches(cursor))?
                 };
                 self.cursor = cursor;
-                self.library.locations.get(&self.order[cursor]).copied()
+                self.order.get(cursor).copied()
             }),
-            NextTarget::Queue(id, planned) => resolve(
-                self.play_queue
-                    .take(id)
-                    .and_then(|id| self.library.locations.get(&id).copied())
-                    .unwrap_or(planned),
-            ),
-            NextTarget::Repeat(track) => resolve(track),
+            NextTarget::Queue(entry, planned) => {
+                let taken = self.play_queue.take(entry);
+                let library = &self.library;
+                taken
+                    .filter(|id| library.locate(*id).is_some())
+                    .or_else(|| resolve(library, planned))
+            }
+            NextTarget::Repeat(track) => resolve(&self.library, track),
         };
-        let Some(track) = track else {
+        let Some(id) = id else {
             self.advance_automatic(ctx);
             return;
         };
         self.record_play();
         if let Some(playing) = self.playing.take() {
             let position = playing.sink.get_pos();
-            self.show_track(track, playing.sink, ctx);
+            self.show_track(id, playing.sink, ctx);
             if let Some(playing) = &mut self.playing {
                 playing.lastfm.rebase(event.listened_at_boundary);
             }
@@ -128,7 +120,7 @@ impl Player {
     }
 
     pub(super) fn advance_automatic(&mut self, ctx: &egui::Context) {
-        let Some(current) = self.playing.as_ref().map(|playing| playing.track) else {
+        let Some(current) = self.playing.as_ref().map(|playing| playing.id) else {
             return;
         };
         let mut warning = match self.play_next_queued(ctx) {
@@ -136,7 +128,7 @@ impl Player {
             Err(warning) => warning,
         };
         if self.library.repeat == Repeat::One {
-            match self.open(current, ctx, None) {
+            match self.open_id(current, ctx, None) {
                 Ok(()) => {
                     self.status = warning.unwrap_or_default();
                     self.save_playback(Duration::ZERO);
@@ -152,8 +144,10 @@ impl Player {
             && self.adjacent_cursor(1).is_none()
         {
             for candidate in 0..self.order.len() {
-                let location = self.library.locations[&self.order[candidate]];
-                match self.open(location, ctx, None) {
+                let Some(id) = self.order.get(candidate).copied() else {
+                    continue;
+                };
+                match self.open_id(id, ctx, None) {
                     Ok(()) => {
                         self.cursor = candidate;
                         self.status = warning.unwrap_or_default();

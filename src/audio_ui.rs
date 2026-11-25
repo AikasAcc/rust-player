@@ -1,6 +1,8 @@
 use crate::{
     Player,
-    audio::{AudioTrack, OutputMode, OutputRequest, replaygain::Mode as GainMode},
+    audio::{
+        AudioTrack, OutputMode, OutputRequest, ResamplerQuality, replaygain::Mode as GainMode,
+    },
     volume_slider,
 };
 use eframe::egui;
@@ -86,8 +88,14 @@ impl Player {
         };
         self.audio_retry_after = Some(Instant::now() + Duration::from_secs(2));
         playing.sink.pause();
-        let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
-        match AudioTrack::open(path, request, playing.sink.get_pos(), volume, paused, ctx) {
+        let Some(path) = self
+            .library
+            .track_path(playing.id)
+            .map(|path| path.to_path_buf())
+        else {
+            return;
+        };
+        match AudioTrack::open(&path, request, playing.sink.get_pos(), volume, paused, ctx) {
             Ok(sink) => {
                 self.audio_release = Some(sink.release_gate());
                 playing.sink = sink;
@@ -191,6 +199,23 @@ impl Player {
             "Allow downmix when the output has fewer channels",
         );
         options.reject_downmix = !downmix;
+        ui.horizontal(|ui| {
+            ui.label("Resampler");
+            egui::ComboBox::from_id_salt("resampler-quality")
+                .selected_text(options.resampler.label())
+                .show_ui(ui, |ui| {
+                    for quality in [
+                        ResamplerQuality::Fast,
+                        ResamplerQuality::Balanced,
+                        ResamplerQuality::High,
+                        ResamplerQuality::Maximum,
+                    ] {
+                        ui.selectable_value(&mut options.resampler, quality, quality.label());
+                    }
+                });
+        })
+        .response
+        .on_hover_text("Used only when the source rate differs from the output rate.");
         ui.checkbox(&mut options.verify_flac, "Verify FLAC MD5 during playback")
             .on_hover_text("Verification runs when playing a complete FLAC from the beginning.");
         let mut dsp = self.library.audio_dsp.clone();

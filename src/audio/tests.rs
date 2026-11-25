@@ -212,7 +212,8 @@ fn check_continuous_output(output_rate: u32) -> Result<(), Box<dyn std::error::E
             .iter()
             .map(|&bytes| f32::from(i16::from_le_bytes(bytes)) / 32768.0)
             .collect();
-        let mut reference_converter = Converter::new(&source.info, output_rate, 1)?;
+        let mut reference_converter =
+            Converter::new(&source.info, output_rate, 1, super::ResamplerQuality::High)?;
         let mut converted = Vec::new();
         reference_converter.push(&samples, &mut converted)?;
         reference_converter.finish(&mut converted)?;
@@ -232,6 +233,7 @@ fn check_continuous_output(output_rate: u32) -> Result<(), Box<dyn std::error::E
     };
     let state = Arc::new(RenderState::new(Duration::ZERO, 1.0, false));
     *state.next.lock().map_err(|_| "Could not set test queue")? = Some(next.clone());
+    state.next_epoch.store(1, Release);
     let path = temp.path().join("joined.pcm");
     let backend = FileBackend {
         encoding,
@@ -401,4 +403,38 @@ fn file_backend_preserves_pcm_bytes_at_multiple_depths_and_rates()
         }
     }
     Ok(())
+}
+
+#[test]
+fn extra_codecs_are_compiled_in() {
+    use symphonia::core::codecs::{
+        CODEC_TYPE_ADPCM_IMA_WAV, CODEC_TYPE_ADPCM_MS, CODEC_TYPE_MP1, CODEC_TYPE_MP2,
+        CodecParameters,
+    };
+
+    let registry = symphonia::default::get_codecs();
+    for codec in [CODEC_TYPE_MP1, CODEC_TYPE_MP2] {
+        let mut params = CodecParameters::new();
+        params.codec = codec;
+        params.sample_rate = Some(48_000);
+        assert!(
+            registry.make(&params, &Default::default()).is_ok(),
+            "decoder for {codec:?} must be compiled in"
+        );
+    }
+    for codec in [CODEC_TYPE_ADPCM_MS, CODEC_TYPE_ADPCM_IMA_WAV] {
+        let mut params = CodecParameters::new();
+        params.codec = codec;
+        params.sample_rate = Some(48_000);
+        params.channels = Some(
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        params.frames_per_block = Some(256);
+        params.max_frames_per_packet = Some(256);
+        assert!(
+            registry.make(&params, &Default::default()).is_ok(),
+            "decoder for {codec:?} must be compiled in"
+        );
+    }
 }
