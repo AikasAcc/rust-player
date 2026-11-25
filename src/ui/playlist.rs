@@ -84,6 +84,7 @@ impl Player {
             let mut play = None;
             let mut edit = None;
             let mut properties = None;
+            let mut find_missing = false;
             let mut folder = None;
             let (_, album_text) = self
                 .theme_draft
@@ -190,6 +191,11 @@ impl Player {
                             }
                             _ => title,
                         };
+                        let title = if metadata.is_some_and(|t| t.missing) {
+                            format!("Missing · {title}")
+                        } else {
+                            title
+                        };
                         let number = metadata.map(TrackInfo::track_number).unwrap_or_default();
                         let duration = metadata
                             .and_then(|track| track.duration)
@@ -214,6 +220,16 @@ impl Player {
                                 ui.close();
                             }
                             ui.separator();
+                            if ui
+                                .add_enabled(
+                                    self.relink.is_none(),
+                                    egui::Button::new("Find missing files…"),
+                                )
+                                .clicked()
+                            {
+                                find_missing = true;
+                                ui.close();
+                            }
                             if ui.button("Properties").clicked() {
                                 properties = Some(path.clone());
                                 ui.close();
@@ -262,6 +278,9 @@ impl Player {
             }
             if let Some(path) = properties {
                 self.dialogs.track_properties = Some(TrackProperties::read(path));
+            }
+            if find_missing {
+                self.find_missing(list, ctx);
             }
             if let Some(path) = folder {
                 self.open_containing_folder(path);

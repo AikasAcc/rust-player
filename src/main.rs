@@ -22,6 +22,7 @@ mod play_queue;
 mod playlist_io;
 mod plugins;
 mod presence;
+mod relink;
 mod settings;
 mod taskbar;
 mod theme;
@@ -272,6 +273,7 @@ struct Dialogs {
 }
 
 struct Player {
+    relink: Option<mpsc::Receiver<relink::ResultSet>>,
     cached_favorite: Option<(TrackId, bool)>,
     search_deadline: Option<Instant>,
     dialogs: Dialogs,
@@ -351,6 +353,7 @@ impl Player {
             updater.check(ctx, env!("CARGO_PKG_VERSION"));
         }
         Self {
+            relink: None,
             cached_favorite: None,
             search_deadline: None,
             background: background::Preview::default(),
@@ -963,6 +966,16 @@ impl Player {
     ) -> Result<(), String> {
         self.setup.stop_tone();
         let path = &self.library.playlists[track.0].tracks[track.1];
+        if !relink::exists(path) {
+            if let Some(info) = self
+                .views
+                .get_mut(&track.0)
+                .and_then(|v| v.tracks.get_mut(track.1))
+            {
+                info.missing = true;
+            }
+            return Err(format!("Missing file: {}", path.display()));
+        }
         let sink = audio::AudioTrack::open(
             path,
             self.output_request(),
@@ -1450,6 +1463,7 @@ impl eframe::App for Player {
         self.finish_imports();
         self.finish_artwork(ctx);
         self.finish_lyrics();
+        self.finish_relink();
         self.finish_indexes();
         self.request_index(self.library.selected, ctx);
         if let Some(playing) = &self.playing {

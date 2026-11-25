@@ -57,6 +57,13 @@ impl Cache {
                                 {
                                     return (entry.info.clone(), None);
                                 }
+                                if stamp.is_none()
+                                    && let Some(entry) = cache.get(p)
+                                {
+                                    let mut info = entry.info.clone();
+                                    info.missing = true;
+                                    return (info, None);
+                                }
                                 let mut info = TrackInfo::read(p);
                                 // Virtual CUE entries depend on the sheet and its referenced audio.
                                 info.missing = if let Some((sheet, _)) = crate::cue::reference(p) {
@@ -90,8 +97,6 @@ impl Cache {
                 if let Some(entry) = update {
                     self.0.insert(p.clone(), entry);
                     dirty = true;
-                } else if info.missing {
-                    dirty |= self.0.remove(p).is_some();
                 }
                 info.prepare_search(p);
                 info
