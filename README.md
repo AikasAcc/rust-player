@@ -8,6 +8,8 @@ A standalone Windows x64 audio player written in Rust with egui, Symphonia, and 
 
 Rust Player targets Windows 10 and 11 on x64. Download the Windows ZIP from [GitHub Releases](https://github.com/AikasAcc/rust-player/releases), extract it, and run `Rust-Player.exe`. The executable is unsigned, so Windows SmartScreen or antivirus software may flag it. The release includes a SHA-256 checksum for verifying the ZIP.
 
+Starting with v0.5.0, keep the updater helper alongside the player. Open **Settings → General** to check for and install updates. Users of v0.4.0 need to extract the v0.5.0 ZIP once.
+
 To build from source, run `cargo build --release --locked` with a current Rust toolchain. Use `cargo run --locked` for a development run.
 
 Building from source requires the Windows SDK resource compiler with the MSVC toolchain, or MinGW-w64 `windres` and `ar` on PATH with the GNU toolchain. The executable embeds the [Rust Player logo](assets/ATTRIBUTION.md) at 16 sizes. The app sets DPI-appropriate small and large window icons.
@@ -54,7 +56,7 @@ The queue shows the remaining tracks in the current playlist pass, including the
 
 The file picker accepts the formats listed under [Audio output](#audio-output). Click **+** next to **Playlists** and enter a name. Drop audio files and folders anywhere in the window to add them to the selected playlist. Folder import scans subfolders. You can also use **Add files** and **Add folder**. Double-click a track to play it. The shuffle button randomizes the remaining order without repeating tracks within that run. Playlists and settings are saved in `%LOCALAPPDATA%\Rust Player\library.json`.
 
-The **Now playing** panel reads title, artist, album, cover and lyrics from available tags. If a cover is missing, put a file such as `cover.jpg` or `folder.png` next to the track. For lyrics, put a same-name `.lrc` or `.txt` file next to the track. Timestamped LRC lyrics highlight and follow the current line.
+The **Now playing** panel reads title, artist, album, cover and lyrics from available tags. If a cover is missing, put a file such as `cover.jpg` or `folder.png` next to the track. For lyrics, put a same-name `.lrc` or `.txt` file next to the track. Timestamped LRC lyrics highlight and follow the current line. Click a line to seek. Under **Settings → Appearance**, enable album covers beside track titles to show thumbnails in the playlist.
 
 Use **Sort by** to choose **Title**, **Artist**, **Album**, or **Duration**. For duration, choose **Shortest first** or **Longest first**. Tracks with unknown durations stay at the end. Each playlist remembers its sort. **Date added** restores the original order. Playback follows the displayed order when shuffle is off.
 
@@ -66,7 +68,7 @@ Right-click a playlist for **Pin**, **Rename**, **Copy**, **Delete**, and **Expo
 
 Right-click a track to remove it from the playlist. In **Date added** order, the same menu lets you move tracks up or down. These actions edit playlist entries and leave audio files on disk. The player restores your saved volume on startup.
 
-Press the star in the playback controls to add or remove the current track from **Favorites**. Use **Listening activity** to see your latest 1,000 play starts, most played songs, and most played artists. Play counts and history are stored locally. Pausing and resuming the same loaded track in the same session keeps its existing play count.
+Press the heart in the playback controls to add or remove the current track from **Favorites**. Use **Listening activity** to see your latest 1,000 play starts, most played songs, and most played artists. Play counts and history are stored locally. Pausing and resuming the same loaded track in the same session keeps its existing play count.
 
 ## Lyrics search
 
@@ -116,7 +118,7 @@ The player scrobbles tagged tracks longer than 30 seconds after half the track o
 
 ## Playback and local data
 
-Click or drag the progress bar to seek. Scroll over the **Volume** control to adjust the volume. On restart, the last track and playback position are restored in a paused state.
+Click or drag the progress bar to seek. Scroll over the **Volume** control to adjust the volume. Click the speaker to mute or restore your previous level. On restart, the last track and playback position are restored in a paused state.
 
 Rust Player stores playlists, playback position, listening activity, themes, fonts, plugin paths, and integration settings under `%LOCALAPPDATA%\Rust Player`. Audio files stay at their original paths. Apple Music artwork lookup, LRCLIB search, Discord sharing, and Last.fm scrobbling are separate features you can enable in the interface.
 
