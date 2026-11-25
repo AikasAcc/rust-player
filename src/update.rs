@@ -127,7 +127,7 @@ impl State {
 }
 
 fn fetch_release(current: &str) -> Result<Option<Release>, String> {
-    let mut response = artwork::https_agent()
+    let mut response = artwork::https_agent_with_timeout(std::time::Duration::from_secs(300))
         .get(RELEASE_API)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "Rust-Player-Updater")

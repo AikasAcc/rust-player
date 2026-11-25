@@ -80,3 +80,20 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_failure_restores_previous_executable() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let target = dir.path().join("player.exe");
+        fs::write(&target, b"previous version")?;
+        let mut staged = tempfile::NamedTempFile::new_in(dir.path())?;
+        staged.write_all(b"invalid executable")?;
+        assert!(install(staged, &target).is_err());
+        assert_eq!(fs::read(&target)?, b"previous version");
+        Ok(())
+    }
+}

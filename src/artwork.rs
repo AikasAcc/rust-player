@@ -23,11 +23,15 @@ pub struct Artwork {
 }
 
 pub(crate) fn https_agent() -> ureq::Agent {
+    https_agent_with_timeout(Duration::from_secs(8))
+}
+
+pub(crate) fn https_agent_with_timeout(timeout: Duration) -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
     ureq::Agent::config_builder()
         .https_only(true)
-        .timeout_global(Some(Duration::from_secs(8)))
+        .timeout_global(Some(timeout))
         .tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls)
