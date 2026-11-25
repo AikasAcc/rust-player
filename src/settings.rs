@@ -120,6 +120,7 @@ impl Player {
                             .changed();
                     }
                     Page::Appearance => {
+                        changed |= ui.checkbox(&mut self.library.track_artwork, "Show album covers beside track titles").changed();
                         self.begin_theme_edit();
                         self.theme_editor(ui);
                     }

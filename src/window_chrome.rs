@@ -240,3 +240,43 @@ pub(super) fn buttons(ui: &mut Ui) {
         }
     });
 }
+pub fn drag_zones(header: Rect, controls: [Rect; 2]) -> Vec<Rect> {
+    let mut zones = vec![header];
+    for control in controls {
+        zones = zones
+            .into_iter()
+            .flat_map(|r| {
+                let c = r.intersect(control);
+                if !c.is_positive() {
+                    return vec![r];
+                }
+                [
+                    Rect::from_min_max(r.min, pos2(r.right(), c.top())),
+                    Rect::from_min_max(pos2(r.left(), c.bottom()), r.max),
+                    Rect::from_min_max(pos2(r.left(), c.top()), c.left_bottom()),
+                    Rect::from_min_max(c.right_top(), pos2(r.right(), c.bottom())),
+                ]
+                .into_iter()
+                .filter(Rect::is_positive)
+                .collect()
+            })
+            .collect();
+    }
+    zones
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn drag_includes_gap_and_excludes_controls() {
+        let rect = |x, y, w, h| Rect::from_min_size(pos2(x, y), vec2(w, h));
+        let zones = drag_zones(
+            rect(0., 0., 1000., 48.),
+            [rect(400., 10., 190., 28.), rect(800., 8., 199., 32.)],
+        );
+        let hit = |x, y| zones.iter().any(|r| r.contains(pos2(x, y)));
+        assert!(hit(720., 24.) && hit(450., 4.) && hit(50., 24.));
+        assert!(!hit(460., 20.) && !hit(950., 20.));
+    }
+}

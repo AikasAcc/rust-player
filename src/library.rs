@@ -271,6 +271,7 @@ pub struct Library {
     pub muted: bool,
     pub volume_before_mute: f32,
     pub check_for_updates: bool,
+    pub track_artwork: bool,
     pub playlists: Vec<Playlist>,
     pub selected: usize,
     pub shuffle: bool,
@@ -307,6 +308,7 @@ impl Default for Library {
             muted: false,
             volume_before_mute: 0.7,
             check_for_updates: true,
+            track_artwork: false,
             playlists: vec![Playlist {
                 name: "Default".into(),
                 tracks: Vec::new(),
@@ -330,6 +332,14 @@ impl Default for Library {
 }
 
 impl Library {
+    pub fn toggle_mute(&mut self) {
+        if self.muted {
+            self.volume = self.volume_before_mute;
+        } else {
+            self.volume_before_mute = self.volume;
+        }
+        self.muted = !self.muted;
+    }
     pub fn sidebar_order(&self) -> Vec<usize> {
         let mut order: Vec<_> = (0..self.playlists.len()).collect();
         order.sort_by_key(|&index| {
@@ -614,6 +624,24 @@ mod tests {
             PlaylistView::build(tracks(), Sort::Duration, true).order,
             [2, 0, 3, 4, 1, 5]
         );
+    }
+
+    #[test]
+    fn mute_restores_saved_level_after_restart() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let file = temp.path().join("library.json");
+        let mut library = Library {
+            volume: 0.12345,
+            ..Default::default()
+        };
+        library.toggle_mute();
+        library.save(&file)?;
+        let mut restored = Library::load(&file)?;
+        assert!(restored.muted);
+        restored.toggle_mute();
+        assert!(!restored.muted);
+        assert_eq!(restored.volume, 0.12345);
+        Ok(())
     }
 
     #[test]

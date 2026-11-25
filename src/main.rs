@@ -22,6 +22,7 @@ mod presence;
 mod settings;
 mod taskbar;
 mod theme;
+mod thumbnails;
 mod update;
 mod window_chrome;
 
@@ -273,6 +274,7 @@ struct Player {
     status: String,
     notice: Option<Notice>,
     updater: update::State,
+    thumbs: thumbnails::Cache,
     playlist_dialog: Option<PlaylistDialog>,
     track_properties: Option<TrackProperties>,
     cover_viewer: Option<CoverViewer>,
@@ -356,6 +358,7 @@ impl Player {
             status,
             notice: None,
             updater,
+            thumbs: thumbnails::Cache::new(ctx),
             playlist_dialog: None,
             track_properties: None,
             cover_viewer: None,
@@ -424,13 +427,7 @@ impl Player {
     }
 
     fn toggle_mute(&mut self) {
-        if self.library.muted {
-            self.library.muted = false;
-            self.library.volume = self.library.volume_before_mute.clamp(0.0, 1.0);
-        } else {
-            self.library.volume_before_mute = self.library.volume;
-            self.library.muted = true;
-        }
+        self.library.toggle_mute();
         self.volume_adjusted();
     }
 
@@ -2140,6 +2137,8 @@ impl eframe::App for Player {
             let elapsed = notice.started.elapsed();
             if elapsed >= Duration::from_secs(3) {
                 self.notice = None;
+            } else if elapsed < Duration::from_millis(2550) {
+                ctx.request_repaint_after(Duration::from_millis(2550) - elapsed);
             } else {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
@@ -2192,19 +2191,10 @@ impl eframe::App for Player {
             ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::K));
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             let [mut brand, mut search_ui, mut actions] = desk_sections(ui, 48.0, 244.0);
-            if let Some(chrome) = &self.window_chrome {
-                let left = egui::Rect::from_min_max(
-                    brand.max_rect().left_top(),
-                    egui::pos2(search_ui.max_rect().left(), brand.max_rect().bottom()),
-                );
-                let right = egui::Rect::from_min_max(
-                    egui::pos2(search_ui.max_rect().right(), brand.max_rect().top()),
-                    egui::pos2(actions.max_rect().left(), brand.max_rect().bottom()),
-                );
-                chrome.set_captions([left, right], ctx.pixels_per_point());
-            } else {
-                window_chrome::title_drag(&brand, brand.max_rect());
-            }
+            let header = ui.max_rect().intersect(egui::Rect::from_min_max(
+                egui::pos2(ui.clip_rect().left(), brand.max_rect().top()),
+                egui::pos2(ui.clip_rect().right(), brand.max_rect().bottom()),
+            ));
             brand.horizontal_centered(|ui| {
                 let (mark, family) = fonts::brand_mark();
                 ui.label(
@@ -2214,50 +2204,71 @@ impl eframe::App for Player {
                 );
                 ui.strong("Rust Player");
             });
-            search_ui.horizontal_centered(|ui| {
-                egui::Frame::new()
-                    .fill(ui.visuals().window_fill)
-                    .stroke(ui.visuals().window_stroke)
-                    .corner_radius(4)
-                    .inner_margin(egui::Margin::symmetric(7, 2))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui
-                                .allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                            let center = rect.center() - egui::vec2(1.0, 1.0);
-                            let stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
-                            ui.painter().circle_stroke(center, 4.0, stroke);
-                            ui.painter().line_segment(
-                                [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
-                                stroke,
-                            );
-                            let search = ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.track_search)
-                                        .frame(false)
-                                        .desired_width(142.0)
-                                        .hint_text("Search playlist"),
-                                )
-                                .on_hover_text(
-                                    "Search titles, artists, albums and file names (Ctrl+K)",
+            let search_box = search_ui
+                .horizontal_centered(|ui| {
+                    egui::Frame::new()
+                        .fill(ui.visuals().window_fill)
+                        .stroke(ui.visuals().window_stroke)
+                        .corner_radius(4)
+                        .inner_margin(egui::Margin::symmetric(7, 2))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(14.0, 14.0),
+                                    egui::Sense::hover(),
                                 );
-                            if focus_search {
-                                search.request_focus();
-                            }
-                            if self.track_search.is_empty() {
-                                ui.label(RichText::new("Ctrl K").small().weak());
-                            } else if ui.small_button("×").on_hover_text("Clear search").clicked()
-                            {
-                                self.track_search.clear();
-                            }
-                        });
-                    });
-            });
-            actions.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                window_chrome::buttons(ui);
-                ui.separator();
-                self.header_actions(ui);
-            });
+                                let center = rect.center() - egui::vec2(1.0, 1.0);
+                                let stroke =
+                                    egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
+                                ui.painter().circle_stroke(center, 4.0, stroke);
+                                ui.painter().line_segment(
+                                    [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
+                                    stroke,
+                                );
+                                let search = ui
+                                    .add(
+                                        egui::TextEdit::singleline(&mut self.track_search)
+                                            .frame(false)
+                                            .desired_width(142.0)
+                                            .hint_text("Search playlist"),
+                                    )
+                                    .on_hover_text(
+                                        "Search titles, artists, albums and file names (Ctrl+K)",
+                                    );
+                                if focus_search {
+                                    search.request_focus();
+                                }
+                                if self.track_search.is_empty() {
+                                    ui.label(RichText::new("Ctrl K").small().weak());
+                                } else if ui
+                                    .small_button("×")
+                                    .on_hover_text("Clear search")
+                                    .clicked()
+                                {
+                                    self.track_search.clear();
+                                }
+                            });
+                        })
+                        .response
+                        .rect
+                })
+                .inner;
+            let action_box = actions
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    window_chrome::buttons(ui);
+                    ui.separator();
+                    self.header_actions(ui);
+                    ui.min_rect()
+                })
+                .inner;
+            let zones = window_chrome::drag_zones(header, [search_box, action_box]);
+            if let Some(chrome) = &self.window_chrome {
+                chrome.set_captions(zones, ctx.pixels_per_point());
+            } else {
+                for (i, rect) in zones.into_iter().enumerate() {
+                    ui.push_id(i, |ui| window_chrome::title_drag(ui, rect));
+                }
+            }
         });
 
         egui::TopBottomPanel::bottom("transport")
@@ -2732,9 +2743,22 @@ impl eframe::App for Player {
                 ui.weak(format!("{} matching tracks", results.count));
                 &results.rows
             });
-            let height = ui.spacing().interact_size.y;
+            let show_art = self.library.track_artwork;
+            let height = ui
+                .spacing()
+                .interact_size
+                .y
+                .max(if show_art { 32.0 } else { 0.0 });
             let mut enqueue = None;
-            playlist_columns(ui, height, ["", "#", "Title", "Time"], true, false, "");
+            playlist_columns(
+                ui,
+                height,
+                ["", "#", "Title", "Time"],
+                true,
+                false,
+                "",
+                show_art.then_some(None),
+            );
             egui::ScrollArea::vertical().show_rows(
                 ui,
                 height,
@@ -2809,6 +2833,7 @@ impl eframe::App for Player {
                             false,
                             active,
                             &path.display().to_string(),
+                            show_art.then(|| self.thumbs.get(ctx, path)),
                         );
                         if response.double_clicked() {
                             play = Some(index);
@@ -3040,6 +3065,7 @@ fn playlist_columns(
     header: bool,
     active: bool,
     tooltip: &str,
+    artwork: Option<Option<egui::TextureId>>,
 ) -> egui::Response {
     use egui::{Align2, FontId, Rect, Sense, pos2, vec2};
     let sense = if header {
@@ -3074,6 +3100,28 @@ fn playlist_columns(
             (boundaries[column + 1] - 7.0, Align2::RIGHT_CENTER)
         } else {
             (boundaries[column] + 7.0, Align2::LEFT_CENTER)
+        };
+        let x = if column == 2
+            && let Some(texture) = artwork
+        {
+            let size = height - 4.0;
+            let cover = Rect::from_min_size(pos2(x, rect.top() + 2.0), vec2(size, size));
+            if !header {
+                let p = painter.with_clip_rect(clip);
+                if let Some(texture) = texture {
+                    p.image(
+                        texture,
+                        cover,
+                        Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    p.rect_filled(cover, 2, ui.visuals().widgets.inactive.bg_fill);
+                }
+            }
+            x + size + 6.0
+        } else {
+            x
         };
         let color = if header {
             ui.visuals().weak_text_color()
