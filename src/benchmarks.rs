@@ -6,7 +6,7 @@ use std::hint::black_box;
 fn library_search_scale() {
     for n in [1000, 10000, 50000, 100000] {
         let mut list = Library::default().playlists.remove(0);
-        let tracks = (0..n)
+        let mut tracks: Vec<_> = (0..n)
             .map(|i| {
                 list.tracks.push(PathBuf::from(format!(
                     "Music/Album {}/Track {i}.flac",
@@ -22,6 +22,9 @@ fn library_search_scale() {
             })
             .collect();
         let start = Instant::now();
+        for (p, t) in list.tracks.iter().zip(&mut tracks) {
+            t.prepare_search(p);
+        }
         let view = PlaylistView::build(tracks, Sort::Album, false);
         println!("build,{n},{}", start.elapsed().as_micros());
         for _ in 0..7 {

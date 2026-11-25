@@ -233,18 +233,7 @@ impl SearchResults {
                     PlaylistRow::Album(label) => album = Some(label),
                     PlaylistRow::Track(index) => {
                         let track = &view.tracks[*index];
-                        if [
-                            &track.title,
-                            &track.artist,
-                            &track.album,
-                            &track.album_artist,
-                        ]
-                        .into_iter()
-                        .any(|field| field.to_lowercase().contains(&needle))
-                            || file_title(&playlist.tracks[*index])
-                                .to_lowercase()
-                                .contains(&needle)
-                        {
+                        if !needle.contains('\0') && track.search_key.contains(&needle) {
                             if let Some(label) = album.take() {
                                 rows.push(PlaylistRow::Album(label.clone()));
                             }
@@ -283,6 +272,8 @@ struct Dialogs {
 }
 
 struct Player {
+    cached_favorite: Option<(TrackId, bool)>,
+    search_deadline: Option<Instant>,
     dialogs: Dialogs,
     indexer: metadata_cache::Indexer,
     background: background::Preview,
@@ -360,6 +351,8 @@ impl Player {
             updater.check(ctx, env!("CARGO_PKG_VERSION"));
         }
         Self {
+            cached_favorite: None,
+            search_deadline: None,
             background: background::Preview::default(),
             indexer: metadata_cache::Indexer::new(
                 library_path.with_file_name("metadata-cache.json"),
@@ -410,6 +403,7 @@ impl Player {
     }
 
     fn save(&mut self) {
+        self.cached_favorite = None;
         self.search_results = None;
         self.volume_save_at = None;
         if self.library_needs_backup {

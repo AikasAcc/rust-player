@@ -49,6 +49,11 @@ impl Player {
                                     .on_hover_text(
                                         "Search titles, artists, albums and file names (Ctrl+K)",
                                     );
+                                if search.changed() {
+                                    let wait = Duration::from_millis(80);
+                                    self.search_deadline = Some(Instant::now() + wait);
+                                    ctx.request_repaint_after(wait);
+                                }
                                 if focus_search {
                                     search.request_focus();
                                 }
@@ -86,6 +91,7 @@ impl Player {
         });
     }
     pub(crate) fn transport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let buttons = self.taskbar_buttons();
         let active = self.playing.is_some();
         let paused = self.playing.as_ref().is_some_and(|p| p.sink.is_paused());
         let center_width = (ui.available_width() - 324.0).clamp(245.0, 440.0);
@@ -147,7 +153,7 @@ impl Player {
                     ui,
                     Icon::Previous,
                     "Previous track",
-                    self.taskbar_buttons().previous,
+                    buttons.previous,
                     false,
                 ) {
                     self.previous(ctx);
@@ -157,7 +163,7 @@ impl Player {
                     ui,
                     if show_pause { Icon::Pause } else { Icon::Play },
                     if show_pause { "Pause" } else { "Play" },
-                    self.taskbar_buttons().can_play,
+                    buttons.can_play,
                     false,
                 ) {
                     if show_pause {
@@ -166,13 +172,7 @@ impl Player {
                         self.resume(ctx);
                     }
                 }
-                if icon(
-                    ui,
-                    Icon::Next,
-                    "Next track",
-                    self.taskbar_buttons().next,
-                    false,
-                ) {
+                if icon(ui, Icon::Next, "Next track", buttons.next, false) {
                     self.step(1, ctx);
                 }
                 if icon(ui, Icon::Shuffle, "Shuffle", true, self.library.shuffle) {
@@ -210,13 +210,23 @@ impl Player {
         });
     }
 
-    pub(crate) fn current_is_favorite(&self) -> bool {
-        self.playing.as_ref().is_some_and(|playing| {
+    pub(crate) fn current_is_favorite(&mut self) -> bool {
+        let Some(playing) = &self.playing else {
+            return false;
+        };
+        if let Some((id, value)) = self.cached_favorite
+            && id == playing.id
+        {
+            return value;
+        }
+        let favorite = {
             let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
             self.library
                 .favorites
                 .is_some_and(|index| self.library.playlists[index].tracks.contains(path))
-        })
+        };
+        self.cached_favorite = Some((playing.id, favorite));
+        favorite
     }
 
     pub(crate) fn header_actions(&mut self, ui: &mut egui::Ui) {

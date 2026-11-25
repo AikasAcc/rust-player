@@ -86,6 +86,8 @@ impl Sort {
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TrackInfo {
+    #[serde(skip)]
+    pub search_key: String,
     #[serde(default)]
     pub missing: bool,
     pub title: String,
@@ -98,6 +100,17 @@ pub struct TrackInfo {
 }
 
 impl TrackInfo {
+    pub fn prepare_search(&mut self, path: &Path) {
+        self.search_key = [
+            &self.title[..],
+            &self.artist,
+            &self.album,
+            &self.album_artist,
+            &file_title(path),
+        ]
+        .join("\0")
+        .to_lowercase();
+    }
     pub fn read(path: &Path) -> Self {
         if let Ok(Some(track)) = crate::cue::resolve(path) {
             return Self {

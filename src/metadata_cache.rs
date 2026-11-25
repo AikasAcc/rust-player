@@ -86,13 +86,14 @@ impl Cache {
         let tracks = paths
             .iter()
             .zip(chunks.into_iter().flatten())
-            .map(|(p, (info, update))| {
+            .map(|(p, (mut info, update))| {
                 if let Some(entry) = update {
                     self.0.insert(p.clone(), entry);
                     dirty = true;
                 } else if info.missing {
                     dirty |= self.0.remove(p).is_some();
                 }
+                info.prepare_search(p);
                 info
             })
             .collect();

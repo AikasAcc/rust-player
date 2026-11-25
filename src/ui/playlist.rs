@@ -95,17 +95,24 @@ impl Player {
             let query = self.track_search.trim();
             if query.is_empty() {
                 self.search_results = None;
-            } else if !self
-                .search_results
-                .as_ref()
-                .is_some_and(|cached| cached.list == list && cached.query == query)
+            } else if self
+                .search_deadline
+                .is_none_or(|deadline| Instant::now() >= deadline)
+                && !self
+                    .search_results
+                    .as_ref()
+                    .is_some_and(|cached| cached.list == list && cached.query == query)
             {
                 self.search_results = Some(SearchResults::new(list, query, playlist, view));
             }
-            let filtered_rows = self.search_results.as_ref().map(|results| {
-                ui.weak(format!("{} matching tracks", results.count));
-                &results.rows
-            });
+            let filtered_rows = self
+                .search_results
+                .as_ref()
+                .filter(|cached| cached.list == list)
+                .map(|results| {
+                    ui.weak(format!("{} matching tracks", results.count));
+                    &results.rows
+                });
             let show_art = self.library.track_artwork;
             let height = ui
                 .spacing()
