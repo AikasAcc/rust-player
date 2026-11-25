@@ -16,7 +16,7 @@ pub enum Page {
 
 impl Player {
     pub(super) fn settings_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut page) = self.settings_page else {
+        let Some(mut page) = self.dialogs.settings_page else {
             return;
         };
         let mut open = true;
@@ -128,10 +128,10 @@ impl Player {
                         self.online_lyrics_setting(ui);
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Discord").clicked() {
-                                self.discord_settings = true;
+                                self.dialogs.discord_settings = true;
                             }
                             if ui.button("Plugins").clicked() {
-                                self.plugins_open = true;
+                                self.dialogs.plugins_open = true;
                             }
                         });
                         ui.separator();
@@ -149,7 +149,7 @@ impl Player {
                     }
                 }
             });
-        self.settings_page = open.then_some(page);
+        self.dialogs.settings_page = open.then_some(page);
         if !open && let Some(draft) = self.theme_draft.take() {
             self.restore_applied_theme(ctx, &draft);
         }
@@ -199,7 +199,7 @@ impl Player {
     }
 
     pub(super) fn open_theme_editor(&mut self) {
-        self.settings_page = Some(Page::Appearance);
+        self.dialogs.settings_page = Some(Page::Appearance);
     }
 
     fn begin_theme_edit(&mut self) {
