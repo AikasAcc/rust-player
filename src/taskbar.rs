@@ -279,10 +279,10 @@ unsafe extern "system" fn subclass(
 }
 
 fn enqueue(signals: &Signals, command: Command) {
-    if let Ok(mut queue) = signals.commands.try_borrow_mut() {
-        if queue.len() < 16 {
-            queue.push(command);
-        }
+    if let Ok(mut queue) = signals.commands.try_borrow_mut()
+        && queue.len() < 16
+    {
+        queue.push(command);
     }
     signals.ctx.request_repaint_of(egui::ViewportId::ROOT);
 }

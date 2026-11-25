@@ -72,10 +72,9 @@ fn run(rx: mpsc::Receiver<Update>, status: Arc<Mutex<String>>) {
         if connection
             .as_ref()
             .is_some_and(|(id, _)| update.id.as_ref() != Some(id) || update.activity.is_none())
+            && let Some((_, mut rpc)) = connection.take()
         {
-            if let Some((_, mut rpc)) = connection.take() {
-                let _ = rpc.set_activity(Value::Null);
-            }
+            let _ = rpc.set_activity(Value::Null);
         }
         let message = match (&update.id, &update.activity) {
             (None, _) => "Sharing is off".into(),

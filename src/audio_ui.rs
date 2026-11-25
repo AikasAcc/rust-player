@@ -79,6 +79,7 @@ impl Player {
 
     pub(super) fn reopen_audio(&mut self, ctx: &egui::Context, paused: bool) {
         let request = self.output_request();
+        let volume = self.effective_volume();
         self.observe_lastfm();
         let Some(playing) = &mut self.playing else {
             return;
@@ -86,14 +87,7 @@ impl Player {
         self.audio_retry_after = Some(Instant::now() + Duration::from_secs(2));
         playing.sink.pause();
         let path = &self.library.playlists[playing.track.0].tracks[playing.track.1];
-        match AudioTrack::open(
-            path,
-            request,
-            playing.sink.get_pos(),
-            self.library.volume,
-            paused,
-            ctx,
-        ) {
+        match AudioTrack::open(path, request, playing.sink.get_pos(), volume, paused, ctx) {
             Ok(sink) => {
                 self.audio_release = Some(sink.release_gate());
                 playing.sink = sink;
@@ -254,6 +248,7 @@ impl Player {
             .inner
             .changed()
         {
+            self.library.muted = false;
             self.volume_adjusted();
         }
         if !self.software_volume_available() {
@@ -308,7 +303,7 @@ impl Player {
         } else {
             &processed
         };
-        let volume = self.library.volume;
+        let volume = self.effective_volume();
         let replay_gain = match source.gain {
             Some(gain) => format!("{:+.1} dB", 20.0 * gain.log10()),
             None if self.library.audio_output.replay_gain.enabled() => "Bypassed · no tag".into(),

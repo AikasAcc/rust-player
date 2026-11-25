@@ -3,7 +3,7 @@ use eframe::egui::{
     pos2, vec2,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::ScreenToClient,
@@ -20,7 +20,7 @@ use windows::Win32::{
 const SUBCLASS: usize = 2;
 
 struct HitRegions {
-    caption: Cell<Rect>,
+    captions: RefCell<Vec<Rect>>,
     alive: Cell<bool>,
 }
 
@@ -36,7 +36,7 @@ impl NativeChrome {
         };
         let hwnd = HWND(handle.hwnd.get());
         let regions = Box::new(HitRegions {
-            caption: Cell::new(Rect::NOTHING),
+            captions: RefCell::new(Vec::new()),
             alive: Cell::new(true),
         });
         // Windows invokes the subclass on the UI thread. Its data stays boxed until removal.
@@ -55,11 +55,16 @@ impl NativeChrome {
         Some(Self { hwnd, regions })
     }
 
-    pub fn set_caption(&self, rect: Rect, pixels_per_point: f32) {
-        self.regions.caption.set(Rect::from_min_max(
-            (rect.min.to_vec2() * pixels_per_point).to_pos2(),
-            (rect.max.to_vec2() * pixels_per_point).to_pos2(),
-        ));
+    pub fn set_captions(&self, rects: impl IntoIterator<Item = Rect>, pixels_per_point: f32) {
+        let mut captions = self.regions.captions.borrow_mut();
+        captions.clear();
+        captions.extend(rects.into_iter().filter_map(|rect| {
+            let scaled = Rect::from_min_max(
+                (rect.min.to_vec2() * pixels_per_point).to_pos2(),
+                (rect.max.to_vec2() * pixels_per_point).to_pos2(),
+            );
+            (scaled.width() > 0.0 && scaled.height() > 0.0).then_some(scaled)
+        }));
     }
 }
 
@@ -134,9 +139,10 @@ unsafe extern "system" fn hit_test(
     }
     let regions = unsafe { &*(data as *const HitRegions) };
     if regions
-        .caption
-        .get()
-        .contains(pos2(point.x as f32, point.y as f32))
+        .captions
+        .borrow()
+        .iter()
+        .any(|rect| rect.contains(pos2(point.x as f32, point.y as f32)))
     {
         LRESULT(HTCAPTION as isize)
     } else {

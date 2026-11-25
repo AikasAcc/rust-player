@@ -45,6 +45,57 @@ impl Player {
                             .checkbox(&mut self.library.media_keys, "Use keyboard media keys")
                             .changed();
                         self.media_key_status(ui);
+                        ui.separator();
+                        ui.heading("Updates");
+                        changed |= ui
+                            .checkbox(
+                                &mut self.library.check_for_updates,
+                                "Check for updates when Rust Player starts",
+                            )
+                            .changed();
+                        if ui.button("Check now").clicked() {
+                            self.updater.check(ctx, env!("CARGO_PKG_VERSION"));
+                        }
+                        match &self.updater {
+                            crate::update::State::Idle => {
+                                ui.weak("Updates are checked on GitHub. Downloads always require confirmation.");
+                            }
+                            crate::update::State::Checking(_) => {
+                                ui.weak("Checking GitHub for updates…");
+                            }
+                            crate::update::State::UpToDate => {
+                                ui.weak("Rust Player is up to date.");
+                            }
+                            crate::update::State::Available(release) => {
+                                let release = release.clone();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!("{} is available.", release.version));
+                                    if ui.button("Release notes").clicked() {
+                                        ctx.open_url(egui::OpenUrl::new_tab(&release.page_url));
+                                    }
+                                    if ui.button("Download update").clicked() {
+                                        self.updater.download(ctx);
+                                    }
+                                });
+                            }
+                            crate::update::State::Downloading(_) => {
+                                ui.weak("Downloading and verifying the update…");
+                            }
+                            crate::update::State::Ready(_) => {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Verified update ready.");
+                                    if ui.button("Install and restart").clicked() {
+                                        match self.updater.install() {
+                                            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                                            Err(error) => self.status = error,
+                                        }
+                                    }
+                                });
+                            }
+                            crate::update::State::Failed(error) => {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                            }
+                        }
                     }
                     Page::Audio => {
                         let height = (ctx.content_rect().height() - 120.0).clamp(100.0, 560.0);

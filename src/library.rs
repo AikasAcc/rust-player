@@ -268,6 +268,9 @@ pub struct Library {
     pub plugins: Vec<crate::plugins::PluginConfig>,
     pub favorites: Option<usize>,
     pub volume: f32,
+    pub muted: bool,
+    pub volume_before_mute: f32,
+    pub check_for_updates: bool,
     pub playlists: Vec<Playlist>,
     pub selected: usize,
     pub shuffle: bool,
@@ -301,6 +304,9 @@ impl Default for Library {
             plugins: Vec::new(),
             favorites: None,
             volume: 0.7,
+            muted: false,
+            volume_before_mute: 0.7,
+            check_for_updates: true,
             playlists: vec![Playlist {
                 name: "Default".into(),
                 tracks: Vec::new(),
@@ -389,6 +395,7 @@ impl Library {
             data.library_desk_theme_seen = true;
         }
         data.volume = data.volume.clamp(0.0, 1.0);
+        data.volume_before_mute = data.volume_before_mute.clamp(0.0, 1.0);
         if data.playlists.is_empty() {
             data.playlists = Self::default().playlists;
         }
@@ -550,18 +557,18 @@ impl Media {
                 }
             }
         }
-        if media.cover.is_none() {
-            if let Some(dir) = path.parent() {
-                media.cover = [
-                    "cover.jpg",
-                    "folder.jpg",
-                    "cover.png",
-                    "folder.png",
-                    "front.jpg",
-                ]
-                .iter()
-                .find_map(|name| fs::read(dir.join(name)).ok());
-            }
+        if media.cover.is_none()
+            && let Some(dir) = path.parent()
+        {
+            media.cover = [
+                "cover.jpg",
+                "folder.jpg",
+                "cover.png",
+                "folder.png",
+                "front.jpg",
+            ]
+            .iter()
+            .find_map(|name| fs::read(dir.join(name)).ok());
         }
         if media.lyrics.trim().is_empty() {
             media.lyrics = ["lrc", "txt"]

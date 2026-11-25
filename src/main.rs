@@ -7,6 +7,7 @@ mod audio_ui;
 mod background;
 mod cue;
 mod diagnostics;
+mod digest;
 mod fonts;
 mod gapless_ui;
 mod lastfm;
@@ -21,6 +22,7 @@ mod presence;
 mod settings;
 mod taskbar;
 mod theme;
+mod update;
 mod window_chrome;
 
 use eframe::egui::{self, RichText};
@@ -137,6 +139,11 @@ struct CoverViewer {
     cover: background::Cover,
     title: String,
     artist: String,
+}
+
+struct Notice {
+    message: String,
+    started: Instant,
 }
 
 impl TrackProperties {
@@ -264,6 +271,8 @@ struct Player {
     volume_changed: bool,
     volume_save_at: Option<Instant>,
     status: String,
+    notice: Option<Notice>,
+    updater: update::State,
     playlist_dialog: Option<PlaylistDialog>,
     track_properties: Option<TrackProperties>,
     cover_viewer: Option<CoverViewer>,
@@ -321,6 +330,10 @@ impl Player {
         let plugins = plugins::Host::load(&library.plugins);
         let lastfm = lastfm::Client::new(ctx, &library_path, &library);
         let setup = audio_setup::Setup::new(!library_path.exists() && !library.audio_setup_done);
+        let mut updater = update::State::default();
+        if library.check_for_updates {
+            updater.check(ctx, env!("CARGO_PKG_VERSION"));
+        }
         Self {
             background: background::Preview::default(),
             setup,
@@ -341,6 +354,8 @@ impl Player {
             volume_changed: false,
             volume_save_at: None,
             status,
+            notice: None,
+            updater,
             playlist_dialog: None,
             track_properties: None,
             cover_viewer: None,
@@ -396,8 +411,34 @@ impl Player {
         self.volume_changed = true;
         self.volume_save_at = Some(Instant::now() + Duration::from_millis(300));
         if let Some(playing) = &self.playing {
-            playing.sink.set_volume(self.library.volume);
+            playing.sink.set_volume(self.effective_volume());
         }
+    }
+
+    fn effective_volume(&self) -> f32 {
+        if !self.library.muted {
+            self.library.volume
+        } else {
+            Default::default()
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        if self.library.muted {
+            self.library.muted = false;
+            self.library.volume = self.library.volume_before_mute.clamp(0.0, 1.0);
+        } else {
+            self.library.volume_before_mute = self.library.volume;
+            self.library.muted = true;
+        }
+        self.volume_adjusted();
+    }
+
+    fn show_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some(Notice {
+            message: message.into(),
+            started: Instant::now(),
+        });
     }
 
     fn flush_volume(&mut self, ctx: &egui::Context) {
@@ -654,13 +695,14 @@ impl Player {
             .filter_map(|(entry, track)| (track == &path).then_some(entry))
             .collect();
         if matches.is_empty() {
-            self.status = format!("Added to {}", playlist.name);
+            let notice = format!("Added to {}", playlist.name);
             self.library.playlists[index].tracks.push(path);
             self.save();
+            self.show_notice(notice);
             return;
         }
 
-        self.status = format!("Removed from {}", playlist.name);
+        let notice = format!("Removed from {}", playlist.name);
         if playing.track.0 == index {
             let replacement = self
                 .library
@@ -683,6 +725,7 @@ impl Player {
         for entry in matches.into_iter().rev() {
             self.edit_track((index, entry), TrackEdit::Remove);
         }
+        self.show_notice(notice);
     }
 
     fn record_play(&mut self) {
@@ -749,10 +792,11 @@ impl Player {
                 _ => Some((list, track)),
             }
         });
-        if matches!(edit, TrackEdit::Move(_)) && !self.library.shuffle {
-            if let Some(track) = self.order_track().filter(|track| track.0 == list) {
-                self.plan(track);
-            }
+        if matches!(edit, TrackEdit::Move(_))
+            && !self.library.shuffle
+            && let Some(track) = self.order_track().filter(|track| track.0 == list)
+        {
+            self.plan(track);
         }
     }
 
@@ -1039,7 +1083,7 @@ impl Player {
             path,
             self.output_request(),
             restore.unwrap_or_default(),
-            self.library.volume,
+            self.effective_volume(),
             true,
             ctx,
         )?;
@@ -1587,10 +1631,13 @@ impl Player {
         volume_ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let volume = ui
                 .add_enabled_ui(self.software_volume_available(), |ui| {
-                    desk_volume(ui, &mut self.library.volume)
+                    desk_volume(ui, &mut self.library.volume, self.library.muted)
                 })
                 .inner;
-            if volume.changed() {
+            if volume.speaker_clicked {
+                self.toggle_mute();
+            } else if volume.response.changed() {
+                self.library.muted = false;
                 self.volume_adjusted();
             }
         });
@@ -1900,20 +1947,19 @@ impl Player {
                         .unwrap_or_else(|| "Default font".into());
                     ui.label(format!("Font: {font}"));
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Choose font…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
+                        if ui.button("Choose font…").clicked()
+                            && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("Fonts", &["ttf", "otf"])
                                 .pick_file()
-                            {
-                                match fonts::load(Some(&path)) {
-                                    Ok(fonts) => {
-                                        ctx.set_fonts(fonts);
-                                        draft.font = Some(path);
-                                        draft.font_error.clear();
-                                    }
-                                    Err(error) => {
-                                        draft.font_error = format!("Could not load font: {error}")
-                                    }
+                        {
+                            match fonts::load(Some(&path)) {
+                                Ok(fonts) => {
+                                    ctx.set_fonts(fonts);
+                                    draft.font = Some(path);
+                                    draft.font_error.clear();
+                                }
+                                Err(error) => {
+                                    draft.font_error = format!("Could not load font: {error}")
                                 }
                             }
                         }
@@ -2017,19 +2063,18 @@ impl Player {
                         if let Ok(folder) = plugins::create_folder(&self.library_path) {
                             picker = picker.set_directory(folder);
                         }
-                        if let Some(path) = picker.pick_file() {
-                            if !self
+                        if let Some(path) = picker.pick_file()
+                            && !self
                                 .library
                                 .plugins
                                 .iter()
                                 .any(|plugin| plugin.path == path)
-                            {
-                                self.library.plugins.push(plugins::PluginConfig {
-                                    path,
-                                    enabled: false,
-                                });
-                                changed = true;
-                            }
+                        {
+                            self.library.plugins.push(plugins::PluginConfig {
+                                path,
+                                enabled: false,
+                            });
+                            changed = true;
                         }
                     }
                     if ui.button("Open Plugin Folder").clicked() {
@@ -2090,6 +2135,15 @@ impl eframe::App for Player {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.setup.update(ctx);
         self.lastfm.poll(ctx);
+        self.updater.poll(ctx);
+        if let Some(notice) = &self.notice {
+            let elapsed = notice.started.elapsed();
+            if elapsed >= Duration::from_secs(3) {
+                self.notice = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
         if std::mem::take(&mut self.restore_track) && self.library.restore_last_track {
             self.restore_playback(ctx);
         }
@@ -2139,7 +2193,15 @@ impl eframe::App for Player {
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             let [mut brand, mut search_ui, mut actions] = desk_sections(ui, 48.0, 244.0);
             if let Some(chrome) = &self.window_chrome {
-                chrome.set_caption(brand.max_rect(), ctx.pixels_per_point());
+                let left = egui::Rect::from_min_max(
+                    brand.max_rect().left_top(),
+                    egui::pos2(search_ui.max_rect().left(), brand.max_rect().bottom()),
+                );
+                let right = egui::Rect::from_min_max(
+                    egui::pos2(search_ui.max_rect().right(), brand.max_rect().top()),
+                    egui::pos2(actions.max_rect().left(), brand.max_rect().bottom()),
+                );
+                chrome.set_captions([left, right], ctx.pixels_per_point());
             } else {
                 window_chrome::title_drag(&brand, brand.max_rect());
             }
@@ -2204,6 +2266,16 @@ impl eframe::App for Player {
                 self.transport(ui, ctx);
                 if !self.status.is_empty() {
                     ui.weak(&self.status);
+                }
+                if let Some(notice) = &self.notice {
+                    let fade = ((Duration::from_secs(3).saturating_sub(notice.started.elapsed()))
+                        .as_secs_f32()
+                        / 0.45)
+                        .clamp(0.0, 1.0);
+                    ui.colored_label(
+                        ui.visuals().weak_text_color().gamma_multiply(fade),
+                        &notice.message,
+                    );
                 }
             });
 
@@ -2326,27 +2398,23 @@ impl eframe::App for Player {
                         if response.drag_started_by(egui::PointerButton::Primary) {
                             response.dnd_set_drag_payload(index);
                         }
-                        if let Some(from) = response.dnd_hover_payload::<usize>() {
-                            if self.library.can_move_playlist(*from, index) {
-                                if let Some(pointer) = ctx.pointer_interact_pos() {
-                                    let after = pointer.y >= response.rect.center().y;
-                                    let y = if after {
-                                        response.rect.bottom()
-                                    } else {
-                                        response.rect.top()
-                                    };
-                                    ui.painter().hline(
-                                        response.rect.left()..=ui.max_rect().right(),
-                                        y,
-                                        egui::Stroke::new(
-                                            2.0_f32,
-                                            ui.visuals().selection.stroke.color,
-                                        ),
-                                    );
-                                    if response.dnd_release_payload::<usize>().is_some() {
-                                        reorder = Some((*from, index, after));
-                                    }
-                                }
+                        if let Some(from) = response.dnd_hover_payload::<usize>()
+                            && self.library.can_move_playlist(*from, index)
+                            && let Some(pointer) = ctx.pointer_interact_pos()
+                        {
+                            let after = pointer.y >= response.rect.center().y;
+                            let y = if after {
+                                response.rect.bottom()
+                            } else {
+                                response.rect.top()
+                            };
+                            ui.painter().hline(
+                                response.rect.left()..=ui.max_rect().right(),
+                                y,
+                                egui::Stroke::new(2.0_f32, ui.visuals().selection.stroke.color),
+                            );
+                            if response.dnd_release_payload::<usize>().is_some() {
+                                reorder = Some((*from, index, after));
                             }
                         }
                         response.context_menu(|ui| {
@@ -2384,6 +2452,7 @@ impl eframe::App for Player {
             });
 
         let mut cover_open = None;
+        let mut lyric_seek = None;
         egui::SidePanel::right("now_playing")
             .default_width(235.0)
             .min_width(185.0)
@@ -2494,14 +2563,29 @@ impl eframe::App for Player {
                                     }
                                     last
                                 });
-                                for (index, (_, line)) in playing.timed_lyrics.iter().enumerate() {
+                                for (index, (timestamp, line)) in
+                                    playing.timed_lyrics.iter().enumerate()
+                                {
                                     if current == Some(index) {
-                                        let row = ui.label(RichText::new(line).strong());
+                                        let row = ui
+                                            .add(
+                                                egui::Label::new(RichText::new(line).strong())
+                                                    .sense(egui::Sense::click()),
+                                            )
+                                            .on_hover_text(format!("Jump to {}", time(*timestamp)));
                                         if last != current {
                                             row.scroll_to_me(Some(egui::Align::Center));
                                         }
+                                        if row.clicked() {
+                                            lyric_seek = Some(*timestamp);
+                                        }
                                     } else {
-                                        ui.weak(line);
+                                        let row = ui
+                                            .add(egui::Label::new(line).sense(egui::Sense::click()))
+                                            .on_hover_text(format!("Jump to {}", time(*timestamp)));
+                                        if row.clicked() {
+                                            lyric_seek = Some(*timestamp);
+                                        }
                                     }
                                 }
                             } else if playing.media.lyrics.is_empty() {
@@ -2538,6 +2622,9 @@ impl eframe::App for Player {
             });
         if let Some((pixels, title, artist)) = cover_open {
             self.open_cover_viewer(ctx, pixels, title, artist);
+        }
+        if let Some(timestamp) = lyric_seek {
+            self.seek(timestamp, ctx);
         }
 
         let background = self
@@ -2604,10 +2691,10 @@ impl eframe::App for Player {
                         PlaylistView::build(view.tracks, playlist.sort, playlist.descending),
                     );
                 }
-                if !self.library.shuffle {
-                    if let Some(track) = self.order_track().filter(|track| track.0 == list) {
-                        self.plan(track);
-                    }
+                if !self.library.shuffle
+                    && let Some(track) = self.order_track().filter(|track| track.0 == list)
+                {
+                    self.plan(track);
                 }
                 self.request_index(list, ctx);
                 self.save();
@@ -3140,10 +3227,10 @@ fn volume_slider(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
             .custom_formatter(|value, decimals| {
                 let mut label = egui::emath::format_with_decimals_in_range(value, decimals);
                 // Wheel steps can leave a value just below 1 that still rounds to 1.000.
-                if let Some((whole @ ("0" | "1"), fractional)) = label.split_once('.') {
-                    if fractional.bytes().all(|digit| digit == b'0') {
-                        label.truncate(whole.len());
-                    }
+                if let Some((whole @ ("0" | "1"), fractional)) = label.split_once('.')
+                    && fractional.bytes().all(|digit| digit == b'0')
+                {
+                    label.truncate(whole.len());
                 }
                 label
             }),
@@ -3152,7 +3239,12 @@ fn volume_slider(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
     response
 }
 
-fn desk_volume(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
+struct VolumeResponse {
+    response: egui::Response,
+    speaker_clicked: bool,
+}
+
+fn desk_volume(ui: &mut egui::Ui, volume: &mut f32, is_muted: bool) -> VolumeResponse {
     use egui::{Align2, Sense, Stroke, pos2, vec2};
 
     let (label, label_response) = ui.allocate_exact_size(vec2(35.0, 24.0), Sense::hover());
@@ -3170,12 +3262,16 @@ fn desk_volume(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
             )
         })
         .inner;
-    let (speaker, speaker_response) = ui.allocate_exact_size(vec2(16.0, 20.0), Sense::hover());
+    let (speaker, speaker_response) = ui.allocate_exact_size(vec2(16.0, 20.0), Sense::click());
     let mut response = slider
         .clone()
         .union(label_response)
-        .union(speaker_response)
-        .on_hover_text("Volume · scroll to adjust");
+        .union(speaker_response.clone())
+        .on_hover_text(if is_muted {
+            "Unmute"
+        } else {
+            "Mute · scroll to adjust"
+        });
     volume_wheel(ui, volume, &mut response);
 
     let mut accent = ui.visuals().selection.stroke.color;
@@ -3199,7 +3295,7 @@ fn desk_volume(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
         y,
         Stroke::new(3.0_f32, ui.visuals().window_stroke.color),
     );
-    if *volume > 0.0 {
+    if *volume > 0.0 && !is_muted {
         painter.hline(track.min..=knob.x, y, Stroke::new(3.0_f32, accent));
     }
     painter.circle_filled(
@@ -3232,7 +3328,7 @@ fn desk_volume(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
             .collect(),
         Stroke::new(1.0_f32, muted),
     ));
-    if *volume > 0.0 {
+    if *volume > 0.0 && !is_muted {
         painter.add(egui::Shape::line(
             vec![
                 center + vec2(3.0, -3.0),
@@ -3242,7 +3338,16 @@ fn desk_volume(ui: &mut egui::Ui, volume: &mut f32) -> egui::Response {
             Stroke::new(1.0_f32, muted),
         ));
     }
-    response
+    if is_muted {
+        painter.line_segment(
+            [center + vec2(-7.0, -7.0), center + vec2(7.0, 7.0)],
+            Stroke::new(1.6_f32, ui.visuals().text_color()),
+        );
+    }
+    VolumeResponse {
+        response,
+        speaker_clicked: speaker_response.clicked(),
+    }
 }
 
 fn volume_wheel(ui: &egui::Ui, volume: &mut f32, response: &mut egui::Response) {
