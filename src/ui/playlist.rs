@@ -14,6 +14,11 @@ impl Player {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.background.paint(&background, ui);
             let list = self.library.selected;
+            if self.selection_list != Some(list) {
+                self.track_selection.clear();
+                self.track_anchor = None;
+                self.selection_list = Some(list);
+            }
             let playlist = &mut self.library.playlists[list];
             let old_sort = (playlist.sort, playlist.descending);
             if let Some(sort) = requested_sort {
@@ -59,6 +64,8 @@ impl Player {
                 });
             });
             if old_sort != (playlist.sort, playlist.descending) {
+                self.track_selection.clear();
+                self.track_anchor = None;
                 if let Some(view) = self.views.remove(&list) {
                     self.views.insert(
                         list,
@@ -97,9 +104,16 @@ impl Player {
             let query = self.track_search.trim();
             if query.is_empty() {
                 self.search_results = None;
-            } else if self
-                .search_deadline
-                .is_none_or(|deadline| Instant::now() >= deadline)
+            } else {
+                // Search rows are shadows of playlist entries; selecting them
+                // would make bulk actions operate on unrelated tracks later.
+                self.track_selection.clear();
+                self.track_anchor = None;
+            }
+            if !query.is_empty()
+                && self
+                    .search_deadline
+                    .is_none_or(|deadline| Instant::now() >= deadline)
                 && !self
                     .search_results
                     .as_ref()
@@ -116,19 +130,25 @@ impl Player {
                     &results.rows
                 });
             let show_art = self.library.track_artwork;
+            // Reordering is only meaningful in "Date added" order, and only
+            // when the visible rows map one-to-one to stored playlist entries.
+            let can_reorder = playlist.sort == Sort::Added
+                && filtered_rows.is_none()
+                && view.is_none_or(|view| view.tracks.len() == playlist.tracks.len());
             let height = ui
                 .spacing()
                 .interact_size
                 .y
                 .max(if show_art { 32.0 } else { 0.0 });
-            let mut enqueue = None;
-            let mut toggle = None;
+            let mut enqueue_many = None;
+            let mut favorite_many = None;
+            let mut remove_many = None;
             playlist_columns(
                 ui,
                 height,
                 ["", "#", "Title", "Time"],
                 true,
-                false,
+                RowFlags::default(),
                 "",
                 show_art.then_some(None),
             );
@@ -145,35 +165,41 @@ impl Player {
                 ),
                 |ui, rows| {
                     for row_index in rows {
-                        let row = filtered_rows
+                        let album = filtered_rows
                             .and_then(|rows| rows.get(row_index))
-                            .or_else(|| view.and_then(|view| view.rows.get(row_index)));
-                        let index = match row {
-                            Some(PlaylistRow::Album(album)) => {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(ui.available_width(), height),
-                                    egui::Sense::hover(),
-                                );
-                                let painter =
-                                    ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-                                painter.hline(
-                                    rect.x_range(),
-                                    rect.bottom(),
-                                    ui.visuals().window_stroke,
-                                );
-                                painter.text(
-                                    rect.left_center() + egui::vec2(9.0, 0.0),
-                                    egui::Align2::LEFT_CENTER,
-                                    album,
-                                    egui::FontId::proportional(13.0),
-                                    album_text,
-                                );
-                                continue;
-                            }
-                            Some(PlaylistRow::Track(index)) => *index,
-                            None => view.map_or(row_index, |view| {
-                                view.tracks.len() + row_index - view.rows.len()
-                            }),
+                            .or_else(|| view.and_then(|view| view.rows.get(row_index)))
+                            .and_then(|row| match row {
+                                PlaylistRow::Album(label) => Some(label),
+                                PlaylistRow::Track(_) => None,
+                            });
+                        if let Some(album) = album {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), height),
+                                egui::Sense::hover(),
+                            );
+                            let painter =
+                                ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                            painter.hline(
+                                rect.x_range(),
+                                rect.bottom(),
+                                ui.visuals().window_stroke,
+                            );
+                            painter.text(
+                                rect.left_center() + egui::vec2(9.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                album,
+                                egui::FontId::proportional(13.0),
+                                album_text,
+                            );
+                            continue;
+                        }
+                        // A cached view can still describe rows of a shorter
+                        // playlist after Favorites were pruned. Skip those
+                        // rows instead of indexing past the end.
+                        let Some(index) =
+                            track_row_index(view, filtered_rows, row_index, playlist.tracks.len())
+                        else {
+                            continue;
                         };
                         let path = &playlist.tracks[index];
                         let active = self
@@ -204,15 +230,35 @@ impl Player {
                             .map(time)
                             .unwrap_or_default();
                         let marker = if active { "▶" } else { "" };
+                        let selected = self.track_selection.contains(&index);
                         let response = playlist_columns(
                             ui,
                             height,
                             [marker, &number, &title, &duration],
                             false,
-                            active,
+                            RowFlags { active, selected },
                             &path.display().to_string(),
                             show_art.then(|| self.thumbs.get(ctx, path)),
                         );
+                        if can_reorder {
+                            response.dnd_set_drag_payload(index);
+                            if let Some(source) = response.dnd_hover_payload::<usize>()
+                                && *source != index
+                            {
+                                ui.painter().rect_stroke(
+                                    response.rect,
+                                    3.0,
+                                    ui.visuals().selection.stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                                if response.dnd_release_payload::<usize>().is_some() {
+                                    // The dragged row is still present until the
+                                    // drop is applied, so compensate here.
+                                    let target = if *source < index { index - 1 } else { index };
+                                    edit = Some((*source, TrackEdit::Reorder(target)));
+                                }
+                            }
+                        }
                         let mut heart_hit = false;
                         if let Some(id) = self.library.track_id((list, index)) {
                             let heart = if self.library.is_favorite_id(id) {
@@ -226,15 +272,53 @@ impl Player {
                             );
                             heart_hit = heart_response.hovered();
                             if heart_response.on_hover_text("Toggle favorite").clicked() {
-                                toggle = Some(id);
+                                favorite_many = Some(vec![index]);
+                            }
+                        }
+                        if response.clicked() && !heart_hit {
+                            let modifiers = ui.ctx().input(|state| state.modifiers);
+                            if modifiers.shift
+                                && let Some(anchor) = self.track_anchor
+                            {
+                                self.track_selection.clear();
+                                for target in anchor.min(index)..=anchor.max(index) {
+                                    self.track_selection.insert(target);
+                                }
+                            } else if modifiers.ctrl || modifiers.command {
+                                if !self.track_selection.remove(&index) {
+                                    self.track_selection.insert(index);
+                                }
+                                self.track_anchor = Some(index);
+                            } else {
+                                self.track_selection.clear();
+                                self.track_selection.insert(index);
+                                self.track_anchor = Some(index);
                             }
                         }
                         if response.double_clicked() && !heart_hit {
                             play = Some(index);
                         }
+                        let mut targets: Vec<_> = if selected {
+                            self.track_selection.iter().copied().collect()
+                        } else {
+                            vec![index]
+                        };
+                        targets.retain(|target| *target < playlist.tracks.len());
+                        if targets.is_empty() {
+                            targets.push(index);
+                        }
+                        let suffix = if targets.len() > 1 {
+                            format!(" · {} tracks", targets.len())
+                        } else {
+                            String::new()
+                        };
                         response.context_menu(|ui| {
-                            if ui.button("Add to Play Queue").clicked() {
-                                enqueue = Some((index, title.clone()));
+                            if ui.button(format!("Add to Play Queue{suffix}")).clicked() {
+                                enqueue_many = Some(targets.clone());
+                                ui.close();
+                            }
+                            if ui.button(format!("Toggle favorite{suffix}")).clicked() {
+                                favorite_many = Some(targets.clone());
                                 ui.close();
                             }
                             ui.separator();
@@ -257,8 +341,8 @@ impl Player {
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Remove from playlist").clicked() {
-                                edit = Some((index, TrackEdit::Remove));
+                            if ui.button(format!("Remove from playlist{suffix}")).clicked() {
+                                remove_many = Some(targets.clone());
                                 ui.close();
                             }
                             if playlist.sort == Sort::Added {
@@ -284,17 +368,27 @@ impl Player {
                     }
                 },
             );
-            if let Some(id) = toggle {
-                self.toggle_favorite_id(id);
+            if let Some(indices) = enqueue_many {
+                self.enqueue_tracks(list, &indices);
             }
-            if let Some((index, title)) = enqueue
-                && let Some(id) = self.library.track_id((list, index))
-            {
-                self.play_queue.push(id, title);
-                self.status.clear();
+            if let Some(indices) = favorite_many {
+                let ids: Vec<_> = indices
+                    .iter()
+                    .filter_map(|&index| self.library.track_id((list, index)))
+                    .collect();
+                for id in ids {
+                    self.toggle_favorite_id(id);
+                }
+            }
+            if let Some(indices) = remove_many {
+                self.remove_tracks(list, &indices);
+                self.clear_track_selection();
             }
             if let Some((index, change)) = edit {
                 self.edit_track((list, index), change);
+                if matches!(change, TrackEdit::Reorder(_)) {
+                    self.clear_track_selection();
+                }
             } else if let Some(index) = play
                 && let Some(id) = self.library.track_id((list, index))
             {
@@ -310,5 +404,69 @@ impl Player {
                 self.open_containing_folder(path);
             }
         });
+    }
+}
+
+/// Resolve a visible row to a playlist index. `None` means an album header or
+/// a stale row left by a cached view that no longer matches the playlist.
+fn track_row_index(
+    view: Option<&PlaylistView>,
+    filtered: Option<&Vec<PlaylistRow>>,
+    row: usize,
+    total: usize,
+) -> Option<usize> {
+    let index = if let Some(rows) = filtered {
+        match rows.get(row) {
+            Some(PlaylistRow::Track(index)) => *index,
+            Some(PlaylistRow::Album(_)) | None => return None,
+        }
+    } else if let Some(view) = view {
+        match view.rows.get(row) {
+            Some(PlaylistRow::Album(_)) => return None,
+            Some(PlaylistRow::Track(index)) => *index,
+            None => row
+                .checked_sub(view.rows.len())?
+                .checked_add(view.tracks.len())?,
+        }
+    } else {
+        row
+    };
+    (index < total).then_some(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(album: &str) -> TrackInfo {
+        TrackInfo {
+            album: album.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_view_rows_are_not_resolved_past_the_playlist() {
+        let view = PlaylistView::build(vec![info("A"), info("A")], Sort::Album, false);
+        assert_eq!(view.rows.len(), 3);
+        assert!(matches!(view.rows[0], PlaylistRow::Album(_)));
+        // Album header, then the two tracks of the cached view.
+        assert_eq!(track_row_index(Some(&view), None, 0, 2), None);
+        assert_eq!(track_row_index(Some(&view), None, 1, 2), Some(0));
+        assert_eq!(track_row_index(Some(&view), None, 2, 2), Some(1));
+        // A row for a track added after the view was built...
+        assert_eq!(track_row_index(Some(&view), None, 3, 3), Some(2));
+        // ...but not when the playlist was shortened instead.
+        assert_eq!(track_row_index(Some(&view), None, 3, 2), None);
+        assert_eq!(track_row_index(None, None, 1, 3), Some(1));
+    }
+
+    #[test]
+    fn filtered_rows_win_over_a_stale_view() {
+        let view = PlaylistView::build(vec![info("A"), info("B")], Sort::Album, false);
+        let filtered = vec![PlaylistRow::Track(1), PlaylistRow::Track(0)];
+        assert_eq!(track_row_index(Some(&view), Some(&filtered), 0, 2), Some(1));
+        assert_eq!(track_row_index(Some(&view), Some(&filtered), 1, 2), Some(0));
+        assert_eq!(track_row_index(Some(&view), Some(&filtered), 2, 2), None);
     }
 }

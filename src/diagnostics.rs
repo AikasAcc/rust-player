@@ -50,6 +50,32 @@ pub fn install() {
     }));
 }
 
+/// Persist a background failure. A GUI build has no console, so stderr would
+/// silently discard problems such as a failed cache write.
+pub fn append_error(tag: &str, message: &str) {
+    append_to(&logs(), tag, message);
+}
+
+/// Persist a failure that happens while the window is closing. There is no UI
+/// left to show a status message at that point.
+pub fn append_shutdown(message: &str) {
+    append_error("shutdown", message);
+}
+
+fn append_to(folder: &std::path::Path, tag: &str, message: &str) {
+    if fs::create_dir_all(folder).is_err() {
+        return;
+    }
+    let path = folder.join(format!("{tag}-{}.log", std::process::id()));
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = writeln!(file, "{seconds} {message}");
+    }
+}
+
 impl Player {
     pub(super) fn diagnostic_settings(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
@@ -102,5 +128,23 @@ impl Player {
                 self.status = "Diagnostics copied.".into();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_to;
+
+    #[test]
+    fn background_errors_are_appended_with_their_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        append_to(dir.path(), "metadata-cache", "first failure");
+        append_to(dir.path(), "metadata-cache", "second failure");
+        let path = dir
+            .path()
+            .join(format!("metadata-cache-{}.log", std::process::id()));
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert_eq!(contents.lines().count(), 2);
+        assert!(contents.lines().all(|line| line.ends_with(" failure")));
     }
 }

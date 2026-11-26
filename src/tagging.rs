@@ -16,13 +16,19 @@ pub struct Edit<'a> {
     pub track: &'a str,
 }
 
-/// Write tags into the original file. Empty fields remove an existing value.
-/// CUE entries are virtual tracks, so their source file must be edited instead.
+/// Write tags into the original file. Empty text fields remove an existing
+/// value; the track number must stay a positive integer. CUE entries are
+/// virtual tracks, so their source audio file must be edited instead.
 pub fn write(path: &Path, edit: Edit<'_>) -> Result<(), String> {
     if crate::cue::reference(path).is_some() {
         return Err("Edit the source audio file instead of a CUE track".into());
     }
-    if edit.track.trim().is_empty() || !edit.track.trim().parse::<u32>().is_ok() {
+    if !edit
+        .track
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|number| number > 0)
+    {
         return Err("Track must be a positive number".into());
     }
     let mut file = lofty::read_from_path(path).map_err(|error| error.to_string())?;
@@ -96,6 +102,24 @@ mod tests {
         let tag = file.primary_tag().unwrap();
         assert!(tag.title().is_none());
         assert!(tag.artist().is_none());
+    }
+
+    #[test]
+    fn refuses_zero_and_negative_track_numbers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("song.wav");
+        crate::audio::setup::tone(&path, 48_000).unwrap();
+        for invalid in ["0", "-1", "abc", ""] {
+            let error = write(
+                &path,
+                Edit {
+                    track: invalid,
+                    ..Edit::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("positive"), "accepted track {invalid:?}");
+        }
     }
 
     #[test]

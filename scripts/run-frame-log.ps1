@@ -4,11 +4,17 @@ $ErrorActionPreference = 'Stop'
 # Opt-in UI frame-time session. The logger writes one row per rendered frame and
 # adds no file I/O at all when RUST_PLAYER_FRAME_LOG is not set.
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root 'target/final-build/release/rust-player.exe'
-if (-not (Test-Path $exe)) {
-    $exe = Join-Path $root 'target/release/rust-player.exe'
-}
-if (-not (Test-Path $exe)) {
+# Prefer the most recently built executable. Old build directories are removed
+# as part of cleanup, so never depend on a single fixed path.
+$exe = @(
+    'target/ui-build/release/rust-player.exe',
+    'target/final-build/release/rust-player.exe',
+    'target/release/rust-player.exe'
+) | ForEach-Object { Join-Path $root $_ } |
+    Where-Object { Test-Path $_ } |
+    Sort-Object { (Get-Item $_).LastWriteTime } -Descending |
+    Select-Object -First 1
+if (-not $exe) {
     throw "No release executable found. Run 'cargo build --release --locked' first."
 }
 

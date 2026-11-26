@@ -162,7 +162,8 @@ impl Player {
                                 ("Rename", PlaylistAction::Rename),
                                 ("Copy", PlaylistAction::Copy),
                                 ("Delete", PlaylistAction::Delete),
-                                ("Export", PlaylistAction::Export),
+                                ("Export (absolute paths)", PlaylistAction::ExportAbsolute),
+                                ("Export (relative paths)", PlaylistAction::ExportRelative),
                             ] {
                                 if ui.button(label).clicked() {
                                     action = Some((index, item));
@@ -177,6 +178,11 @@ impl Player {
                 if selected != self.library.selected || order_changed {
                     self.library.selected = selected;
                     self.save();
+                }
+                if order_changed {
+                    // Snapshots refer to playlist positions, which just moved.
+                    self.undo.clear();
+                    self.redo.clear();
                 }
                 if let Some((index, action)) = action {
                     self.playlist_action(index, action, ctx);

@@ -3,7 +3,7 @@ use image::{AnimationDecoder, DynamicImage, ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{self, BufReader},
+    io::{self, BufReader, Cursor, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -234,6 +234,33 @@ impl Cover {
     pub fn save_png(&self, path: &Path) -> image::ImageResult<()> {
         self.pixels.save_with_format(path, ImageFormat::Png)
     }
+
+    pub fn save_sidecar(&self, source: &Path) -> Result<PathBuf, String> {
+        save_sidecar_png(&self.pixels, source)
+    }
+}
+
+/// Write `cover.png` next to a track without overwriting an existing file.
+pub fn save_sidecar_png(pixels: &image::RgbaImage, source: &Path) -> Result<PathBuf, String> {
+    let dir = source
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let path = dir.join("cover.png");
+    if path.exists() {
+        return Err(format!("{} already exists", path.display()));
+    }
+    let mut bytes = Vec::new();
+    pixels
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(|error| error.to_string())?;
+    file.write_all(&bytes)
+        .and_then(|()| file.flush())
+        .map_err(|error| error.to_string())?;
+    file.persist_noclobber(&path)
+        .map_err(|error| error.to_string())?;
+    Ok(path)
 }
 
 #[derive(Clone)]
@@ -684,6 +711,22 @@ fn downscale(image: DynamicImage, max_width: u32, max_height: u32) -> image::Rgb
 mod tests {
     use super::*;
     use image::{Delay, Frame, Rgba, RgbaImage, codecs::gif::GifEncoder};
+
+    #[test]
+    fn sidecar_cover_is_written_once_and_never_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let music = directory.path().join("music");
+        fs::create_dir(&music).unwrap();
+        let source = music.join("track.flac");
+        let pixels = RgbaImage::from_pixel(2, 2, Rgba([10, 20, 30, 255]));
+
+        let path = save_sidecar_png(&pixels, &source).unwrap();
+        assert_eq!(path, music.join("cover.png"));
+        let first = fs::read(&path).unwrap();
+        assert!(!first.is_empty());
+        assert!(save_sidecar_png(&pixels, &source).is_err());
+        assert_eq!(fs::read(&path).unwrap(), first);
+    }
 
     #[test]
     fn cover_source_tracks_artwork_identity_and_clears_without_a_cover() {

@@ -369,3 +369,50 @@ fn corrupt_playback_json_backup_preserves_bytes() -> std::io::Result<()> {
     assert_ne!(std::fs::read(&path)?, broken);
     Ok(())
 }
+
+#[test]
+fn pruning_favorites_reports_only_real_changes() {
+    let mut lib = Library::default();
+    lib.playlists[0].tracks = vec!["a.wav".into(), "b.wav".into()];
+    lib.rebuild_locations();
+    let a = lib.playlists[0].ids[0];
+    assert!(lib.toggle_favorite_id(a));
+    assert!(!lib.prune_favorites());
+
+    lib.playlists[0].tracks[0] = PathBuf::from("renamed.wav");
+    lib.rebuild_locations();
+    assert!(lib.prune_favorites());
+    assert_eq!(
+        lib.playlists[lib.favorites.unwrap()].tracks,
+        [PathBuf::from("renamed.wav")]
+    );
+    assert!(!lib.prune_favorites());
+}
+
+#[test]
+fn pruning_favorites_drops_its_cached_view_and_index_job() {
+    let mut lib = Library::default();
+    lib.playlists[0].tracks = vec!["a.wav".into(), "b.wav".into()];
+    lib.rebuild_locations();
+    let a = lib.playlists[0].ids[0];
+    assert!(lib.toggle_favorite_id(a));
+    let favorites = lib.favorites.unwrap();
+
+    let mut views = HashMap::new();
+    views.insert(
+        favorites,
+        PlaylistView::build(Vec::new(), Sort::Added, false),
+    );
+    let (sender, receiver) = mpsc::channel();
+    let mut indexing = HashMap::new();
+    indexing.insert(favorites, receiver);
+
+    lib.playlists[0].ids.remove(0);
+    lib.playlists[0].tracks.remove(0);
+    lib.rebuild_locations();
+    assert!(lib.prune_favorites());
+    invalidate_favorites_cache(lib.favorites, &mut views, &mut indexing);
+    assert!(!views.contains_key(&favorites));
+    assert!(!indexing.contains_key(&favorites));
+    drop(sender);
+}

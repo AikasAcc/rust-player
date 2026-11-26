@@ -2,8 +2,7 @@
 #[path = "../digest.rs"]
 mod digest;
 use std::{
-    env, fs,
-    io::{self, Write},
+    env, fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -32,10 +31,14 @@ fn replace() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("Install folder does not match the updater".into());
     }
-    let bytes = fs::read(&source)?;
-    digest::verify(&bytes, &expected.to_string_lossy())?;
     let mut staged = tempfile::NamedTempFile::new_in(dir)?;
-    staged.write_all(&bytes)?;
+    // Verify while copying: a wrong digest discards the staged file instead
+    // of reading the installer twice.
+    digest::copy_verified(
+        fs::File::open(&source)?,
+        &mut staged,
+        &expected.to_string_lossy(),
+    )?;
     staged.as_file().sync_all()?;
     unsafe {
         match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
@@ -84,6 +87,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn restart_failure_restores_previous_executable() -> io::Result<()> {

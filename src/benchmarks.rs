@@ -214,7 +214,7 @@ fn library_save_scale() {
             worker.enqueue(worker_path.clone(), bytes);
             record(&mut rows, "ui_path", n, start.elapsed().as_micros());
         }
-        worker.shutdown();
+        let _ = worker.finish();
     }
     run.finish(&rows);
 }

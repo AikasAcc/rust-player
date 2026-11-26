@@ -14,15 +14,36 @@ pub enum Repeat {
     All,
 }
 
+/// `Repeat::All` wraps to the first entry; the other modes stop at the end.
+fn wrap_cursor(repeat: Repeat, adjacent: Option<usize>, len: usize) -> Option<usize> {
+    match repeat {
+        Repeat::All => adjacent.or((len > 0).then_some(0)),
+        Repeat::Off | Repeat::One => adjacent,
+    }
+}
+
+/// Only forward navigation wraps. "Previous" must keep stopping at the first
+/// entry so the play queue and automatic transitions stay predictable.
+pub(super) fn step_cursor(
+    repeat: Repeat,
+    adjacent: Option<usize>,
+    len: usize,
+    offset: isize,
+) -> Option<usize> {
+    if offset > 0 {
+        wrap_cursor(repeat, adjacent, len)
+    } else {
+        adjacent
+    }
+}
+
 impl Player {
-    fn next_cursor(&self) -> Option<usize> {
-        if self.order.is_empty() {
-            return None;
-        }
-        match self.library.repeat {
-            Repeat::All => self.adjacent_cursor(1).or(Some(0)),
-            Repeat::Off | Repeat::One => self.adjacent_cursor(1),
-        }
+    pub(super) fn next_cursor(&self) -> Option<usize> {
+        wrap_cursor(
+            self.library.repeat,
+            self.adjacent_cursor(1),
+            self.order.len(),
+        )
     }
 
     pub(super) fn refresh_gapless(&self) {
@@ -80,6 +101,7 @@ impl Player {
             }
             .resolve(library)
         };
+        let consumed_queue = matches!(&event.next.target, NextTarget::Queue(..));
         let id = match event.next.target {
             NextTarget::Playlist(planned) => self.order_list.and_then(|list| {
                 let tracks = &self.library.playlists[list].tracks;
@@ -107,6 +129,9 @@ impl Player {
             }
             NextTarget::Repeat(track) => resolve(&self.library, track),
         };
+        if consumed_queue {
+            self.save_queue();
+        }
         let Some(id) = id else {
             self.advance_automatic(ctx);
             return;
@@ -187,5 +212,32 @@ impl Player {
                 ui.selectable_value(&mut self.library.repeat, Repeat::All, "Playlist");
             });
         changed || old_repeat != self.library.repeat
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_step_wraps_only_for_repeat_all() {
+        assert_eq!(step_cursor(Repeat::All, None, 3, 1), Some(0));
+        // The adjacent entry always wins; wrapping is the fallback at the end.
+        assert_eq!(step_cursor(Repeat::All, Some(2), 3, 1), Some(2));
+        assert_eq!(step_cursor(Repeat::Off, None, 3, 1), None);
+        assert_eq!(step_cursor(Repeat::One, None, 3, 1), None);
+    }
+
+    #[test]
+    fn backward_step_never_wraps() {
+        for repeat in [Repeat::Off, Repeat::One, Repeat::All] {
+            assert_eq!(step_cursor(repeat, None, 3, -1), None);
+        }
+        assert_eq!(step_cursor(Repeat::All, Some(0), 3, -1), Some(0));
+    }
+
+    #[test]
+    fn an_empty_order_has_no_wrap_target() {
+        assert_eq!(step_cursor(Repeat::All, None, 0, 1), None);
     }
 }

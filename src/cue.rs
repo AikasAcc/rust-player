@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Track {
     pub number: u32,
     pub title: String,
@@ -54,6 +54,21 @@ pub fn entries(sheet: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
+/// Entries of a file that may be either a CUE sheet or an audio file with an
+/// embedded sheet. Parses the embedded block once, unlike `has_embedded` +
+/// `entries`. `None` means the audio file carries no usable sheet.
+pub(crate) fn entries_from_source(source: &Path) -> Result<Option<Vec<PathBuf>>, String> {
+    if is_sheet(source) {
+        return entries(source).map(Some);
+    }
+    Ok(embedded(source).map(|tracks| {
+        tracks
+            .into_iter()
+            .map(|track| source.join(track.number.to_string()))
+            .collect()
+    }))
+}
+
 fn tracks(source: &Path) -> Result<Vec<Track>, String> {
     if is_sheet(source) {
         read(source)
@@ -67,7 +82,17 @@ fn tracks(source: &Path) -> Result<Vec<Track>, String> {
 /// lofty maps unknown Vorbis keys into a format-specific companion tag that is
 /// not exposed through the generic `Tag`, so the block is parsed directly.
 fn embedded(audio: &Path) -> Option<Vec<Track>> {
-    let text = flac_comments(audio)
+    let comments = match flac_comments(audio) {
+        Ok(Some(comments)) => comments,
+        Ok(None) => return None,
+        Err(error) => {
+            // A malformed Vorbis block is not the same as "no CUE sheet".
+            // A GUI build has no console, so keep the reason in the log.
+            crate::diagnostics::append_error("cue", &format!("{}: {error}", audio.display()));
+            return None;
+        }
+    };
+    let text = comments
         .into_iter()
         .filter(|(key, _)| {
             key.eq_ignore_ascii_case("CUESHEET") || key.eq_ignore_ascii_case("CUESHEET_TEXT")
@@ -78,13 +103,16 @@ fn embedded(audio: &Path) -> Option<Vec<Track>> {
     parse_inner(audio, Some(audio), &text).ok()
 }
 
-fn flac_comments(path: &Path) -> Vec<(String, String)> {
+/// `Ok(None)` means "no Vorbis comment block" (a normal FLAC without an
+/// embedded sheet). `Err` means the block exists but is malformed, so callers
+/// can report it instead of silently treating it as an absent CUE.
+fn flac_comments(path: &Path) -> Result<Option<Vec<(String, String)>>, String> {
     let Ok(mut file) = File::open(path) else {
-        return Vec::new();
+        return Ok(None);
     };
     let mut magic = [0u8; 4];
     if file.read_exact(&mut magic).is_err() || &magic != b"fLaC" {
-        return Vec::new();
+        return Ok(None);
     }
     loop {
         let mut header = [0u8; 4];
@@ -95,42 +123,54 @@ fn flac_comments(path: &Path) -> Vec<(String, String)> {
         let kind = header[0] & 0x7f;
         let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
         if length > 16 * 1024 * 1024 {
-            break;
+            return Err(format!(
+                "FLAC metadata block of {length} bytes is too large"
+            ));
         }
         if kind == 4 {
             let mut block = vec![0u8; length];
-            if file.read_exact(&mut block).is_err() {
-                break;
-            }
-            return parse_vorbis_block(&block).unwrap_or_default();
+            file.read_exact(&mut block)
+                .map_err(|error| format!("truncated FLAC Vorbis comment block: {error}"))?;
+            return parse_vorbis_block(&block)
+                .map(Some)
+                .map_err(|error| format!("invalid FLAC Vorbis comment block: {error}"));
         }
-        if file.seek(SeekFrom::Current(length as i64)).is_err() {
-            break;
-        }
+        file.seek(SeekFrom::Current(length as i64))
+            .map_err(|error| format!("could not skip FLAC metadata block: {error}"))?;
         if last {
             break;
         }
     }
-    Vec::new()
+    Ok(None)
 }
 
-fn parse_vorbis_block(block: &[u8]) -> Option<Vec<(String, String)>> {
-    fn field<'a>(bytes: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
-        let length = u32::from_le_bytes(bytes.get(*offset..*offset + 4)?.try_into().ok()?);
-        *offset = offset.checked_add(4)?;
+fn parse_vorbis_block(block: &[u8]) -> Result<Vec<(String, String)>, String> {
+    fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+        let raw: [u8; 4] = bytes
+            .get(*offset..)
+            .and_then(|rest| rest.get(..4))
+            .ok_or("truncated comment header")?
+            .try_into()
+            .map_err(|_| "invalid comment header".to_owned())?;
+        *offset = offset.checked_add(4).ok_or("comment offset overflow")?;
+        Ok(u32::from_le_bytes(raw))
+    }
+    fn field<'a>(bytes: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
+        let length = read_u32(bytes, offset)?;
         let start = *offset;
-        *offset = offset.checked_add(length as usize)?;
-        bytes.get(start..*offset)
+        *offset = offset
+            .checked_add(length as usize)
+            .ok_or("comment length overflow")?;
+        bytes
+            .get(start..*offset)
+            .ok_or_else(|| "truncated comment field".into())
     }
     let mut offset = 0;
-    field(block, &mut offset)?;
-    let count = u32::from_le_bytes(block.get(offset..offset + 4)?.try_into().ok()?);
-    offset += 4;
+    field(block, &mut offset)?; // vendor string
+    let count = read_u32(block, &mut offset)?;
     let mut pairs = Vec::new();
     for _ in 0..count.min(4096) {
-        let Some(item) = field(block, &mut offset) else {
-            break;
-        };
+        let item = field(block, &mut offset)?;
         let Some(separator) = item.iter().position(|&byte| byte == b'=') else {
             continue;
         };
@@ -139,7 +179,7 @@ fn parse_vorbis_block(block: &[u8]) -> Option<Vec<(String, String)>> {
             String::from_utf8_lossy(&item[separator + 1..]).into_owned(),
         ));
     }
-    Some(pairs)
+    Ok(pairs)
 }
 
 pub fn duration(frames: u64) -> Duration {
@@ -333,6 +373,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn rejects_malformed_tracks_and_indexes() {
+        let cases = [
+            (
+                "FILE \"a.wav\" WAVE\nTRACK 00 AUDIO\nINDEX 01 00:00:00",
+                "Invalid CUE track number",
+            ),
+            (
+                "FILE \"a.wav\" WAVE\nTRACK 01 CDG\nINDEX 01 00:00:00",
+                "No indexed audio tracks",
+            ),
+            (
+                "TRACK 01 AUDIO\nINDEX 01 00:00:00",
+                "CUE INDEX precedes FILE",
+            ),
+            (
+                "FILE \"a.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:99:00",
+                "Invalid CUE INDEX 01",
+            ),
+            (
+                "FILE \"a.wav\" WAVE\nTRACK 02 AUDIO\nINDEX 01 00:00:00\nFILE \"b.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00",
+                "CUE tracks are out of order",
+            ),
+        ];
+        for (text, expected) in cases {
+            let error = parse(Path::new("disc.cue"), text).unwrap_err();
+            assert!(error.contains(expected), "expected {expected}, got {error}");
+        }
+    }
+
+    #[test]
+    fn reads_bom_and_cp1252_sheets_and_rejects_huge_files() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let path = dir.path().join("sheet.cue");
+        let bom = "\u{FEFF}FILE \"a.wav\" WAVE\nTRACK 01 AUDIO\nTITLE \"Song\"\nINDEX 01 00:00:00";
+        std::fs::write(&path, bom).map_err(|error| error.to_string())?;
+        assert_eq!(read(&path)?[0].title, "Song");
+
+        let mut cp1252 = b"FILE \"a.wav\" WAVE\nTRACK 01 AUDIO\nTITLE \"Caf".to_vec();
+        cp1252.push(0xE9);
+        cp1252.extend_from_slice(b"\"\nINDEX 01 00:00:00");
+        std::fs::write(&path, cp1252).map_err(|error| error.to_string())?;
+        assert_eq!(read(&path)?[0].title, "Café");
+
+        std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).map_err(|error| error.to_string())?;
+        assert!(read(&path).unwrap_err().contains("1 MiB"));
+        Ok(())
+    }
+
     fn flac_with_cuesheet(text: &str) -> Vec<u8> {
         let mut entry = b"CUESHEET=".to_vec();
         entry.extend_from_slice(text.as_bytes());
@@ -380,7 +469,7 @@ mod tests {
             bytes.len() - 8
         );
         std::fs::write(&audio, bytes)?;
-        let comments = flac_comments(&audio);
+        let comments = flac_comments(&audio)?.expect("Vorbis comment block");
         assert_eq!(comments.len(), 1, "comments: {comments:?}");
         assert!(embedded(&audio).is_some(), "embedded CUE missing");
         let virtual_track = audio.join("2");
@@ -391,6 +480,20 @@ mod tests {
         assert_eq!(track.title, "Second");
         assert_eq!(track.audio, audio);
         assert_eq!(entries(&audio)?, vec![audio.join("1"), audio.join("2")]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_truncated_vorbis_block_is_reported_instead_of_looking_like_no_cue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let audio = directory.path().join("broken.flac");
+        let mut bytes = flac_with_cuesheet("TRACK 01 AUDIO\nINDEX 01 00:00:00");
+        bytes.truncate(bytes.len() - 3);
+        std::fs::write(&audio, bytes)?;
+        let error = flac_comments(&audio).unwrap_err();
+        assert!(error.contains("truncated"), "{error}");
+        assert!(embedded(&audio).is_none());
         Ok(())
     }
 }

@@ -44,10 +44,11 @@ impl Player {
                                         egui::TextEdit::singleline(&mut self.track_search)
                                             .frame(false)
                                             .desired_width(142.0)
-                                            .hint_text("Search playlist"),
+                                            .hint_text("Search tracks"),
                                     )
                                     .on_hover_text(
-                                        "Search titles, artists, albums and file names (Ctrl+K)",
+                                        "Search fields: artist:beatles album:\"help!\" \
+                                         -album:live OR file:flac. Ctrl+K to focus.",
                                     );
                                 if search.changed() {
                                     let wait = Duration::from_millis(80);
@@ -135,7 +136,7 @@ impl Player {
                     })
                     .frame(false),
                 )
-                .on_hover_text("Toggle favorite")
+                .on_hover_text("Toggle favorite (F)")
                 .clicked()
             {
                 self.toggle_favorite();
@@ -146,13 +147,13 @@ impl Player {
                 // Equal gutters keep the central play/pause control above the timeline.
                 ui.add_space((ui.available_width() - 158.0).max(0.0) * 0.5);
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if icon(ui, Icon::Stop, "Stop", active, false) {
+                if icon(ui, Icon::Stop, "Stop (S)", active, false) {
                     self.stop();
                 }
                 if icon(
                     ui,
                     Icon::Previous,
-                    "Previous track",
+                    "Previous track (P)",
                     buttons.previous,
                     false,
                 ) {
@@ -162,7 +163,11 @@ impl Player {
                 if icon(
                     ui,
                     if show_pause { Icon::Pause } else { Icon::Play },
-                    if show_pause { "Pause" } else { "Play" },
+                    if show_pause {
+                        "Pause (Space)"
+                    } else {
+                        "Play (Space)"
+                    },
                     buttons.can_play,
                     false,
                 ) {
@@ -172,10 +177,16 @@ impl Player {
                         self.resume(ctx);
                     }
                 }
-                if icon(ui, Icon::Next, "Next track", buttons.next, false) {
+                if icon(ui, Icon::Next, "Next track (N)", buttons.next, false) {
                     self.step(1, ctx);
                 }
-                if icon(ui, Icon::Shuffle, "Shuffle", true, self.library.shuffle) {
+                if icon(
+                    ui,
+                    Icon::Shuffle,
+                    "Shuffle (Ctrl+S)",
+                    true,
+                    self.library.shuffle,
+                ) {
                     self.toggle_shuffle();
                 }
             });
@@ -226,6 +237,8 @@ impl Player {
         use HeaderAction::*;
         const ADD: &[(&str, HeaderAction)] = &[("Audio files", Files), ("Folder", Folder)];
         const TOOLS: &[(&str, HeaderAction)] = &[
+            ("Undo playlist edit", Undo),
+            ("Redo playlist edit", Redo),
             ("Theme editor", Theme),
             ("Plugins", Plugins),
             ("Discord", Discord),
@@ -281,6 +294,8 @@ impl Player {
             Some(GitHub) => ui
                 .ctx()
                 .open_url(egui::OpenUrl::new_tab(crate::PROJECT_URL)),
+            Some(Undo) => self.undo_edit(),
+            Some(Redo) => self.redo_edit(),
             None => {}
         }
     }

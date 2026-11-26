@@ -8,20 +8,23 @@ use std::{
     time::Duration,
 };
 
+/// Normalized key used by every path lookup. Components remove separator
+/// differences; Windows additionally ignores letter case.
+fn path_key(path: &Path) -> String {
+    let mut value = String::new();
+    for component in path.components() {
+        value.push_str(&component.as_os_str().to_string_lossy());
+        value.push('|');
+    }
+    #[cfg(windows)]
+    let value = value.to_lowercase();
+    value
+}
+
 /// Compare paths the way the target filesystem does. On Windows, letter case
 /// and separator style do not distinguish a path; on other platforms they do.
 pub fn same_path(a: &Path, b: &Path) -> bool {
-    let key = |path: &Path| {
-        let mut value = String::new();
-        for component in path.components() {
-            value.push_str(&component.as_os_str().to_string_lossy());
-            value.push('|');
-        }
-        #[cfg(windows)]
-        let value = value.to_lowercase();
-        value
-    };
-    key(a) == key(b)
+    path_key(a) == path_key(b)
 }
 
 pub fn timed_lyrics(text: &str) -> Vec<(Duration, String)> {
@@ -290,6 +293,13 @@ impl PlaylistView {
 pub struct Library {
     #[serde(skip)]
     pub locations: HashMap<TrackId, crate::Track>,
+    /// First source entry per normalized path, excluding Favorites. Derived
+    /// from `playlists` by `rebuild_locations()`, never serialized.
+    #[serde(skip)]
+    path_sources: HashMap<String, TrackId>,
+    /// Favorites rows per normalized path. Derived the same way.
+    #[serde(skip)]
+    favorite_paths: HashMap<String, Vec<usize>>,
     pub media_keys: bool,
     pub audio_setup_done: bool,
     pub restore_last_track: bool,
@@ -333,6 +343,8 @@ impl Default for Library {
     fn default() -> Self {
         Self {
             locations: Default::default(),
+            path_sources: HashMap::new(),
+            favorite_paths: HashMap::new(),
             media_keys: true,
             audio_setup_done: false,
             restore_last_track: true,
@@ -381,6 +393,8 @@ impl Default for Library {
 impl Library {
     pub fn rebuild_locations(&mut self) {
         let mut locations = HashMap::new();
+        let mut path_sources = HashMap::new();
+        let mut favorite_paths = HashMap::new();
         let mut all_ids: Vec<Vec<TrackId>> = Vec::with_capacity(self.playlists.len());
         for (list, playlist) in self.playlists.iter().enumerate() {
             let mut ids = Vec::with_capacity(playlist.tracks.len());
@@ -404,12 +418,29 @@ impl Library {
                 locations.insert(id, (list, index));
                 ids.push(id);
             }
+            if Some(list) == self.favorites {
+                for (index, path) in playlist.tracks.iter().enumerate() {
+                    favorite_paths
+                        .entry(path_key(path))
+                        .or_insert_with(Vec::new)
+                        .push(index);
+                }
+            } else {
+                for (index, path) in playlist.tracks.iter().enumerate() {
+                    if let Some(&id) = ids.get(index) {
+                        // source_id() historically returns the first match.
+                        path_sources.entry(path_key(path)).or_insert(id);
+                    }
+                }
+            }
             all_ids.push(ids);
         }
         for (playlist, ids) in self.playlists.iter_mut().zip(all_ids) {
             playlist.ids = ids;
         }
         self.locations = locations;
+        self.path_sources = path_sources;
+        self.favorite_paths = favorite_paths;
     }
 
     /// Stable identity of a playlist entry. Never derived from the path.
@@ -563,17 +594,7 @@ impl Library {
     }
 
     fn source_id(&self, path: &Path) -> Option<TrackId> {
-        self.playlists
-            .iter()
-            .enumerate()
-            .filter(|(list, _)| Some(*list) != self.favorites)
-            .find_map(|(_, playlist)| {
-                playlist
-                    .tracks
-                    .iter()
-                    .position(|track| same_path(track, path))
-                    .and_then(|index| playlist.ids.get(index).copied())
-            })
+        self.path_sources.get(&path_key(path)).copied()
     }
 
     pub fn migrate_favorite_ids(&mut self) {
@@ -599,7 +620,7 @@ impl Library {
     }
 
     pub fn is_favorite_id(&self, id: TrackId) -> bool {
-        !self.favorite_id_entries(id).is_empty()
+        self.favorite_ids.contains(&Some(id))
             || self
                 .favorites
                 .and_then(|index| self.playlists.get(index))
@@ -624,11 +645,9 @@ impl Library {
             .source_id(path)
             .map(|id| self.favorite_id_entries(id))
             .unwrap_or_default();
-        if let Some(index) = self.favorites
-            && let Some(playlist) = self.playlists.get(index)
-        {
-            for (entry, track) in playlist.tracks.iter().enumerate() {
-                if same_path(track, path) && !entries.contains(&entry) {
+        if let Some(indexed) = self.favorite_paths.get(&path_key(path)) {
+            for &entry in indexed {
+                if !entries.contains(&entry) {
                     entries.push(entry);
                 }
             }
@@ -706,9 +725,11 @@ impl Library {
     }
 
     /// Drop favorites whose source no longer exists and refresh changed paths.
-    pub fn prune_favorites(&mut self) {
+    /// Returns whether the Favorites playlist was actually rewritten, so the
+    /// caller can invalidate cached rows and index jobs for that view.
+    pub fn prune_favorites(&mut self) -> bool {
         let Some(index) = self.favorites else {
-            return;
+            return false;
         };
         let mut kept = Vec::new();
         for (entry, favorite) in self.favorite_ids.iter().enumerate() {
@@ -728,12 +749,13 @@ impl Library {
                 .zip(&self.playlists[index].tracks)
                 .all(|((path, _), old)| same_path(path, old));
         if unchanged {
-            return;
+            return false;
         }
         self.playlists[index].tracks = kept.iter().map(|(path, _)| path.clone()).collect();
         self.playlists[index].ids.clear();
         self.favorite_ids = kept.into_iter().map(|(_, id)| id).collect();
         self.rebuild_locations();
+        true
     }
 
     pub fn back_up_invalid_json(path: &Path, prefix: &str) -> std::io::Result<PathBuf> {
@@ -839,13 +861,10 @@ pub fn collect(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
 }
 
 fn add_path(path: PathBuf, tracks: &mut Vec<PathBuf>, skipped: &mut usize) {
-    if crate::cue::is_sheet(&path) || crate::cue::has_embedded(&path) {
-        match crate::cue::entries(&path) {
-            Ok(entries) => tracks.extend(entries),
-            Err(_) => *skipped += 1,
-        }
-    } else {
-        tracks.push(path);
+    match crate::cue::entries_from_source(&path) {
+        Ok(Some(entries)) => tracks.extend(entries),
+        Ok(None) => tracks.push(path),
+        Err(_) => *skipped += 1,
     }
 }
 
@@ -1232,6 +1251,24 @@ mod tests {
         assert_eq!(library.playlists[0].tracks.len(), 2);
         assert_eq!(library.playlists[0].ids.len(), 2);
         assert!(!library.locations.contains_key(&favorite_id));
+    }
+
+    #[test]
+    fn favorite_path_lookup_follows_reordered_sources() {
+        let mut library = Library::default();
+        library.playlists[0].tracks = vec![PathBuf::from("a.flac"), PathBuf::from("song.flac")];
+        library.rebuild_locations();
+        library.toggle_favorite_path(Path::new("song.flac"));
+        assert_eq!(library.favorite_entries(Path::new("song.flac")), [0]);
+        #[cfg(windows)]
+        assert_eq!(library.favorite_entries(Path::new("SONG.FLAC")), [0]);
+
+        library.playlists[0].tracks.swap(0, 1);
+        library.playlists[0].ids.swap(0, 1);
+        library.rebuild_locations();
+        assert_eq!(library.favorite_entries(Path::new("song.flac")), [0]);
+        assert_eq!(library.path_sources.len(), 2);
+        assert_eq!(library.favorite_paths.len(), 1);
     }
 
     #[test]

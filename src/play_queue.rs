@@ -1,20 +1,49 @@
 use crate::{Player, Track, TrackId};
 use eframe::egui;
-use std::{collections::VecDeque, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{collections::VecDeque, io::ErrorKind, path::Path, time::Duration};
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Entry {
     id: u64,
     track: TrackId,
     title: String,
 }
 
-#[derive(Default)]
+#[derive(Debug)]
+pub(super) enum LoadError {
+    /// No queue has been saved yet. This is a normal first start, not a
+    /// corrupt file, so it must not trigger the backup path.
+    Missing,
+    Invalid(String),
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 pub(super) struct PlayQueue {
     entries: VecDeque<Entry>,
     next_id: u64,
 }
 
 impl PlayQueue {
+    pub fn load(path: &Path) -> Result<Self, LoadError> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Err(LoadError::Missing),
+            Err(error) => return Err(LoadError::Invalid(error.to_string())),
+        };
+        let mut queue: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| LoadError::Invalid(error.to_string()))?;
+        queue.next_id = queue
+            .entries
+            .iter()
+            .map(|entry| entry.id.saturating_add(1))
+            .max()
+            .unwrap_or_default()
+            .max(queue.next_id);
+        Ok(queue)
+    }
+
     pub fn push(&mut self, track: TrackId, title: String) {
         self.entries.push_back(Entry {
             id: self.next_id,
@@ -37,12 +66,16 @@ impl PlayQueue {
         self.entries.remove(index).map(|entry| entry.track)
     }
 
+    fn position(&self, id: u64) -> Option<usize> {
+        self.entries.iter().position(|entry| entry.id == id)
+    }
+
     fn move_to(&mut self, id: u64, position: usize) {
-        if position < self.entries.len()
-            && let Some(from) = self.entries.iter().position(|entry| entry.id == id)
+        if position <= self.entries.len()
+            && let Some(from) = self.position(id)
             && let Some(entry) = self.entries.remove(from)
         {
-            self.entries.insert(position, entry);
+            self.entries.insert(position.min(self.entries.len()), entry);
         }
     }
 
@@ -66,6 +99,17 @@ impl QueueRow {
 enum QueueEdit {
     Remove(QueueRow),
     Move(QueueRow, usize),
+}
+
+/// Drag targets are row indices captured before the dragged row is removed.
+/// Removing an earlier row shifts the target one to the left, so compensate to
+/// keep dropping consistently *before* the target row. The context menu passes
+/// post-removal indices already and therefore uses `Move` unchanged.
+fn drop_target(from: Option<usize>, target: usize) -> usize {
+    match from {
+        Some(from) if from < target => target - 1,
+        _ => target,
+    }
 }
 
 impl Player {
@@ -94,7 +138,9 @@ impl Player {
 
     pub(super) fn play_next_queued(&mut self, ctx: &egui::Context) -> Result<(), Option<String>> {
         let mut warning = None;
+        let mut changed = false;
         while let Some(entry) = self.play_queue.entries.pop_front() {
+            changed = true;
             if self.library.locate(entry.track).is_none() {
                 continue;
             }
@@ -102,12 +148,16 @@ impl Player {
                 Ok(()) => {
                     self.status = warning.unwrap_or_default();
                     self.save_playback(Duration::ZERO);
+                    self.save_queue();
                     self.sync_presence();
                     self.refresh_gapless();
                     return Ok(());
                 }
                 Err(error) => warning = Some(format!("Skipped queued track: {error}")),
             }
+        }
+        if changed {
+            self.save_queue();
         }
         Err(warning)
     }
@@ -121,6 +171,18 @@ impl Player {
             .checked_add(1)
             .unwrap_or_default()
             .min(self.order.len())
+    }
+
+    /// Current position of a dragged row, before any removal happens.
+    fn row_position(&self, row: QueueRow) -> Option<usize> {
+        match row {
+            QueueRow::Added(id) => self.play_queue.position(id),
+            QueueRow::Playlist(entry) if self.order_list == Some(entry.0) => self
+                .order
+                .iter()
+                .position(|&id| self.library.track_id(entry) == Some(id)),
+            QueueRow::Playlist(_) => None,
+        }
     }
 
     pub(super) fn queue_panel(&mut self, ui: &mut egui::Ui) {
@@ -311,7 +373,8 @@ impl Player {
                                     egui::StrokeKind::Inside,
                                 );
                                 if response.dnd_release_payload::<QueueRow>().is_some() {
-                                    edit = Some(QueueEdit::Move(*source, position));
+                                    let target = drop_target(self.row_position(*source), position);
+                                    edit = Some(QueueEdit::Move(*source, target));
                                 }
                             }
                             response.context_menu(|ui| {
@@ -350,6 +413,7 @@ impl Player {
             QueueEdit::Remove(row) => (row, None),
             QueueEdit::Move(row, position) => (row, Some(position)),
         };
+        let added_row = matches!(row, QueueRow::Added(_));
         match row {
             QueueRow::Added(id) => {
                 if let Some(position) = destination {
@@ -372,13 +436,87 @@ impl Player {
             }
             _ => {}
         }
+        if added_row {
+            self.save_queue();
+        }
         self.refresh_gapless();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PlayQueue, TrackId};
+    use super::{LoadError, PlayQueue, TrackId, drop_target};
+
+    #[test]
+    fn a_missing_queue_file_is_not_reported_as_corrupt() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            PlayQueue::load(&directory.path().join("queue.json")),
+            Err(LoadError::Missing)
+        ));
+    }
+
+    #[test]
+    fn a_drop_before_the_source_keeps_its_target_index() {
+        assert_eq!(drop_target(Some(3), 1), 1);
+        assert_eq!(drop_target(Some(1), 1), 1);
+        assert_eq!(drop_target(None, 2), 2);
+    }
+
+    #[test]
+    fn a_drop_after_the_source_shifts_the_target_left() {
+        assert_eq!(drop_target(Some(0), 2), 1);
+        assert_eq!(drop_target(Some(1), 3), 2);
+    }
+
+    #[test]
+    fn a_dropped_row_lands_before_the_target() {
+        let mut queue = PlayQueue::default();
+        queue.push(TrackId(1), "A".into());
+        queue.push(TrackId(2), "B".into());
+        queue.push(TrackId(3), "C".into());
+        let a = queue.next().unwrap().0;
+        let c = queue.entries[2].id;
+        // Drag A onto C: from 0, target 2 becomes insert index 1.
+        queue.move_to(a, drop_target(Some(0), 2));
+        let titles: Vec<_> = queue.entries.iter().map(|entry| entry.track.0).collect();
+        assert_eq!(titles, vec![2, 1, 3]);
+        assert_eq!(c, queue.entries[2].id);
+    }
+
+    #[test]
+    fn queue_round_trips_and_prunes_stale_tracks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.json");
+        let mut queue = PlayQueue::default();
+        queue.push(TrackId(1), "A".into());
+        queue.push(TrackId(2), "B".into());
+        std::fs::write(&path, serde_json::to_vec(&queue).unwrap()).unwrap();
+
+        let mut loaded = PlayQueue::load(&path).unwrap();
+        assert_eq!(loaded.next(), queue.next());
+        loaded.retain(|id| id != TrackId(1));
+        assert_eq!(loaded.next().unwrap().1, TrackId(2));
+        queue.push(TrackId(3), "C".into());
+        assert_ne!(queue.next().unwrap().0, loaded.next().unwrap().0);
+    }
+
+    #[test]
+    fn load_repairs_a_stale_next_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.json");
+        let mut queue = PlayQueue::default();
+        queue.push(TrackId(7), "A".into());
+        let bytes = serde_json::to_vec(&queue).unwrap().to_vec();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["next_id"] = serde_json::json!(0);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let mut loaded = PlayQueue::load(&path).unwrap();
+        let existing = loaded.next().unwrap().0;
+        loaded.push(TrackId(8), "B".into());
+        assert_ne!(loaded.entries[1].id, existing);
+    }
 
     #[test]
     fn reorder_and_remap_keep_duplicate_entries_independent() {

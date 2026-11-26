@@ -7,7 +7,7 @@
 
 use crate::library::save_bytes;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender},
     thread::JoinHandle,
@@ -94,13 +94,15 @@ impl SaveWorker {
                     // snapshot per path. Old snapshots can never be newer
                     // than the state the UI thread holds now.
                     let mut pending: Vec<Snapshot> = vec![first];
+                    // The map points into `pending`, so ordering is unchanged
+                    // while duplicate lookups become O(1).
+                    let mut index = HashMap::new();
+                    index.insert(pending[0].path.clone(), 0usize);
                     while let Ok(next) = incoming.try_recv() {
-                        if let Some(queued) = pending
-                            .iter_mut()
-                            .find(|snapshot| snapshot.path == next.path)
-                        {
-                            queued.bytes = next.bytes;
+                        if let Some(&position) = index.get(&next.path) {
+                            pending[position].bytes = next.bytes;
                         } else {
+                            index.insert(next.path.clone(), pending.len());
                             pending.push(next);
                         }
                     }
@@ -139,13 +141,16 @@ impl SaveWorker {
         self.reports.try_iter().collect()
     }
 
-    /// Finish everything still queued, then stop the thread. Called on exit
-    /// so graceful shutdown never drops a pending write.
-    pub fn shutdown(&mut self) {
+    /// Finish everything still queued, then stop the thread. Returns the write
+    /// reports and whether the worker panicked; callers that exit must persist
+    /// both instead of dropping them with the window.
+    pub fn finish(&mut self) -> (Vec<SaveReport>, bool) {
         self.sender = None;
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        let panicked = self
+            .handle
+            .take()
+            .is_some_and(|handle| handle.join().is_err());
+        (self.take_reports(), panicked)
     }
 }
 
@@ -158,13 +163,27 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_writes_a_pending_snapshot() {
+    fn finish_writes_a_pending_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         let mut worker = SaveWorker::new();
         worker.enqueue(path.clone(), b"first".to_vec());
-        worker.shutdown();
+        let _ = worker.finish();
         assert_eq!(contents(&path), "first");
+    }
+
+    #[test]
+    fn finish_returns_the_final_write_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut worker = SaveWorker::new();
+        worker.enqueue(path.clone(), b"final".to_vec());
+        let (reports, panicked) = worker.finish();
+        assert!(!panicked);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].path, path);
+        assert!(reports[0].error.is_none());
+        assert_eq!(contents(&path), "final");
     }
 
     #[test]
@@ -175,7 +194,7 @@ mod tests {
         worker.enqueue(path.clone(), b"old".to_vec());
         worker.enqueue(path.clone(), b"new".to_vec());
         worker.enqueue(path.clone(), b"final".to_vec());
-        worker.shutdown();
+        let _ = worker.finish();
         assert_eq!(contents(&path), "final");
     }
 
@@ -187,7 +206,7 @@ mod tests {
         let mut worker = SaveWorker::new();
         worker.enqueue(library.clone(), b"library".to_vec());
         worker.enqueue(playback.clone(), b"playback".to_vec());
-        worker.shutdown();
+        let _ = worker.finish();
         assert_eq!(contents(&library), "library");
         assert_eq!(contents(&playback), "playback");
     }
@@ -200,8 +219,8 @@ mod tests {
         std::fs::write(dir.path().join("missing-parent"), b"block").unwrap();
         let mut worker = SaveWorker::new();
         worker.enqueue(path, b"value".to_vec());
-        worker.shutdown();
-        assert!(worker.take_reports().iter().any(|report| {
+        let (reports, _) = worker.finish();
+        assert!(reports.iter().any(|report| {
             report
                 .error
                 .as_deref()
@@ -215,8 +234,7 @@ mod tests {
         let path = dir.path().join("state.json");
         let mut worker = SaveWorker::new();
         worker.enqueue(path.clone(), b"value".to_vec());
-        worker.shutdown();
-        let reports = worker.take_reports();
+        let (reports, _) = worker.finish();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].path, path);
         assert!(reports[0].error.is_none());
@@ -253,5 +271,45 @@ mod tests {
         let mut tracker = BackupTracker::default();
         tracker.failed(path.clone());
         assert!(!tracker.should_back_up(&path));
+    }
+
+    /// End-to-end: a corrupt file is backed up, the replacement is written by
+    /// the worker, and only the confirmed write retires the pending backup.
+    #[test]
+    fn a_corrupt_state_file_is_backed_up_then_replaced_atomically() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("library.json");
+        let broken = b"{not json";
+        std::fs::write(&path, broken)?;
+
+        let mut tracker = BackupTracker::default();
+        tracker.need(path.clone());
+        assert!(tracker.should_back_up(&path));
+        let backup = crate::library::Library::back_up_invalid_json(&path, "library.invalid-")?;
+        tracker.mark_backed_up(path.clone());
+        assert!(!tracker.should_back_up(&path));
+        assert_eq!(std::fs::read(&backup)?, broken);
+
+        let replacement = br#"{"ok":true}"#;
+        let mut worker = SaveWorker::new();
+        worker.enqueue(path.clone(), replacement.to_vec());
+        let (reports, panicked) = worker.finish();
+        assert!(!panicked);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
+        tracker.written(&path);
+        assert!(!tracker.should_back_up(&path));
+        assert_eq!(std::fs::read(&path)?, replacement);
+
+        // The atomic write must not leave its temporary file behind, and the
+        // backup of the corrupt original must remain untouched.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+        assert_eq!(std::fs::read(&backup)?, broken);
+        Ok(())
     }
 }

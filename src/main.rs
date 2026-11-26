@@ -25,6 +25,7 @@ mod plugins;
 mod presence;
 mod relink;
 mod save_worker;
+mod search;
 mod settings;
 mod tagging;
 mod taskbar;
@@ -42,7 +43,7 @@ use library::{
 };
 use rand::seq::SliceRandom;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Write,
     path::PathBuf,
     sync::mpsc,
@@ -94,9 +95,37 @@ enum PlaylistDialog {
     Delete(usize),
 }
 
+#[derive(Clone, Copy)]
 enum TrackEdit {
-    Remove,
+    /// Swap adjacent rows (context menu).
     Move(usize),
+    /// Remove a row and insert it before the target (drag and drop).
+    Reorder(usize),
+}
+
+fn apply_track_edit<T>(items: &mut Vec<T>, index: usize, edit: TrackEdit) {
+    match edit {
+        TrackEdit::Move(other) if index.max(other) < items.len() => items.swap(index, other),
+        TrackEdit::Reorder(target) if index < items.len() => {
+            let item = items.remove(index);
+            items.insert(target.min(items.len()), item);
+        }
+        _ => {}
+    }
+}
+
+/// Enough state to restore one playlist after a track-level edit. The metadata
+/// copy is in-memory only; it is rebuilt from the cache when absent.
+#[derive(Clone)]
+struct PlaylistSnapshot {
+    list: usize,
+    tracks: Vec<PathBuf>,
+    ids: Vec<TrackId>,
+    metadata: Vec<TrackInfo>,
+    has_view: bool,
+    sort: Sort,
+    descending: bool,
+    favorites: Option<Vec<Option<TrackId>>>,
 }
 
 enum PlaylistAction {
@@ -104,7 +133,8 @@ enum PlaylistAction {
     Rename,
     Copy,
     Delete,
-    Export,
+    ExportAbsolute,
+    ExportRelative,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -130,6 +160,98 @@ enum HeaderAction {
     Plugins,
     Discord,
     GitHub,
+    Undo,
+    Redo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shortcut {
+    PlayPause,
+    Next,
+    Previous,
+    Stop,
+    Mute,
+    Favorite,
+    Shuffle,
+    Undo,
+    Redo,
+}
+
+fn shortcut(modifiers: egui::Modifiers, key: egui::Key) -> Option<Shortcut> {
+    let plain = modifiers == egui::Modifiers::default();
+    if plain && key == egui::Key::Space {
+        Some(Shortcut::PlayPause)
+    } else if plain && key == egui::Key::N {
+        Some(Shortcut::Next)
+    } else if plain && key == egui::Key::P {
+        Some(Shortcut::Previous)
+    } else if plain && key == egui::Key::S {
+        Some(Shortcut::Stop)
+    } else if plain && key == egui::Key::M {
+        Some(Shortcut::Mute)
+    } else if plain && key == egui::Key::F {
+        Some(Shortcut::Favorite)
+    } else if modifiers == egui::Modifiers::CTRL && key == egui::Key::S {
+        Some(Shortcut::Shuffle)
+    } else if modifiers == egui::Modifiers::CTRL && key == egui::Key::ArrowRight {
+        Some(Shortcut::Next)
+    } else if modifiers == egui::Modifiers::CTRL && key == egui::Key::ArrowLeft {
+        Some(Shortcut::Previous)
+    } else if modifiers == egui::Modifiers::CTRL && key == egui::Key::Z {
+        Some(Shortcut::Undo)
+    } else if (modifiers == (egui::Modifiers::CTRL | egui::Modifiers::SHIFT) && key == egui::Key::Z)
+        || (modifiers == egui::Modifiers::CTRL && key == egui::Key::Y)
+    {
+        Some(Shortcut::Redo)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn plain_keys_map_to_transport_actions() {
+        let plain = egui::Modifiers::default();
+        assert_eq!(shortcut(plain, egui::Key::Space), Some(Shortcut::PlayPause));
+        assert_eq!(shortcut(plain, egui::Key::N), Some(Shortcut::Next));
+        assert_eq!(shortcut(plain, egui::Key::P), Some(Shortcut::Previous));
+        assert_eq!(shortcut(plain, egui::Key::S), Some(Shortcut::Stop));
+        assert_eq!(shortcut(plain, egui::Key::M), Some(Shortcut::Mute));
+        assert_eq!(shortcut(plain, egui::Key::F), Some(Shortcut::Favorite));
+    }
+
+    #[test]
+    fn ctrl_modifiers_are_not_treated_as_plain_keys() {
+        assert_eq!(
+            shortcut(egui::Modifiers::CTRL, egui::Key::S),
+            Some(Shortcut::Shuffle)
+        );
+        assert_eq!(
+            shortcut(egui::Modifiers::CTRL, egui::Key::ArrowRight),
+            Some(Shortcut::Next)
+        );
+        assert_eq!(shortcut(egui::Modifiers::CTRL, egui::Key::Space), None);
+        assert_eq!(shortcut(egui::Modifiers::SHIFT, egui::Key::N), None);
+    }
+
+    #[test]
+    fn undo_and_redo_have_distinct_modifiers() {
+        assert_eq!(
+            shortcut(egui::Modifiers::CTRL, egui::Key::Z),
+            Some(Shortcut::Undo)
+        );
+        assert_eq!(
+            shortcut(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z),
+            Some(Shortcut::Redo)
+        );
+        assert_eq!(
+            shortcut(egui::Modifiers::CTRL, egui::Key::Y),
+            Some(Shortcut::Redo)
+        );
+    }
 }
 
 struct ThemeDraft {
@@ -162,6 +284,7 @@ struct CoverViewer {
     cover: background::Cover,
     title: String,
     artist: String,
+    source: Option<PathBuf>,
 }
 
 struct Notice {
@@ -295,8 +418,8 @@ struct SearchResults {
 }
 
 impl SearchResults {
-    fn new(list: usize, query: &str, playlist: &Playlist, view: Option<&PlaylistView>) -> Self {
-        let needle = query.to_lowercase();
+    fn new(list: usize, text: &str, playlist: &Playlist, view: Option<&PlaylistView>) -> Self {
+        let query = search::Query::compile(text);
         let mut rows = Vec::new();
         let mut count = 0;
         let mut indexed = 0;
@@ -308,7 +431,7 @@ impl SearchResults {
                     PlaylistRow::Album(label) => album = Some(label),
                     PlaylistRow::Track(index) => {
                         let track = &view.tracks[*index];
-                        if !needle.contains('\0') && track.search_key.contains(&needle) {
+                        if query.matches(Some(track), &playlist.tracks[*index]) {
                             if let Some(label) = album.take() {
                                 rows.push(PlaylistRow::Album(label.clone()));
                             }
@@ -320,17 +443,60 @@ impl SearchResults {
             }
         }
         for (index, path) in playlist.tracks.iter().enumerate().skip(indexed) {
-            if file_title(path).to_lowercase().contains(&needle) {
+            if query.matches(None, path) {
                 rows.push(PlaylistRow::Track(index));
                 count += 1;
             }
         }
         Self {
             list,
-            query: query.into(),
+            query: text.into(),
             rows,
             count,
         }
+    }
+}
+
+#[cfg(test)]
+mod search_results_tests {
+    use super::*;
+
+    fn playlist() -> Playlist {
+        Playlist {
+            name: "Test".into(),
+            tracks: vec![
+                PathBuf::from("Music/A/Help.flac"),
+                PathBuf::from("Music/B/Other.flac"),
+            ],
+            ids: vec![],
+            pinned: false,
+            sidebar_position: None,
+            sort: Sort::Added,
+            descending: false,
+        }
+    }
+
+    #[test]
+    fn field_queries_filter_indexed_rows_and_unindexed_paths() {
+        let list = playlist();
+        let mut info = TrackInfo {
+            title: "Help!".into(),
+            artist: "The Beatles".into(),
+            ..Default::default()
+        };
+        info.prepare_search(&list.tracks[0]);
+        let view = PlaylistView::build(vec![info], Sort::Added, false);
+
+        let by_artist = SearchResults::new(0, "artist:beatles", &list, Some(&view));
+        assert_eq!(by_artist.count, 1);
+        assert!(matches!(by_artist.rows.as_slice(), [PlaylistRow::Track(0)]));
+
+        let by_file = SearchResults::new(0, "file:other.flac", &list, Some(&view));
+        assert_eq!(by_file.count, 1);
+        assert!(matches!(by_file.rows.as_slice(), [PlaylistRow::Track(1)]));
+
+        let no_match = SearchResults::new(0, "-path:music", &list, Some(&view));
+        assert_eq!(no_match.count, 0);
     }
 }
 
@@ -388,6 +554,11 @@ struct Player {
     artwork_url: String,
     track_search: String,
     search_results: Option<SearchResults>,
+    track_selection: HashSet<usize>,
+    track_anchor: Option<usize>,
+    selection_list: Option<usize>,
+    undo: Vec<PlaylistSnapshot>,
+    redo: Vec<PlaylistSnapshot>,
     rpc: presence::Presence,
     lastfm: lastfm::Client,
     order: Vec<TrackId>,
@@ -404,6 +575,20 @@ struct Player {
     /// Opt-in UI frame timing: set RUST_PLAYER_FRAME_LOG to a CSV path.
     frame_log: Option<std::io::BufWriter<std::fs::File>>,
     frame_log_count: usize,
+}
+
+/// `prune_favorites()` rewrites the Favorites playlist when a source is
+/// deleted, renamed or relinked. Cached rows and a running index job belong to
+/// the old list and must be dropped together with it.
+fn invalidate_favorites_cache(
+    favorites: Option<usize>,
+    views: &mut HashMap<usize, PlaylistView>,
+    indexing: &mut HashMap<usize, mpsc::Receiver<Vec<TrackInfo>>>,
+) {
+    if let Some(index) = favorites {
+        views.remove(&index);
+        indexing.remove(&index);
+    }
 }
 
 impl Player {
@@ -425,10 +610,34 @@ impl Player {
             match listening::Listening::load(&library_path.with_file_name("listening.json")) {
                 Ok(data) => (data, false),
                 Err(error) => {
-                    status = format!("Could not load listening activity: {error}");
+                    let message = format!("Could not load listening activity: {error}");
+                    if status.is_empty() {
+                        status = message;
+                    } else {
+                        // Both files can be corrupt; do not hide the more
+                        // important playlist error behind the listening one.
+                        status = format!("{status} · {message}");
+                    }
                     (listening::Listening::default(), true)
                 }
             };
+        let queue_path = library_path.with_file_name("queue.json");
+        let (play_queue, queue_needs_backup) = match play_queue::PlayQueue::load(&queue_path) {
+            Ok(mut queue) => {
+                queue.retain(|id| library.locations.contains_key(&id));
+                (queue, false)
+            }
+            Err(play_queue::LoadError::Missing) => (play_queue::PlayQueue::default(), false),
+            Err(play_queue::LoadError::Invalid(error)) => {
+                let message = format!("Could not load queue: {error}");
+                if status.is_empty() {
+                    status = message;
+                } else {
+                    status = format!("{status} · {message}");
+                }
+                (play_queue::PlayQueue::default(), true)
+            }
+        };
         let plugins = plugins::Host::load(&library.plugins);
         let lastfm = lastfm::Client::new(ctx, &library_path, &library);
         let setup = audio_setup::Setup::new(!library_path.exists() && !library.audio_setup_done);
@@ -442,6 +651,9 @@ impl Player {
         }
         if listening_needs_backup {
             backup.need(library_path.with_file_name("listening.json"));
+        }
+        if queue_needs_backup {
+            backup.need(queue_path);
         }
         let mut frame_log = std::env::var_os("RUST_PLAYER_FRAME_LOG").and_then(|path| {
             std::fs::File::create(path)
@@ -472,7 +684,7 @@ impl Player {
             search_results: None,
             order_list: None,
             queue_order_edited: false,
-            play_queue: Default::default(),
+            play_queue,
             inspector_tab: InspectorTab::Queue,
             audio_release: None,
             playing: None,
@@ -499,6 +711,11 @@ impl Player {
 
             artwork_url: String::new(),
             track_search: String::new(),
+            track_selection: HashSet::new(),
+            track_anchor: None,
+            selection_list: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
             rpc: presence::Presence::new(),
             lastfm,
             order: Vec::new(),
@@ -529,7 +746,12 @@ impl Player {
         self.cached_favorite = None;
         self.search_results = None;
         self.volume_save_at = None;
-        self.library.prune_favorites();
+        if self.library.prune_favorites() {
+            // Favorites rows may have been removed or repointed to a relinked
+            // source. A cached view would still contain the old rows and can
+            // make the UI index past the end of the shorter playlist.
+            invalidate_favorites_cache(self.library.favorites, &mut self.views, &mut self.indexing);
+        }
         self.sync_cache_paths();
         let mut notices = Vec::new();
         if !self.prepare_backup(
@@ -540,15 +762,8 @@ impl Player {
         ) {
             return;
         }
-        let listening_path = self.library_path.with_file_name("listening.json");
-        if !self.prepare_backup(
-            listening_path,
-            "listening.invalid-",
-            "listening activity",
-            &mut notices,
-        ) {
-            return;
-        }
+        // listening.json is written by record_play(), which backs it up right
+        // before its own enqueue. A failure there must not block settings.
         // Serialize on the UI thread, let the worker do the atomic write.
         // The snapshot belongs to the state right now, so a later save simply
         // replaces it in the worker's queue. The backup stays pending until the
@@ -563,6 +778,29 @@ impl Player {
             }
             Err(error) => {
                 notices.push(format!("Could not save playlists or settings: {error}"));
+                self.status = notices.join(" ");
+            }
+        }
+        self.save_queue();
+    }
+
+    /// Persist only the explicit "PLAY NEXT" entries. The playlist part of the
+    /// queue is derived from the current order and is saved with playback.json.
+    fn save_queue(&mut self) {
+        let path = self.library_path.with_file_name("queue.json");
+        let mut notices = Vec::new();
+        if !self.prepare_backup(path.clone(), "queue.invalid-", "queue", &mut notices) {
+            return;
+        }
+        match serde_json::to_vec(&self.play_queue) {
+            Ok(bytes) => {
+                self.save_worker.enqueue(path, bytes);
+                if !notices.is_empty() {
+                    self.status = notices.join(" ");
+                }
+            }
+            Err(error) => {
+                notices.push(format!("Could not save queue: {error}"));
                 self.status = notices.join(" ");
             }
         }
@@ -645,7 +883,7 @@ impl Player {
                 return None;
             }
         };
-        let mut saved: SavedTrack = match serde_json::from_slice(&bytes) {
+        let saved: SavedTrack = match serde_json::from_slice(&bytes) {
             Ok(Some(saved)) => saved,
             Ok(None) => return None,
             Err(error) => {
@@ -656,17 +894,23 @@ impl Player {
             }
         };
         let missing_id = saved.id.is_none();
-        let id = saved.resolve(&self.library)?;
-        let track = self.library.locate(id)?;
-        saved.id = Some(id);
-        saved.track = track;
-        saved.path = self
-            .library
-            .track_path(id)
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let saved = self.normalize_saved(saved)?;
         if missing_id {
             self.write_playback(Some(saved.clone()));
+        }
+        Some(saved)
+    }
+
+    /// Refresh identity, coordinates and path of a persisted track together.
+    /// Both restore paths use this so a reorder cannot leave them disagreeing.
+    fn normalize_saved(&self, mut saved: SavedTrack) -> Option<SavedTrack> {
+        let id = saved.resolve(&self.library)?;
+        saved.id = Some(id);
+        if let Some(track) = self.library.locate(id) {
+            saved.track = track;
+        }
+        if let Some(path) = self.library.track_path(id) {
+            saved.path = path.to_path_buf();
         }
         Some(saved)
     }
@@ -778,19 +1022,9 @@ impl Player {
             self.clear_order();
             self.sync_presence();
             self.write_playback(None);
-        } else if let Some(mut saved) = saved {
-            if let Some(id) = saved.resolve(&self.library) {
-                saved.id = Some(id);
-                saved.track = self.library.locate(id).unwrap_or(saved.track);
-                saved.path = self
-                    .library
-                    .track_path(id)
-                    .map(PathBuf::from)
-                    .unwrap_or(saved.path);
-                self.write_playback(Some(saved));
-            } else {
-                self.write_playback(None);
-            }
+        } else if let Some(saved) = saved {
+            let saved = self.normalize_saved(saved);
+            self.write_playback(saved);
         }
     }
 
@@ -810,6 +1044,8 @@ impl Player {
             .unwrap_or_else(|| list.min(self.library.playlists.len() - 1));
         self.views.clear();
         self.indexing.clear();
+        self.undo.clear();
+        self.redo.clear();
         self.imports.retain_mut(|(index, _)| {
             if let Some(new) = rebase(*index) {
                 *index = new;
@@ -854,7 +1090,7 @@ impl Player {
             PlaylistAction::Delete => {
                 self.dialogs.playlist_dialog = Some(PlaylistDialog::Delete(index))
             }
-            PlaylistAction::Export => {
+            PlaylistAction::ExportAbsolute | PlaylistAction::ExportRelative => {
                 let playlist = self.library.playlists[index].clone();
                 let name = playlist
                     .name
@@ -864,12 +1100,17 @@ impl Player {
                     .set_file_name(format!("{name}.m3u8"))
                     .save_file()
                 {
+                    let mode = if matches!(action, PlaylistAction::ExportRelative) {
+                        playlist_io::PathMode::Relative
+                    } else {
+                        playlist_io::PathMode::Absolute
+                    };
                     let (send, receive) = mpsc::channel();
                     self.playlist_exports.push(receive);
                     let label = playlist.name.clone();
                     let ctx = ctx.clone();
                     std::thread::spawn(move || {
-                        let result = playlist_io::export(&playlist, &path)
+                        let result = playlist_io::export(&playlist, &path, mode)
                             .map_err(|error| error.to_string());
                         let _ = send.send((label, result));
                         ctx.request_repaint();
@@ -925,13 +1166,17 @@ impl Player {
                     Ok((mut playlist, ignored)) => {
                         playlist.name = self.unique_playlist_name(&playlist.name);
                         self.library.playlists.push(playlist);
-                        self.library.rebuild_locations();
-                        self.library.selected = self.library.playlists.len() - 1;
                         imported += 1;
                         skipped += ignored;
                     }
                     Err(error) => errors.push(error),
                 }
+            }
+            // Importing N playlists used to rebuild the whole location/ID map N
+            // times. New playlists have no IDs yet, so one pass is equivalent.
+            if imported > 0 {
+                self.library.rebuild_locations();
+                self.library.selected = self.library.playlists.len() - 1;
             }
             self.status = format!("Imported {imported} playlists");
             if skipped > 0 {
@@ -1074,46 +1319,182 @@ impl Player {
         }
     }
 
+    fn snapshot_playlist(&self, list: usize) -> PlaylistSnapshot {
+        let playlist = &self.library.playlists[list];
+        let view = self.views.get(&list);
+        PlaylistSnapshot {
+            list,
+            tracks: playlist.tracks.clone(),
+            ids: playlist.ids.clone(),
+            metadata: view.map(|view| view.tracks.clone()).unwrap_or_default(),
+            has_view: view.is_some(),
+            sort: playlist.sort,
+            descending: playlist.descending,
+            favorites: (Some(list) == self.library.favorites)
+                .then(|| self.library.favorite_ids.clone()),
+        }
+    }
+
+    fn record_edit(&mut self, list: usize) {
+        self.undo.push(self.snapshot_playlist(list));
+        if self.undo.len() > 64 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn apply_playlist_snapshot(&mut self, snapshot: PlaylistSnapshot) {
+        let saved = self.previously_saved();
+        {
+            let playlist = &mut self.library.playlists[snapshot.list];
+            playlist.tracks = snapshot.tracks;
+            playlist.ids = snapshot.ids;
+            playlist.sort = snapshot.sort;
+            playlist.descending = snapshot.descending;
+        }
+        if let Some(favorites) = snapshot.favorites {
+            self.library.favorite_ids = favorites;
+        }
+        self.indexing.remove(&snapshot.list);
+        self.views.remove(&snapshot.list);
+        if snapshot.has_view {
+            self.views.insert(
+                snapshot.list,
+                PlaylistView::build(snapshot.metadata, snapshot.sort, snapshot.descending),
+            );
+        }
+        self.cached_favorite = None;
+        self.search_results = None;
+        self.library.rebuild_locations();
+        self.save();
+        self.refresh_playback_ids(saved);
+        self.clear_track_selection();
+    }
+
+    fn undo_edit(&mut self) {
+        let Some(snapshot) = self.undo.pop() else {
+            self.status = "Nothing to undo.".into();
+            return;
+        };
+        self.redo.push(self.snapshot_playlist(snapshot.list));
+        self.apply_playlist_snapshot(snapshot);
+        self.status = "Undid playlist edit.".into();
+    }
+
+    fn redo_edit(&mut self) {
+        let Some(snapshot) = self.redo.pop() else {
+            self.status = "Nothing to redo.".into();
+            return;
+        };
+        self.undo.push(self.snapshot_playlist(snapshot.list));
+        self.apply_playlist_snapshot(snapshot);
+        self.status = "Redid playlist edit.".into();
+    }
+
     fn edit_track(&mut self, (list, index): Track, edit: TrackEdit) {
+        let len = self.library.playlists[list].tracks.len();
+        let changed = match edit {
+            TrackEdit::Move(other) => index.max(other) < len,
+            TrackEdit::Reorder(target) => index < len && target != index,
+        };
+        if changed {
+            self.record_edit(list);
+        }
         let saved = self.previously_saved();
         let playlist = &mut self.library.playlists[list];
-        match edit {
-            TrackEdit::Remove => {
-                playlist.ids.remove(index);
-            }
-            TrackEdit::Move(other) => playlist.ids.swap(index, other),
-        }
-        let tracks = &mut playlist.tracks;
-        match edit {
-            TrackEdit::Remove => {
-                tracks.remove(index);
-            }
-            TrackEdit::Move(other) => tracks.swap(index, other),
-        }
+        apply_track_edit(&mut playlist.ids, index, edit);
+        apply_track_edit(&mut playlist.tracks, index, edit);
         if Some(list) == self.library.favorites {
-            match edit {
-                TrackEdit::Remove => {
-                    if index < self.library.favorite_ids.len() {
-                        self.library.favorite_ids.remove(index);
-                    }
+            apply_track_edit(&mut self.library.favorite_ids, index, edit);
+        }
+        self.indexing.remove(&list);
+        if let Some(view) = self.views.remove(&list) {
+            let mut metadata = view.tracks;
+            apply_track_edit(&mut metadata, index, edit);
+            let playlist = &self.library.playlists[list];
+            self.views.insert(
+                list,
+                PlaylistView::build(metadata, playlist.sort, playlist.descending),
+            );
+        }
+        self.library.rebuild_locations();
+        self.save();
+        self.refresh_playback_ids(saved);
+        if matches!(edit, TrackEdit::Move(_) | TrackEdit::Reorder(_))
+            && !self.library.shuffle
+            && self.order_list == Some(list)
+            && let Some(id) = self.order_id()
+        {
+            self.plan(id);
+        }
+    }
+
+    fn enqueue_tracks(&mut self, list: usize, indices: &[usize]) {
+        let mut added = 0;
+        for &index in indices {
+            let Some(id) = self.library.track_id((list, index)) else {
+                continue;
+            };
+            let title = self
+                .views
+                .get(&list)
+                .and_then(|view| view.tracks.get(index))
+                .map(|track| track.title.clone())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| file_title(&self.library.playlists[list].tracks[index]));
+            self.play_queue.push(id, title);
+            added += 1;
+        }
+        if added > 0 {
+            self.save_queue();
+            self.status = if added == 1 {
+                "Added 1 track to the queue.".into()
+            } else {
+                format!("Added {added} tracks to the queue.")
+            };
+        }
+    }
+
+    fn remove_tracks(&mut self, list: usize, indices: &[usize]) {
+        let total = self.library.playlists[list].tracks.len();
+        let mut unique: Vec<_> = indices
+            .iter()
+            .copied()
+            .filter(|index| *index < total)
+            .collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.is_empty() {
+            return;
+        }
+        self.record_edit(list);
+        let saved = self.previously_saved();
+        let favorites = Some(list) == self.library.favorites;
+        {
+            let playlist = &mut self.library.playlists[list];
+            for &index in unique.iter().rev() {
+                if index < playlist.ids.len() {
+                    playlist.ids.remove(index);
                 }
-                TrackEdit::Move(other) => self.library.favorite_ids.swap(index, other),
+                if index < playlist.tracks.len() {
+                    playlist.tracks.remove(index);
+                }
+            }
+        }
+        if favorites {
+            for &index in unique.iter().rev() {
+                if index < self.library.favorite_ids.len() {
+                    self.library.favorite_ids.remove(index);
+                }
             }
         }
         self.indexing.remove(&list);
         if let Some(view) = self.views.remove(&list) {
             let mut metadata = view.tracks;
-            match edit {
-                TrackEdit::Remove if index < metadata.len() => {
+            for &index in unique.iter().rev() {
+                if index < metadata.len() {
                     metadata.remove(index);
                 }
-                TrackEdit::Move(other) if index.max(other) < metadata.len() => {
-                    metadata.swap(index, other)
-                }
-                TrackEdit::Move(other) if index.min(other) < metadata.len() => {
-                    metadata.truncate(index.min(other))
-                }
-                _ => {}
             }
             let playlist = &self.library.playlists[list];
             self.views.insert(
@@ -1124,13 +1505,16 @@ impl Player {
         self.library.rebuild_locations();
         self.save();
         self.refresh_playback_ids(saved);
-        if matches!(edit, TrackEdit::Move(_))
-            && !self.library.shuffle
-            && self.order_list == Some(list)
-            && let Some(id) = self.order_id()
-        {
-            self.plan(id);
-        }
+        self.status = if unique.len() == 1 {
+            "Removed 1 track.".into()
+        } else {
+            format!("Removed {} tracks.", unique.len())
+        };
+    }
+
+    fn clear_track_selection(&mut self) {
+        self.track_selection.clear();
+        self.track_anchor = None;
     }
 
     fn open_containing_folder(&mut self, path: PathBuf) {
@@ -1714,7 +2098,14 @@ impl Player {
             }
             return;
         };
-        let mut candidate = self.adjacent_cursor(offset);
+        // Manual Next (button, taskbar, media key) must honour Repeat::All just
+        // like the automatic transition does.
+        let mut candidate = gapless_ui::step_cursor(
+            self.library.repeat,
+            self.adjacent_cursor(offset),
+            self.order.len(),
+            offset,
+        );
         while let Some(cursor) = candidate
             && let Some(&id) = self.order.get(cursor)
             && self.library.locate(id).is_some()
@@ -1837,6 +2228,62 @@ impl Player {
         self.save();
     }
 
+    /// foobar-style global keys. Skipped while a widget has keyboard focus so
+    /// typing in the search box or a settings field never changes playback.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.memory(|memory| memory.focused().is_some()) {
+            return;
+        }
+        let candidates = [
+            (egui::Modifiers::default(), egui::Key::Space),
+            (egui::Modifiers::default(), egui::Key::N),
+            (egui::Modifiers::default(), egui::Key::P),
+            (egui::Modifiers::default(), egui::Key::S),
+            (egui::Modifiers::default(), egui::Key::M),
+            (egui::Modifiers::default(), egui::Key::F),
+            (egui::Modifiers::CTRL, egui::Key::S),
+            (egui::Modifiers::CTRL, egui::Key::ArrowRight),
+            (egui::Modifiers::CTRL, egui::Key::ArrowLeft),
+            (egui::Modifiers::CTRL, egui::Key::Z),
+            (egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z),
+            (egui::Modifiers::CTRL, egui::Key::Y),
+        ];
+        let mut actions = Vec::new();
+        ctx.input_mut(|input| {
+            for (modifiers, key) in candidates {
+                if input.consume_key(modifiers, key)
+                    && let Some(action) = shortcut(modifiers, key)
+                    && !actions.contains(&action)
+                {
+                    actions.push(action);
+                }
+            }
+        });
+        for action in actions {
+            match action {
+                Shortcut::PlayPause => {
+                    if self
+                        .playing
+                        .as_ref()
+                        .is_some_and(|playing| !playing.sink.is_paused())
+                    {
+                        self.pause();
+                    } else {
+                        self.resume(ctx);
+                    }
+                }
+                Shortcut::Next => self.step(1, ctx),
+                Shortcut::Previous => self.previous(ctx),
+                Shortcut::Stop => self.stop(),
+                Shortcut::Mute => self.toggle_mute(),
+                Shortcut::Favorite => self.toggle_favorite(),
+                Shortcut::Shuffle => self.toggle_shuffle(),
+                Shortcut::Undo => self.undo_edit(),
+                Shortcut::Redo => self.redo_edit(),
+            }
+        }
+    }
+
     fn taskbar_buttons(&self) -> taskbar::Buttons {
         let loaded = self.playing.is_some();
         taskbar::Buttons {
@@ -1852,7 +2299,7 @@ impl Player {
                     .tracks
                     .is_empty(),
             playing: self.playing.as_ref().is_some_and(|p| !p.sink.is_paused()),
-            next: !self.play_queue.is_empty() || (loaded && self.adjacent_cursor(1).is_some()),
+            next: !self.play_queue.is_empty() || (loaded && self.next_cursor().is_some()),
             shuffle: self.library.shuffle,
         }
     }
@@ -1912,6 +2359,7 @@ impl eframe::App for Player {
         }
         self.update_audio(ctx);
         self.run_transport_commands(ctx);
+        self.handle_shortcuts(ctx);
         let mut dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
@@ -2014,8 +2462,18 @@ impl eframe::App for Player {
         if let Some(playing) = &self.playing {
             self.save_playback(playing.sink.get_pos());
         }
-        // Drain and join: graceful exit must never lose a queued snapshot.
-        self.save_worker.shutdown();
+        // Drain and join: graceful exit must never lose a queued snapshot or
+        // the outcome of its final write. The window is gone, so persist any
+        // failure to the diagnostic log instead of showing a status message.
+        let (reports, panicked) = self.save_worker.finish();
+        if panicked {
+            crate::diagnostics::append_shutdown("Save worker stopped unexpectedly.");
+        }
+        for report in reports {
+            if let Some(error) = report.error {
+                crate::diagnostics::append_shutdown(&error);
+            }
+        }
         if let Some(log) = &mut self.frame_log {
             let _ = log.flush();
         }
@@ -2100,6 +2558,29 @@ fn playlist_entry(len: usize, shuffle: bool, order: Option<&[usize]>) -> Option<
 }
 
 #[cfg(test)]
+mod track_edit_tests {
+    use super::{TrackEdit, apply_track_edit};
+
+    #[test]
+    fn reorder_moves_a_row_before_the_target() {
+        let mut items = vec!["A", "B", "C", "D"];
+        // A onto C: the UI compensates to target index 1.
+        apply_track_edit(&mut items, 0, TrackEdit::Reorder(1));
+        assert_eq!(items, ["B", "A", "C", "D"]);
+        apply_track_edit(&mut items, 3, TrackEdit::Reorder(0));
+        assert_eq!(items, ["D", "B", "A", "C"]);
+    }
+
+    #[test]
+    fn reorder_ignores_stale_indices() {
+        let mut items = vec!["A", "B"];
+        apply_track_edit(&mut items, 5, TrackEdit::Reorder(0));
+        apply_track_edit(&mut items, 0, TrackEdit::Reorder(9));
+        assert_eq!(items, ["B", "A"]);
+    }
+}
+
+#[cfg(test)]
 mod playlist_entry_tests {
     use super::playlist_entry;
 
@@ -2131,12 +2612,18 @@ fn favorite_column_rect(row: egui::Rect) -> egui::Rect {
     )
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RowFlags {
+    pub active: bool,
+    pub selected: bool,
+}
+
 fn playlist_columns(
     ui: &mut egui::Ui,
     height: f32,
     text: [&str; 4],
     header: bool,
-    active: bool,
+    flags: RowFlags,
     tooltip: &str,
     artwork: Option<Option<egui::TextureId>>,
 ) -> egui::Response {
@@ -2148,8 +2635,13 @@ fn playlist_columns(
     };
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), sense);
     let painter = ui.painter();
-    if active || response.hovered() && !header {
-        painter.rect_filled(rect, 0.0, ui.visuals().selection.bg_fill);
+    if flags.active || flags.selected || response.hovered() && !header {
+        let fill = if flags.selected && !flags.active {
+            ui.visuals().widgets.inactive.weak_bg_fill
+        } else {
+            ui.visuals().selection.bg_fill
+        };
+        painter.rect_filled(rect, 0.0, fill);
     }
     painter.hline(rect.x_range(), rect.bottom(), ui.visuals().window_stroke);
     let left = rect.left();
@@ -2201,7 +2693,7 @@ fn playlist_columns(
         };
         let color = if header {
             ui.visuals().weak_text_color()
-        } else if active {
+        } else if flags.active {
             ui.visuals().selection.stroke.color
         } else {
             ui.visuals().text_color()

@@ -145,6 +145,7 @@ impl Cache {
             .map_or(1, usize::from)
             .min(4);
         let cache = &self.entries;
+        let mut worker_failed = false;
         let chunks = thread::scope(|s| {
             paths
                 .chunks(paths.len().div_ceil(workers).max(1))
@@ -192,12 +193,21 @@ impl Cache {
                 .into_iter()
                 .map(|(len, worker)| match worker.join() {
                     Ok(result) => result,
-                    Err(_) => (0..len)
-                        .map(|_| (TrackInfo::default(), None::<Entry>))
-                        .collect(),
+                    Err(_) => {
+                        worker_failed = true;
+                        (0..len)
+                            .map(|_| (TrackInfo::default(), None::<Entry>))
+                            .collect()
+                    }
                 })
                 .collect::<Vec<_>>()
         });
+        if worker_failed {
+            crate::diagnostics::append_error(
+                "metadata-cache",
+                "A metadata scan worker stopped unexpectedly.",
+            );
+        }
         let mut dirty = false;
         let tracks = paths
             .iter()
@@ -221,6 +231,22 @@ impl Cache {
     }
 }
 
+/// `save()` sends the same path set on many state changes; rebuilding the
+/// HashSet and retaining every entry on each of those frames is pure overhead.
+fn prune_if_changed(
+    cache: &mut Cache,
+    last_keep: &mut Option<HashSet<PathBuf>>,
+    paths: Vec<PathBuf>,
+) -> bool {
+    let keep: HashSet<PathBuf> = paths.into_iter().collect();
+    if last_keep.as_ref() == Some(&keep) {
+        return false;
+    }
+    let changed = cache.prune(&keep);
+    *last_keep = Some(keep);
+    changed
+}
+
 enum Job {
     Scan {
         paths: Vec<PathBuf>,
@@ -236,9 +262,14 @@ impl Indexer {
         let (send, recv) = mpsc::channel::<Job>();
         thread::spawn(move || {
             let (mut cache, mut dirty) = Cache::load(&file).unwrap_or_else(|error| {
-                eprintln!("Could not load metadata cache: {error}");
+                crate::diagnostics::append_error(
+                    "metadata-cache",
+                    &format!("Could not load metadata cache: {error}"),
+                );
                 (Cache::default(), false)
             });
+            let mut save_failed = false;
+            let mut last_keep = None;
             for job in recv {
                 match job {
                     Job::Scan { paths, reply, ctx } => {
@@ -248,12 +279,24 @@ impl Indexer {
                         ctx.request_repaint();
                     }
                     Job::Paths(paths) => {
-                        let keep: HashSet<PathBuf> = paths.into_iter().collect();
-                        dirty |= cache.prune(&keep);
+                        dirty |= prune_if_changed(&mut cache, &mut last_keep, paths);
                     }
                 }
-                if dirty && save_json(&cache, &file).is_ok() {
-                    dirty = false;
+                if dirty {
+                    match save_json(&cache, &file) {
+                        Ok(()) => {
+                            dirty = false;
+                            save_failed = false;
+                        }
+                        Err(error) if !save_failed => {
+                            crate::diagnostics::append_error(
+                                "metadata-cache",
+                                &format!("Could not save metadata cache: {error}"),
+                            );
+                            save_failed = true;
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         });
@@ -296,6 +339,26 @@ pub fn measure(paths: &[PathBuf], file: &Path) -> Vec<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_library_paths_are_not_pruned_twice() {
+        let mut cache = Cache::default();
+        let keep = PathBuf::from("keep.flac");
+        let drop = PathBuf::from("drop.flac");
+        cache.entries.insert(keep.clone(), Entry::default());
+        cache.entries.insert(drop.clone(), Entry::default());
+        let mut last = None;
+        assert!(prune_if_changed(&mut cache, &mut last, vec![keep.clone()]));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(!prune_if_changed(&mut cache, &mut last, vec![keep]));
+        cache.entries.insert(drop, Entry::default());
+        assert!(prune_if_changed(
+            &mut cache,
+            &mut last,
+            vec![PathBuf::from("other.flac")]
+        ));
+        assert!(cache.entries.is_empty());
+    }
 
     #[test]
     fn corrupt_cache_is_backed_up_and_rebuilt() {

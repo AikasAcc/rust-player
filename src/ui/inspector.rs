@@ -52,6 +52,9 @@ impl Player {
                                         artwork.pixels(),
                                         playing.media.title.clone(),
                                         playing.media.artist.clone(),
+                                        self.library
+                                            .track_path(playing.id)
+                                            .map(|path| path.to_path_buf()),
                                     ));
                                 }
                                 response.on_hover_text("Double-click to open artwork");
@@ -71,6 +74,25 @@ impl Player {
                             if !playing.media.album.is_empty() {
                                 ui.weak(&playing.media.album);
                             }
+                            let connected = self.lastfm.connected() && self.library.lastfm_enabled;
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(connected, egui::Button::new("♥ Last.fm"))
+                                    .on_hover_text("Love the current track on Last.fm")
+                                    .clicked()
+                                {
+                                    self.lastfm.love(&playing.media, playing.duration, true);
+                                }
+                                if ui
+                                    .add_enabled(connected, egui::Button::new("♡ Last.fm"))
+                                    .on_hover_text(
+                                        "Remove the current track from Last.fm loved tracks",
+                                    )
+                                    .clicked()
+                                {
+                                    self.lastfm.love(&playing.media, playing.duration, false);
+                                }
+                            });
                         });
                 }
                 let mut search = false;
@@ -170,8 +192,8 @@ impl Player {
                     self.save_lyrics();
                 }
             });
-        if let Some((pixels, title, artist)) = cover_open {
-            self.open_cover_viewer(ctx, pixels, title, artist);
+        if let Some((pixels, title, artist, source)) = cover_open {
+            self.open_cover_viewer(ctx, pixels, title, artist, source);
         }
         if let Some(timestamp) = lyric_seek {
             self.seek(timestamp, ctx);

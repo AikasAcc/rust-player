@@ -166,4 +166,51 @@ mod tests {
         assert_eq!(choose(&paths[..1], None), Some(paths[0].clone()));
         assert!(choose(&[], None).is_none());
     }
+
+    #[test]
+    fn metadata_picks_the_matching_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let wanted = dir.path().join("wanted.wav");
+        let other = dir.path().join("other.wav");
+        for path in [&wanted, &other] {
+            crate::audio::setup::tone(path, 48_000).unwrap();
+        }
+        crate::tagging::write(
+            &wanted,
+            crate::tagging::Edit {
+                title: "Song",
+                artist: "Artist",
+                album: "Album",
+                album_artist: "Artist",
+                track: "1",
+            },
+        )
+        .unwrap();
+        let old = TrackInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            ..TrackInfo::default()
+        };
+        let choices = vec![other, wanted.clone()];
+        assert_eq!(choose(&choices, Some(&old)), Some(wanted));
+    }
+
+    #[test]
+    fn a_virtual_cue_track_is_missing_when_its_audio_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("disc.wav");
+        crate::audio::setup::tone(&audio, 48_000).unwrap();
+        let sheet = dir.path().join("disc.cue");
+        std::fs::write(
+            &sheet,
+            b"FILE \"disc.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        let track = sheet.join("1");
+        assert!(exists(&track));
+        assert!(!exists(&dir.path().join("gone.wav")));
+        std::fs::remove_file(&audio).unwrap();
+        assert!(!exists(&track));
+    }
 }

@@ -32,12 +32,23 @@ Still **not** supported: WavPack, Monkey's Audio, DSD, ASIO, VST plugins, and UP
 
 - Settings, playlists, and listening history are saved in the background. On closing, the player waits briefly until everything is actually on disk.
 - After saving, the folder itself is also flushed. This ensures the new file survives a power failure.
-- If a file is corrupted, the player creates a backup copy and rebuilds the data. Old backups are **never deleted automatically**.
+- If a file is corrupted, the player creates a backup copy and rebuilds the data. Old backups are **never deleted automatically**. A not-yet-existing queue file is not treated as corrupted.
+- A damaged CUE block inside a FLAC file is reported in the log folder instead of being silently treated as an album without a sheet.
+- Updates are downloaded with low memory usage: the installer is checked while it is being written to disk.
 
 ## Small Usability Improvements
 
 - A heart in every song row – favorites directly in the list.
+- Playlist search supports field filters, quoted phrases, boolean operators and negation.
+- Deleting or relinking a source track refreshes Favorites immediately; scrolling cannot run into an outdated row.
 - Double-clicking a playlist or Favorites starts playback.
+- Drag tracks to reorder "Date added" playlists; select several tracks for queue, favorite, or remove actions.
+- Undo/redo playlist edits with `Ctrl`+`Z` / `Ctrl`+`Shift`+`Z` (or **Tools**).
+- More global shortcuts: `Space`, `N`, `P`, `S`, `M`, `F`, `Ctrl`+`S`, `Ctrl`+`←`/`→`.
+- M3U export with relative paths for portable playlists.
+- Explicitly queued tracks are restored after a restart.
+- Save album art as `cover.png` beside the audio file; existing covers are kept.
+- Love/unlove the current track on Last.fm from the now-playing panel.
 - GitHub button under **Tools** and under **Settings → About**.
 
 ## Sound and Tags
@@ -56,7 +67,7 @@ Still **not** supported: WavPack, Monkey's Audio, DSD, ASIO, VST plugins, and UP
 
 ## What Stays the Same
 
-- Keyboard shortcuts, playlists, favorites, listening history, and settings remain valid.
+- Existing shortcuts, playlists, favorites, listening history, and settings remain valid; the listed shortcuts and editing actions are additions.
 - No music files are moved, renamed, or deleted.
 - Existing `library.json`, `playback.json`, and listening history are reused automatically.
 

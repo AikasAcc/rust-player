@@ -133,9 +133,15 @@ impl Player {
                 value(ui, "Format", &properties.format);
                 value(ui, "File size", &properties.size);
                 ui.separator();
-                save_tags = ui.button("Save tags").clicked();
+                let cue_track = crate::cue::reference(&properties.path).is_some();
+                save_tags = ui
+                    .add_enabled(!cue_track, egui::Button::new("Save tags"))
+                    .clicked();
                 if ui.button("Scan and write ReplayGain").clicked() {
                     scan_gain = true;
+                }
+                if cue_track {
+                    ui.weak("CUE entries are virtual; edit the source audio file instead.");
                 }
                 if !properties.status.is_empty() {
                     ui.weak(&properties.status);
@@ -201,11 +207,13 @@ impl Player {
         pixels: std::sync::Arc<image::RgbaImage>,
         title: String,
         artist: String,
+        source: Option<PathBuf>,
     ) {
         self.dialogs.cover_viewer = Some(CoverViewer {
             cover: background::Cover::new(ctx, pixels.as_ref().clone()),
             title,
             artist,
+            source,
         });
     }
 
@@ -216,6 +224,7 @@ impl Player {
         let mut keep_open = true;
         let mut close = false;
         let mut save = false;
+        let mut save_sidecar = false;
         egui::Window::new("Album artwork")
             .open(&mut keep_open)
             .resizable(true)
@@ -241,6 +250,13 @@ impl Player {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     save = ui.button("Save cover as…").clicked();
+                    save_sidecar = ui
+                        .add_enabled(
+                            viewer.source.is_some(),
+                            egui::Button::new("Save next to track"),
+                        )
+                        .on_hover_text("Write cover.png beside the audio file without overwriting")
+                        .clicked();
                     if ui.button("Close").clicked() {
                         close = true;
                     }
@@ -273,6 +289,12 @@ impl Player {
                     Ok(()) => self.status = format!("Saved cover to {}", path.display()),
                     Err(error) => self.status = format!("Could not save cover: {error}"),
                 }
+            }
+        }
+        if save_sidecar && let Some(source) = viewer.source.as_deref() {
+            match viewer.cover.save_sidecar(source) {
+                Ok(path) => self.status = format!("Saved cover to {}", path.display()),
+                Err(error) => self.status = format!("Could not save cover: {error}"),
             }
         }
         if keep_open {
@@ -321,10 +343,14 @@ impl Player {
                 }
             }
             ui.label("Discord displays public images or uploaded assets. Local cover files stay on this device.");
+            ui.weak("Discord never shows activity buttons to you on your own profile. To check them, join a voice channel and hover over yourself, or open your full profile from a second account.");
             ui.label(self.rpc.status());
             ui.horizontal(|ui| {
                 if ui.button("Save settings").clicked() { save = true; }
                 if ui.button("Refresh presence").clicked() { refresh = true; }
+                if ui.button("GitHub").clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(crate::PROJECT_URL));
+                }
             });
         });
         self.dialogs.discord_settings = open;

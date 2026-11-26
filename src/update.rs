@@ -2,16 +2,17 @@ use crate::{artwork, digest};
 use eframe::egui;
 use serde::Deserialize;
 use std::{
-    io::Write,
+    io::Read,
+    path::PathBuf,
     process::Command,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, TryRecvError},
     thread,
 };
 
 const RELEASE_API: &str = "https://api.github.com/repos/AikasAcc/rust-player/releases/latest";
 const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Release {
     pub version: String,
     pub page_url: String,
@@ -64,15 +65,19 @@ impl State {
 
     pub fn poll(&mut self, ctx: &egui::Context) {
         let next = match self {
-            Self::Checking(receiver) => receiver.try_recv().ok().map(|result| match result {
-                Ok(Some(release)) => Self::Available(release),
-                Ok(None) => Self::UpToDate,
-                Err(error) => Self::Failed(error),
-            }),
-            Self::Downloading(receiver) => receiver.try_recv().ok().map(|result| match result {
-                Ok(path) => Self::Ready(path),
-                Err(error) => Self::Failed(error),
-            }),
+            Self::Checking(receiver) => {
+                received(receiver, "Update check").map(|result| match result {
+                    Ok(Some(release)) => Self::Available(release),
+                    Ok(None) => Self::UpToDate,
+                    Err(error) => Self::Failed(error),
+                })
+            }
+            Self::Downloading(receiver) => {
+                received(receiver, "Update download").map(|result| match result {
+                    Ok(path) => Self::Ready(path),
+                    Err(error) => Self::Failed(error),
+                })
+            }
             _ => None,
         };
         if let Some(next) = next {
@@ -96,9 +101,6 @@ impl State {
     }
 
     pub fn install(&mut self) -> Result<(), String> {
-        let Self::Ready((download, digest)) = self else {
-            return Err("No verified update is ready to install.".into());
-        };
         let current = std::env::current_exe().map_err(|error| error.to_string())?;
         let updater = current
             .parent()
@@ -107,22 +109,44 @@ impl State {
         if !updater.is_file() {
             return Err("Rust-Player-Updater.exe is missing next to Rust-Player.exe.".into());
         }
-        Command::new(updater)
+        // The child must never see a path that this process can delete while
+        // it is reading. Persist the verified download before spawning it.
+        let (staged, digest) = staged_download(self)?;
+        let started = Command::new(updater)
             .arg("--wait-pid")
             .arg(std::process::id().to_string())
             .arg("--source")
-            .arg(download.as_os_str())
+            .arg(&staged)
             .arg("--digest")
-            .arg(digest)
+            .arg(&digest)
             .arg("--target")
             .arg(&current)
-            .spawn()
-            .map_err(|error| format!("Could not start the updater: {error}"))?;
-        // Transfer ownership of the staged file to the updater process.
-        if let State::Ready((path, _)) = std::mem::take(self) {
-            path.keep().map_err(|e| e.to_string())?;
+            .spawn();
+        if let Err(error) = started {
+            let _ = std::fs::remove_file(&staged);
+            let message = format!("Could not start the updater: {error}");
+            *self = State::Failed(message.clone());
+            return Err(message);
         }
         Ok(())
+    }
+}
+
+/// Move the staged file out of the state machine and make it persistent. The
+/// updater takes over ownership only after this succeeds.
+fn staged_download(state: &mut State) -> Result<(PathBuf, String), String> {
+    let State::Ready((download, digest)) = std::mem::take(state) else {
+        return Err("No verified update is ready to install.".into());
+    };
+    match download.keep() {
+        Ok(path) => Ok((path, digest)),
+        Err(error) => {
+            // The TempPath is already consumed here. Leave a visible reason
+            // in the UI instead of silently falling back to Idle.
+            let message = format!("Could not persist the downloaded update: {error}");
+            *state = State::Failed(message.clone());
+            Err(message)
+        }
     }
 }
 
@@ -137,6 +161,12 @@ fn fetch_release(current: &str) -> Result<Option<Release>, String> {
         .body_mut()
         .read_json()
         .map_err(|error| format!("Could not read the update response: {error}"))?;
+    release_from(release, current)
+}
+
+/// Pure validation of the GitHub response, kept separate from network I/O so
+/// the asset name, URL and digest checks can be regression-tested offline.
+fn release_from(release: ApiRelease, current: &str) -> Result<Option<Release>, String> {
     if release.draft || release.prerelease || !newer(&release.tag_name, current) {
         return Ok(None);
     }
@@ -183,16 +213,33 @@ fn download_release(release: &Release) -> Result<(tempfile::TempPath, String), S
         .header("User-Agent", "Rust-Player-Updater")
         .call()
         .map_err(|error| format!("Update download failed: {error}"))?;
-    let bytes = response
+    // ureq enforces the size limit while reading; hashing during the copy
+    // avoids holding the whole installer (up to 256 MiB) in memory.
+    let reader = response
         .body_mut()
         .with_config()
         .limit(MAX_INSTALLER_BYTES)
-        .read_to_vec()
-        .map_err(|error| format!("Could not download the update: {error}"))?;
-    digest::verify(&bytes, &release.sha256)?;
+        .reader();
+    let staged = stream_verified(reader, &release.sha256)?;
+    Ok((staged, release.sha256.clone()))
+}
+
+/// Copy a bounded reader to a temporary file while computing its digest. The
+/// file is only handed to the updater after the digest matches.
+fn stream_verified<R: Read>(reader: R, expected: &str) -> Result<tempfile::TempPath, String> {
     let mut file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
-    Ok((file.into_temp_path(), release.sha256.clone()))
+    digest::copy_verified(reader, &mut file, expected)?;
+    Ok(file.into_temp_path())
+}
+
+/// `try_recv().ok()` cannot distinguish "still running" from "worker died".
+/// The latter must leave the Failed state, not spin forever in Checking.
+fn received<T>(receiver: &Receiver<Result<T, String>>, task: &str) -> Option<Result<T, String>> {
+    match receiver.try_recv() {
+        Ok(result) => Some(result),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(Err(format!("{task} stopped unexpectedly."))),
+    }
 }
 
 fn newer(candidate: &str, current: &str) -> bool {
@@ -213,10 +260,140 @@ fn newer(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::newer;
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn a_streamed_download_is_staged_only_when_its_digest_matches() {
+        let payload = b"abc".to_vec();
+        let digest = "00".repeat(32);
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let staged = stream_verified(Cursor::new(&payload), expected).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), payload);
+        std::fs::remove_file(&staged).unwrap();
+
+        let error = stream_verified(Cursor::new(&payload), &digest).unwrap_err();
+        assert!(error.contains("SHA-256"), "{error}");
+    }
+
     #[test]
     fn compares_release_versions() {
         assert!(newer("v0.4.2", "0.4.1"));
         assert!(!newer("v0.4.1", "0.4.1"));
+    }
+
+    fn api(digest: Option<&str>, name: &str, url: &str) -> ApiRelease {
+        ApiRelease {
+            tag_name: "v0.7.0".into(),
+            html_url: "https://github.com/AikasAcc/rust-player/releases/tag/v0.7.0".into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![ApiAsset {
+                name: name.into(),
+                browser_download_url: url.into(),
+                digest: digest.map(str::to_owned),
+            }],
+        }
+    }
+
+    fn valid_api() -> ApiRelease {
+        api(
+            Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "Rust-Player-v0.7.0-Windows-x64.exe",
+            "https://github.com/AikasAcc/rust-player/releases/download/v0.7.0/Rust-Player-v0.7.0-Windows-x64.exe",
+        )
+    }
+
+    #[test]
+    fn a_valid_release_is_accepted_with_a_normalized_digest() {
+        let release = release_from(valid_api(), "0.6.0").unwrap().unwrap();
+        assert_eq!(release.version, "v0.7.0");
+        assert_eq!(
+            release.sha256,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert!(release.download_url.ends_with("Windows-x64.exe"));
+    }
+
+    #[test]
+    fn drafts_prereleases_and_older_tags_are_skipped() {
+        let mut candidate = valid_api();
+        candidate.draft = true;
+        assert!(release_from(candidate, "0.6.0").unwrap().is_none());
+        let mut candidate = valid_api();
+        candidate.prerelease = true;
+        assert!(release_from(candidate, "0.6.0").unwrap().is_none());
+        assert!(release_from(valid_api(), "0.7.0").unwrap().is_none());
+    }
+
+    #[test]
+    fn wrong_asset_name_url_or_digest_is_rejected() {
+        let expected_name = "Rust-Player-v0.7.0-Windows-x64.exe";
+        let expected_url = "https://github.com/AikasAcc/rust-player/releases/download/v0.7.0/Rust-Player-v0.7.0-Windows-x64.exe";
+        let candidate = api(None, "wrong.exe", expected_url);
+        assert!(
+            release_from(candidate, "0.6.0")
+                .unwrap_err()
+                .contains("updater asset")
+        );
+        let candidate = api(None, expected_name, "https://evil.example/update.exe");
+        assert!(
+            release_from(candidate, "0.6.0")
+                .unwrap_err()
+                .contains("URL")
+        );
+        for digest in [
+            None,
+            Some("deadbeef"),
+            Some("sha256:zz00000000000000000000000000000000000000000000000000000000000000"),
+        ] {
+            let candidate = api(digest, expected_name, expected_url);
+            assert!(
+                release_from(candidate, "0.6.0")
+                    .unwrap_err()
+                    .contains("SHA-256")
+            );
+        }
+    }
+
+    #[test]
+    fn a_staged_download_survives_the_state_transition() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let mut state = State::Ready((file.into_temp_path(), "digest".into()));
+        let (staged, digest) = staged_download(&mut state).unwrap();
+        assert_eq!(staged, path);
+        assert_eq!(digest, "digest");
+        assert!(staged.is_file(), "the updater's source must not vanish");
+        assert!(matches!(state, State::Idle));
+        std::fs::remove_file(staged).unwrap();
+
+        let mut idle = State::Idle;
+        assert!(staged_download(&mut idle).is_err());
+    }
+
+    #[test]
+    fn a_dead_worker_does_not_leave_the_ui_waiting() {
+        let ctx = egui::Context::default();
+        let (_, check) = mpsc::channel();
+        let mut state = State::Checking(check);
+        state.poll(&ctx);
+        assert!(matches!(state, State::Failed(message) if message.contains("Update check")));
+
+        let (_, download) = mpsc::channel();
+        let mut state = State::Downloading(download);
+        state.poll(&ctx);
+        assert!(matches!(state, State::Failed(message) if message.contains("Update download")));
+    }
+
+    #[test]
+    fn an_empty_channel_keeps_waiting() {
+        let ctx = egui::Context::default();
+        let (sender, check) = mpsc::channel();
+        let mut state = State::Checking(check);
+        state.poll(&ctx);
+        assert!(matches!(state, State::Checking(_)));
+        drop(sender);
     }
 }

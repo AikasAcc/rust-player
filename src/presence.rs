@@ -45,11 +45,25 @@ impl Presence {
     }
 
     pub fn update(&self, id: Option<String>, activity: Option<Activity>) {
-        let _ = self.tx.send(Update {
-            id,
-            activity,
-            sent_at: SystemTime::now(),
-        });
+        if self
+            .tx
+            .send(Update {
+                id,
+                activity,
+                sent_at: SystemTime::now(),
+            })
+            .is_err()
+        {
+            worker_stopped(&self.status);
+        }
+    }
+}
+
+/// Without this the UI would keep showing the last successful Discord status
+/// forever if the worker thread panicked.
+fn worker_stopped(status: &Arc<Mutex<String>>) {
+    if let Ok(mut status) = status.lock() {
+        *status = "Discord status worker stopped unexpectedly.".into();
     }
 }
 
@@ -85,33 +99,19 @@ fn run(rx: mpsc::Receiver<Update>, status: Arc<Mutex<String>>) {
                         connection = Some((id.clone(), Rpc::connect(id)?));
                     }
                     let (_, rpc) = connection.as_mut().expect("connection established");
-                    let mut rejected = false;
-                    for image in [&track.artwork, &track.fallback_artwork] {
-                        if image.is_empty() || (rejected && image == &track.artwork) {
-                            continue;
-                        }
+                    for (image, source) in artwork_attempts(track) {
                         match rpc.set_activity(payload(track, update.sent_at, image)) {
-                            Ok(()) => {
-                                return Ok(if rejected {
-                                    "Discord accepted the fallback artwork."
-                                } else {
-                                    "Discord accepted the activity with artwork."
-                                });
-                            }
-                            Err(RpcError::Rejected(_)) => rejected = true,
+                            Ok(reply) => return Ok(accepted(&reply, source)),
+                            Err(RpcError::Rejected(_)) => continue,
                             Err(error) => return Err(error),
                         }
                     }
-                    rpc.set_activity(payload(track, update.sent_at, ""))?;
-                    Ok(if rejected {
-                        "Discord rejected the artwork."
-                    } else {
-                        "Discord activity has no artwork URL or asset."
-                    })
+                    let reply = rpc.set_activity(payload(track, update.sent_at, ""))?;
+                    Ok(accepted(&reply, "no artwork"))
                 })();
                 current = Some(update);
                 match result {
-                    Ok(message) => message.into(),
+                    Ok(message) => message,
                     Err(error) => {
                         connection = None;
                         error.message()
@@ -175,7 +175,7 @@ impl Rpc {
         Ok(rpc)
     }
 
-    fn set_activity(&mut self, activity: Value) -> Result<(), RpcError> {
+    fn set_activity(&mut self, activity: Value) -> Result<Value, RpcError> {
         self.nonce += 1;
         let nonce = self.nonce.to_string();
         let request = json!({
@@ -198,7 +198,7 @@ impl Rpc {
         Ok(())
     }
 
-    fn wait_for(&mut self, matches: impl Fn(&Value) -> bool) -> Result<(), RpcError> {
+    fn wait_for(&mut self, matches: impl Fn(&Value) -> bool) -> Result<Value, RpcError> {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let mut header = [0; 8];
@@ -224,7 +224,7 @@ impl Rpc {
                 return Err(RpcError::Rejected(text.chars().take(200).collect()));
             }
             if opcode == 1 && matches(&reply) {
-                return Ok(());
+                return Ok(reply);
             }
         }
     }
@@ -286,6 +286,35 @@ fn payload(track: &Activity, sent_at: SystemTime, artwork: &str) -> Value {
     activity
 }
 
+/// Artwork sources in priority order. The label follows the URL actually sent,
+/// so an accepted fallback is never reported as primary artwork. An identical
+/// fallback is skipped: retrying the same URL cannot help.
+fn artwork_attempts(activity: &Activity) -> Vec<(&str, &'static str)> {
+    let mut attempts = Vec::new();
+    if !activity.artwork.is_empty() {
+        attempts.push((activity.artwork.as_str(), "artwork"));
+    }
+    if !activity.fallback_artwork.is_empty() && activity.fallback_artwork != activity.artwork {
+        attempts.push((activity.fallback_artwork.as_str(), "fallback artwork"));
+    }
+    attempts
+}
+
+fn accepted(reply: &Value, source: &str) -> String {
+    let buttons: Vec<&str> = reply["data"]["buttons"]
+        .as_array()
+        .map(|buttons| buttons.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if buttons.is_empty() {
+        format!("Discord accepted the activity with {source}.")
+    } else {
+        format!(
+            "Discord accepted the activity with {source}; button: {}.",
+            buttons.join(", ")
+        )
+    }
+}
+
 fn text(value: &str) -> String {
     let mut output = String::new();
     for character in value.trim().chars().filter(|ch| !ch.is_control()) {
@@ -301,4 +330,131 @@ fn text(value: &str) -> String {
         output.push(' ');
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dead_presence_worker_is_visible_in_the_status() {
+        let status = Arc::new(Mutex::new("Sharing is off".to_owned()));
+        worker_stopped(&status);
+        assert!(status.lock().unwrap().contains("stopped unexpectedly"));
+    }
+
+    #[test]
+    fn artwork_source_labels_match_the_url_actually_sent() {
+        let mut track = Activity {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            artwork: String::new(),
+            fallback_artwork: "cover".into(),
+            elapsed: Duration::ZERO,
+            duration: None,
+        };
+        assert_eq!(
+            artwork_attempts(&track),
+            vec![("cover", "fallback artwork")]
+        );
+
+        track.artwork.push_str("cover");
+        assert_eq!(artwork_attempts(&track), vec![("cover", "artwork")]);
+
+        track.fallback_artwork.push_str("-small");
+        assert_eq!(
+            artwork_attempts(&track),
+            vec![("cover", "artwork"), ("cover-small", "fallback artwork")]
+        );
+    }
+
+    #[test]
+    fn activity_exposes_the_github_project_button() {
+        let track = Activity {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            artwork: "cover".into(),
+            fallback_artwork: String::new(),
+            elapsed: Duration::from_secs(5),
+            duration: Some(Duration::from_secs(200)),
+        };
+        let value = payload(&track, SystemTime::now(), "cover");
+        assert_eq!(value["buttons"][0]["label"], "Rust Player on GitHub");
+        assert_eq!(value["buttons"][0]["url"], PROJECT_URL);
+    }
+
+    fn sample(artist: &str, album: &str, duration: Option<Duration>) -> Activity {
+        Activity {
+            title: "Song".into(),
+            artist: artist.into(),
+            album: album.into(),
+            artwork: String::new(),
+            fallback_artwork: String::new(),
+            elapsed: Duration::from_secs(30),
+            duration,
+        }
+    }
+
+    #[test]
+    fn timestamps_use_elapsed_time_and_omit_end_when_duration_is_unknown() {
+        let sent = UNIX_EPOCH + Duration::from_secs(1_000);
+        let value = payload(
+            &sample("Artist", "Album", Some(Duration::from_secs(200))),
+            sent,
+            "",
+        );
+        assert_eq!(value["timestamps"]["start"], 970);
+        assert_eq!(value["timestamps"]["end"], 1_170);
+        assert!(value["assets"].is_null());
+
+        let value = payload(&sample("Artist", "Album", None), sent, "");
+        assert_eq!(value["timestamps"]["start"], 970);
+        assert!(value["timestamps"].get("end").is_none());
+    }
+
+    #[test]
+    fn text_strips_controls_truncates_bytes_and_fills_empty_fields() {
+        assert_eq!(text("  So\u{1b}ng  "), "Song");
+        assert_eq!(text("   "), "Unknown");
+        assert_eq!(text("x"), "x ");
+        assert_eq!(text(&"é".repeat(100)).len(), 128);
+    }
+
+    #[test]
+    fn missing_tags_still_produce_a_valid_activity() {
+        let value = payload(&sample("", "", None), UNIX_EPOCH, "cover");
+        assert_eq!(value["state"], "Unknown artist");
+        assert_eq!(value["assets"]["large_image"], "cover");
+        assert_eq!(value["assets"]["large_text"], "Song");
+    }
+
+    #[test]
+    fn artwork_urls_must_be_public_https_links() {
+        assert!(public_artwork_url("https://example.com/cover.jpg?size=600"));
+        assert!(!public_artwork_url("http://example.com/cover.jpg"));
+        assert!(!public_artwork_url(
+            "https://user:pass@example.com/cover.jpg"
+        ));
+        assert!(!public_artwork_url("https://example.com/my cover.jpg"));
+        assert!(!public_artwork_url("https://example.com/cover.jpg#part"));
+        assert!(!public_artwork_url(&format!(
+            "https://example.com/{}",
+            "a".repeat(300)
+        )));
+    }
+
+    #[test]
+    fn accepted_reply_reports_the_button_discord_stored() {
+        let reply = json!({"data": {"buttons": ["Rust Player on GitHub"]}});
+        assert_eq!(
+            accepted(&reply, "artwork"),
+            "Discord accepted the activity with artwork; button: Rust Player on GitHub."
+        );
+        assert_eq!(
+            accepted(&json!({"data": {}}), "no artwork"),
+            "Discord accepted the activity with no artwork."
+        );
+    }
 }

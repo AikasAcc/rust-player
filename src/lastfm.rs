@@ -119,6 +119,10 @@ impl Track {
     }
 }
 
+fn love_method(loved: bool) -> &'static str {
+    if loved { "track.love" } else { "track.unlove" }
+}
+
 fn valid_mbid(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(index, byte)| match index {
@@ -164,6 +168,13 @@ enum Command {
         track: Track,
     },
     Scrobble(u64, Play),
+    Love {
+        epoch: u64,
+        track_id: u64,
+        expires: Instant,
+        track: Track,
+        loved: bool,
+    },
 }
 
 enum Event {
@@ -273,6 +284,26 @@ impl Client {
 
     pub fn track_changed(&self) {
         self.sharing.track_id.fetch_add(1, Relaxed);
+    }
+
+    pub fn connected(&self) -> bool {
+        self.name.is_some()
+    }
+
+    /// Send an explicit Love/Unlove for the current track. The generation and
+    /// track ID stop a late click from loving a different song.
+    pub fn love(&mut self, media: &Media, duration: Option<Duration>, loved: bool) {
+        if !self.sharing.enabled.load(Relaxed) || self.name.is_none() {
+            self.status = "Connect to Last.fm and enable sharing first.".into();
+            return;
+        }
+        self.send(Command::Love {
+            epoch: self.sharing.epoch.load(Relaxed),
+            track_id: self.sharing.track_id.load(Relaxed),
+            expires: Instant::now() + RETRY,
+            track: Track::from_media(media, duration),
+            loved,
+        });
     }
 
     fn send(&mut self, command: Command) {
@@ -773,6 +804,36 @@ fn worker(
                     notify(Event::Submission(error.status));
                 }
             }
+            Command::Love {
+                epoch,
+                track_id,
+                expires,
+                track,
+                loved,
+            } => {
+                if !invalid_session
+                    && epoch == sharing.epoch.load(Relaxed)
+                    && track_id == sharing.track_id.load(Relaxed)
+                    && sharing.enabled.load(Relaxed)
+                    && Instant::now() <= expires
+                    && let Some(account) = &account
+                {
+                    match call(
+                        &agent,
+                        &account.keys,
+                        love_method(loved),
+                        track.fields(account),
+                        true,
+                    ) {
+                        Ok(_) => notify(Event::Submission(if loved {
+                            "Loved on Last.fm.".into()
+                        } else {
+                            "Removed love on Last.fm.".into()
+                        })),
+                        Err(error) => notify(Event::Submission(error.status)),
+                    }
+                }
+            }
         }
     }
 }
@@ -848,6 +909,12 @@ mod tests {
             signature(&fields, "test"),
             "7b6a23812065c960962335d59e756410"
         );
+    }
+
+    #[test]
+    fn love_and_unlove_use_distinct_api_methods() {
+        assert_eq!(love_method(true), "track.love");
+        assert_eq!(love_method(false), "track.unlove");
     }
 
     #[test]

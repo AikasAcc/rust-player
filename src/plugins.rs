@@ -109,12 +109,18 @@ impl Host {
         }
     }
 
+    // The plugin list can grow in the same frame that adds a config, before the
+    // host is reloaded. Indexing would panic while painting the plugin manager.
     pub fn status(&self, index: usize) -> &str {
-        &self.entries[index].status
+        self.entries
+            .get(index)
+            .map_or("", |entry| entry.status.as_str())
     }
 
     pub fn output(&self, index: usize) -> &str {
-        &self.entries[index].output
+        self.entries
+            .get(index)
+            .map_or("", |entry| entry.output.as_str())
     }
 }
 
@@ -138,4 +144,28 @@ fn compile(engine: &Engine, config: &PluginConfig) -> Result<AST, String> {
         return Err("Expected fn on_track(title, artist, album)".into());
     }
     Ok(ast)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_plugin_host_reports_no_status_or_output() {
+        let host = Host::load(&[]);
+        assert_eq!(host.status(0), "");
+        assert_eq!(host.output(0), "");
+    }
+
+    #[test]
+    fn disabled_plugins_keep_their_status_without_reading_the_script() {
+        let configs = [PluginConfig {
+            path: PathBuf::from("missing.rhai"),
+            enabled: false,
+        }];
+        let host = Host::load(&configs);
+        assert_eq!(host.status(0), "Disabled");
+        assert_eq!(host.status(1), "");
+        assert_eq!(host.output(0), "");
+    }
 }
