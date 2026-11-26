@@ -22,11 +22,11 @@ The scripts in `scripts/` deliberately stop at the package boundary.
 
 ## Current release state
 
-- Stable: **v0.6.0**, `prerelease = false`, tag `v0.6.0` from the committed worktree on branch `ai/rust-player-improvements`.
-- Previous stable: **v0.5.0**.
+- Stable: **v0.6.1**, `prerelease = false`, tag `v0.6.1` from the committed worktree on branch `ai/rust-player-improvements`.
+- Previous stable: **v0.6.0**, `prerelease = false`, tag `v0.6.0` at commit `d9b7ffd5f79815f6fa3f099f7e0bc6ae8000cdc6`. It remains unchanged.
 - Superseded preview: **v0.6.0-rc1**, `prerelease = true`, tag `v0.6.0-rc1` at commit `f0e05adca0b405af7e9012956fa34be155b56633`. It remains unchanged.
-- Stable ZIP SHA-256: `6f2bed58ce6d8ff3fd986cb3a33ca205da4a07a6177dae48e294c91a151f5e03`.
-- The work after `f0e05ad` is included in `v0.6.0`: identity cleanup, backup fix, benchmark tooling, parity features, MP1/MP2, ADPCM, MKA/MKV, Monkey's Audio, DSD-to-PCM, ReplayGain, tag editor, bit-perfect preset, WavPack and the hardware verification guide.
+- Stable ZIP SHA-256: `e11e1247c60eb2ebd0c3e6677a89db117d4be44381aa5d71b22212957f71621f`.
+- The work after `f0e05ad` is included in `v0.6.0`: identity cleanup, backup fix, benchmark tooling, parity features, MP1/MP2, ADPCM, MKA/MKV, Monkey's Audio, DSD-to-PCM, ReplayGain, tag editor, bit-perfect preset, WavPack and the hardware verification guide. The facet filter fixes are included in `v0.6.1`.
 
 ## Prepare a release
 

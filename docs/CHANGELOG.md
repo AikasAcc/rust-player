@@ -1,6 +1,8 @@
-# Rust Player v0.6.0 – What's New
+# Rust Player v0.6.1 – What's New
 
-This is the stable **v0.6.0** release. It succeeds the preview `v0.6.0-rc1` and the previous stable `v0.5.0`. All automated build, lint and regression checks passed. Hardware bit-perfect capture and listening checks are described in `docs/HARDWARE-VERIFICATION.md` and are performed by the maintainer; the audio signal path itself is unchanged.
+This is the stable **v0.6.1** patch release. It succeeds **v0.6.0** without changing the audio signal path. All automated build, lint and regression checks passed. Hardware bit-perfect capture and listening checks are described in `docs/HARDWARE-VERIFICATION.md` and are performed by the maintainer.
+
+**Facet filter fixes:** The facet bar now has an **All filters** button. It expands every cached Artist, Album, Genre and Year value into a scrollable, wrapped panel instead of showing only the six most frequent values of each kind. The compact bar is horizontally scrollable with the mouse wheel (no Shift required). Clicking an already active chip reliably removes its filter, including when two filters are active and the values contain spaces. The published `v0.6.0` release is left unchanged.
 
 ## In Short
 

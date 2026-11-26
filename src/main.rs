@@ -820,6 +820,7 @@ struct Player {
     cached_favorite: Option<(TrackId, bool)>,
     search_deadline: Option<Instant>,
     facets: Option<FacetCache>,
+    facets_expanded: bool,
     dialogs: Dialogs,
     indexer: metadata_cache::Indexer,
     save_worker: save_worker::SaveWorker,
@@ -973,6 +974,7 @@ impl Player {
             cached_favorite: None,
             search_deadline: None,
             facets: None,
+            facets_expanded: false,
             background: background::Preview::default(),
             indexer: metadata_cache::Indexer::new(
                 library_path.with_file_name("metadata-cache.json"),

@@ -103,38 +103,76 @@ impl Player {
             let view = self.views.get(&list);
             if self.facets.as_ref().is_none_or(|cache| cache.list != list) {
                 let values = view
-                    .map(|view| search::collect_facets(&view.tracks, 6))
+                    .map(|view| search::collect_facets(&view.tracks, usize::MAX))
                     .unwrap_or_default();
                 self.facets = Some(FacetCache { list, values });
             }
-            let toggled = self.facets.as_ref().and_then(|cache| {
-                if cache.values.is_empty() {
-                    return None;
-                }
-                let mut toggled = None;
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for facet in &cache.values {
-                            let clause = facet.clause();
-                            let active = self.track_search.contains(&clause);
-                            let label = format!(
-                                "{}: {} · {}",
-                                facet.kind.label(),
-                                facet.value,
-                                facet.count
-                            );
-                            if ui
-                                .selectable_label(active, label)
-                                .on_hover_text(format!("Filter: {clause}"))
-                                .clicked()
-                            {
-                                toggled = Some((facet.kind.field(), facet.value.clone()));
-                            }
-                        }
-                    });
+            let mut toggled = None;
+            let mut expand = None;
+            if let Some(cache) = self
+                .facets
+                .as_ref()
+                .filter(|cache| !cache.values.is_empty())
+            {
+                ui.horizontal(|ui| {
+                    let label = if self.facets_expanded {
+                        "Hide all filters"
+                    } else {
+                        "All filters"
+                    };
+                    if ui.small_button(label).clicked() {
+                        expand = Some(!self.facets_expanded);
+                    }
+                    ui.weak(format!("{} filter values", cache.values.len()));
                 });
-                toggled
-            });
+                let mut shown = [0usize; search::FacetKind::ALL.len()];
+                // Only one axis is enabled here, so let a normal mouse wheel
+                // move the row sideways instead of requiring Shift + wheel.
+                ui.scope(|ui| {
+                    ui.style_mut().always_scroll_the_only_direction = true;
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .max_height(26.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for facet in &cache.values {
+                                    let slot = facet.kind.index();
+                                    if shown[slot] >= 6 {
+                                        continue;
+                                    }
+                                    shown[slot] += 1;
+                                    if facet_chip(ui, facet, &self.track_search) {
+                                        toggled = Some((facet.kind.field(), facet.value.clone()));
+                                    }
+                                }
+                            });
+                        });
+                });
+                if self.facets_expanded {
+                    egui::ScrollArea::vertical()
+                        .id_salt("all-facet-filters")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for kind in search::FacetKind::ALL {
+                                ui.add_space(2.0);
+                                ui.label(RichText::new(kind.label()).small().strong());
+                                ui.horizontal_wrapped(|ui| {
+                                    for facet in
+                                        cache.values.iter().filter(|facet| facet.kind == kind)
+                                    {
+                                        if facet_chip(ui, facet, &self.track_search) {
+                                            toggled =
+                                                Some((facet.kind.field(), facet.value.clone()));
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                }
+            }
+            if let Some(value) = expand {
+                self.facets_expanded = value;
+            }
             if let Some((field, value)) = toggled {
                 self.track_search = search::toggle_clause(&self.track_search, field, &value);
             }
@@ -459,6 +497,17 @@ impl Player {
             }
         });
     }
+}
+
+/// One clickable filter chip. Clicking an already active chip removes its
+/// clause from the search query again.
+fn facet_chip(ui: &mut egui::Ui, facet: &search::Facet, query: &str) -> bool {
+    let clause = facet.clause();
+    let active = search::query_has_clause(query, facet.kind.field(), &facet.value);
+    let label = format!("{}: {} · {}", facet.kind.label(), facet.value, facet.count);
+    ui.selectable_label(active, label)
+        .on_hover_text(format!("Filter: {clause}\nClick again to remove"))
+        .clicked()
 }
 
 /// Resolve a visible row to a playlist index. `None` means an album header or

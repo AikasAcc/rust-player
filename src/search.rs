@@ -42,7 +42,12 @@ fn tokens(input: &str) -> Vec<String> {
     let mut quoted = false;
     for character in input.chars() {
         match character {
-            '"' => quoted = !quoted,
+            '"' => {
+                // Keep the quote in the token so toggle_clause can rebuild the
+                // query without breaking multi-word values already in it.
+                current.push(character);
+                quoted = !quoted;
+            }
             character if character.is_whitespace() && !quoted => {
                 if !current.is_empty() {
                     result.push(std::mem::take(&mut current));
@@ -187,6 +192,16 @@ impl FacetKind {
         }
     }
 
+    /// Stable slot for per-kind limits in the facet UI.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Artist => 0,
+            Self::Album => 1,
+            Self::Genre => 2,
+            Self::Year => 3,
+        }
+    }
+
     fn values(self, track: &TrackInfo) -> Vec<String> {
         let one = |value: &str| {
             (!value.trim().is_empty())
@@ -227,6 +242,24 @@ fn clause(field: &str, value: &str) -> String {
     }
 }
 
+/// Compare a single query token with a positive field clause. Quoting and
+/// letter case are ignored so a chip stays active when the same clause was
+/// typed by hand, and negative clauses are never mistaken for an active chip.
+fn token_matches_clause(token: &str, field: &str, value: &str) -> bool {
+    let (wanted_field, wanted_value, _) = parse_clause(&clause(field, value));
+    let (actual_field, actual_value, negated) = parse_clause(token);
+    !negated
+        && actual_field == wanted_field
+        && actual_value.to_lowercase() == wanted_value.to_lowercase()
+}
+
+/// True when `query` already contains the positive clause for `field`/`value`.
+pub fn query_has_clause(query: &str, field: &str, value: &str) -> bool {
+    tokens(query)
+        .iter()
+        .any(|token| token_matches_clause(token, field, value))
+}
+
 /// Most frequent values per facet, counted from indexed playlist metadata.
 pub fn collect_facets(tracks: &[TrackInfo], per_kind: usize) -> Vec<Facet> {
     use std::collections::HashMap;
@@ -259,16 +292,15 @@ pub fn collect_facets(tracks: &[TrackInfo], per_kind: usize) -> Vec<Facet> {
 
 /// Add or remove one facet clause while preserving the rest of the query.
 pub fn toggle_clause(query: &str, field: &str, value: &str) -> String {
-    let needle = clause(field, value);
     let mut existing = tokens(query);
     if let Some(position) = existing
         .iter()
-        .position(|token| token.eq_ignore_ascii_case(&needle))
+        .position(|token| token_matches_clause(token, field, value))
     {
         existing.remove(position);
         return existing.join(" ");
     }
-    existing.push(needle);
+    existing.push(clause(field, value));
     existing.join(" ")
 }
 
@@ -384,5 +416,44 @@ mod tests {
         assert_eq!(query, "title:help");
         let query = toggle_clause("", "artist", "The Beatles");
         assert_eq!(query, "artist:\"The Beatles\"");
+    }
+
+    #[test]
+    fn active_facet_is_found_ignoring_case_and_quoting() {
+        assert!(query_has_clause(
+            "artist:\"the beatles\"",
+            "artist",
+            "The Beatles"
+        ));
+        assert!(query_has_clause("genre:jazz OR year:1959", "genre", "Jazz"));
+        assert!(!query_has_clause("-artist:beatles", "artist", "Beatles"));
+        assert!(!query_has_clause("album:beatles", "artist", "Beatles"));
+        assert_eq!(
+            toggle_clause("title:help ARTIST:\"the beatles\"", "artist", "The Beatles"),
+            "title:help"
+        );
+        assert_eq!(
+            toggle_clause("-artist:beatles", "artist", "Beatles"),
+            "-artist:beatles artist:Beatles"
+        );
+    }
+
+    #[test]
+    fn two_active_facets_can_be_removed_individually() {
+        let mut query = toggle_clause("", "artist", "The Beatles");
+        query = toggle_clause(&query, "album", "Help!");
+        assert_eq!(query, "artist:\"The Beatles\" album:Help!");
+        assert!(query_has_clause(&query, "artist", "The Beatles"));
+        assert!(query_has_clause(&query, "album", "Help!"));
+
+        query = toggle_clause(&query, "artist", "The Beatles");
+        assert_eq!(query, "album:Help!");
+        assert!(!query_has_clause(&query, "artist", "The Beatles"));
+        assert!(query_has_clause(&query, "album", "Help!"));
+
+        let mut quoted_album = toggle_clause("", "album", "The White Album");
+        quoted_album = toggle_clause(&quoted_album, "genre", "Rock");
+        assert_eq!(quoted_album, "album:\"The White Album\" genre:Rock");
+        assert!(query_has_clause(&quoted_album, "album", "The White Album"));
     }
 }

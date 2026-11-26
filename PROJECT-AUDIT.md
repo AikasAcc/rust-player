@@ -366,3 +366,38 @@ Auf ausdrückliche Anweisung des Nutzers wurde der Stand nach Abschnitt 16 als s
 - **Veröffentlichung:** Commit auf `ai/rust-player-improvements` gepusht, Tag `v0.6.0` erstellt und gepusht, GitHub-Release `https://github.com/AikasAcc/rust-player/releases/tag/v0.6.0` mit `prerelease = false` und den vier Assets veröffentlicht. `gh` ist in dieser Umgebung nicht installiert; die Veröffentlichung lief über die GitHub REST API mit einem Token aus dem lokalen Git Credential Manager. Kein Token wurde im Repository oder in Skripten gespeichert.
 - **Freigabe und Tabu:** Commit, Push, Tag und Release erfolgten ausschließlich auf die ausdrückliche Anweisung „pack die version als 0.6.0 auf github“ hin. `android/` und `phase5-complete.patch` wurden nicht committet, nicht gepusht und nicht veröffentlicht. Es gab keinen Merge, keinen Branchwechsel und keine Änderung an `v0.6.0-rc1`.
 - **Ehrliche Grenze:** Die automatisierten Prüfungen sind grün. Hardware-Bitperfektheit, digitale Loopbacks und Hörtests bleiben Aufgaben des Nutzers und sind in `docs/HARDWARE-VERIFICATION.md` beschrieben; sie wurden nicht simuliert oder behauptet.
+
+---
+
+## 18. Facetten-Filter nach `v0.6.0` nachgebessert
+
+Der Nutzer meldete, dass die Facetten-Leiste bei vielen Artists/Alben nur wenige Werte zeigt, nicht sichtbar scrollbar ist und ein erneuter Klick auf einen aktiven Chip den Filter nicht zuverlässig entfernt.
+
+- **Ursache:** `collect_facets(..., 6)` begrenzte jede Kategorie auf sechs Werte, und die Aktivprüfung nutzte einen einfachen Substring-Abgleich auf dem Suchtext. Bei abweichender Groß-/Kleinschreibung oder anderer Quotierung wurde ein Chip nicht als aktiv erkannt; ein zweiter Klick fügte die Klausel erneut hinzu statt sie zu entfernen.
+- **Änderung:** `src/search.rs` kennt jetzt `query_has_clause()` und einen gemeinsamen Token-Vergleich, der Feld, Wert, Groß-/Kleinschreibung und Quotierung normalisiert und negierte Klauseln nicht als aktiv markiert. `toggle_clause()` nutzt denselben Vergleich. `FacetKind::index()` erlaubt eine stabile Begrenzung der kompakten Leiste.
+- **UI:** `src/ui/playlist.rs` zeigt weiter eine kompakte, horizontal scrollbare Leiste mit den sechs häufigsten Werten je Kategorie. Der neue Knopf **All filters** klappt ein vertikal scrollbares, umbrechendes Panel mit **allen** gecachten Artist-, Album-, Genre- und Jahr-Werten auf. Jeder Chip zeigt im Tooltip, dass ein erneuter Klick den Filter entfernt. Der Expanded-Zustand liegt in `Player::facets_expanded`; die Facetten werden unverändert pro Playlist gecacht.
+- **Verifikation:** `cargo fmt --all`, `cargo clippy --release --locked --all-targets -- -D warnings` und `cargo test --release --locked` grün (**179 + 3 bestanden, 4 ignoriert**; neuer Test `active_facet_is_found_ignoring_case_and_quoting`). Frischer `cargo build --release --locked` in `rust-player-facets-final\target` grün; EXE-SHA-256 `EB2609D472C42C2D11536BF05A207C372F349D9105C4C2211DB4A6155F0C941C`.
+- **Deploy-Status:** Der Nutzer schloss den laufenden Player selbst; es wurde nichts gestoppt. Danach wurde der neue Build in beide aktiven Startpfade kopiert (Backup unter `rust-player-daily-backup-20261126-3`) und die Desktop-Ziel-EXE gestartet (PID `24136`). Alle drei EXEs haben identische SHA-256 `EB2609D472C42C2D11536BF05A207C372F349D9105C4C2211DB4A6155F0C941C`. Kein Commit, Push, Tag oder GitHub-Release für diese Nachbesserung; das veröffentlichte `v0.6.0` bleibt unverändert.
+
+---
+
+## 19. Zwei Facetten-Filter und Mausrad nachgebessert
+
+Der Nutzer meldete, dass sich bei zwei aktiven Schnellfiltern die einzelnen Chips nicht mehr abwählen ließen und dass die kompakte Leiste nicht mit dem Mausrad horizontal scrollte.
+
+- **Ursache:** `tokens()` entfernte die Anführungszeichen aus Klauseln. Beim Hinzufügen des zweiten Filters wurde der erste Filter daher ohne Quotes neu zusammengesetzt. Bei Werten mit Leerzeichen zerfiel er beim nächsten Parsen in mehrere Tokens, war nicht mehr als aktiv erkennbar und ein Klick fügte ihn erneut hinzu.
+- **Fix:** `tokens()` behält die Anführungszeichen im Token; `parse_clause()` entfernt sie weiterhin für den Vergleich. Damit bleibt die Query beim Umschalten mehrerer Filter korrekt quotiert. Neuer Regressionstest `two_active_facets_can_be_removed_individually`.
+- **Mausrad:** Die kompakte Facetten-Leiste setzt innerhalb eines `ui.scope` `always_scroll_the_only_direction = true`. Da nur die horizontale Achse aktiv ist, scrollt ein normales Mausrad jetzt seitwärts; `Shift` ist nicht nötig. Das expansive Panel bleibt vertikal scrollbar.
+- **Verifikation:** `cargo fmt --all`, `cargo clippy --release --locked --all-targets -- -D warnings` und `cargo test --release --locked` grün (**180 + 3 bestanden, 4 ignoriert**). Frischer `cargo build --release --locked` in `rust-player-facets-wheel-final\target` grün.
+- **Deploy:** Kein laufender Player beim Kopieren, es wurde nichts gestoppt. Neue EXE in beide Startpfade kopiert (Backup `rust-player-daily-backup-20261126-4`) und gestartet (PID `8020`). SHA-256 aller drei EXEs: `CE4BEEDAA36C0077C5C6DFFA97311F0ECE9CDE6466E97EFB914683F3023F3BE9`. Kein Commit, Push, Tag oder Release; GitHub `v0.6.0` unverändert.
+
+---
+
+## 20. Stabile Version v0.6.1 veröffentlicht
+
+Auf ausdrücklichen Wunsch des Nutzers wurden die Facetten-Fixes aus Abschnitt 18/19 als eigener stabiler Patch veröffentlicht. Ein bereits veröffentlichtes Tag wurde nicht verschoben; `v0.6.0`, `v0.6.0-rc1` und `v0.5.0` bleiben unverändert.
+
+- **Version:** `Cargo.toml` und `Cargo.lock` von `0.6.0` auf `0.6.1` angehoben, damit der Updater die neue Version meldet. Release-Texte und `docs/RELEASE-WORKFLOW.md` wurden auf `v0.6.1` umgestellt.
+- **Paket:** `scripts/package-release.ps1 -Version v0.6.1` grün inklusive `cargo fmt --check`, Clippy, Tests (**180 + 3 bestanden, 4 ignoriert**) und Release-Build. ZIP: `Rust-Player-v0.6.1-Windows-x64.zip`, SHA-256 `e11e1247c60eb2ebd0c3e6677a89db117d4be44381aa5d71b22212957f71621f`.
+- **Veröffentlichung:** Commit auf `ai/rust-player-improvements` gepusht, Tag `v0.6.1` erstellt und gepusht, GitHub-Release `https://github.com/AikasAcc/rust-player/releases/tag/v0.6.1` mit `prerelease = false` und den vier Assets veröffentlicht. Die Veröffentlichung lief erneut über die GitHub REST API mit einem Token aus dem lokalen Git Credential Manager; `gh` ist nicht installiert.
+- **Tabu:** Kein Merge, kein Branchwechsel, kein Force-Push, kein Überschreiben von `v0.6.0`. `android/` und `phase5-complete.patch` wurden nicht committet oder veröffentlicht. Hardware- und Hörtests bleiben wie zuvor dokumentiert und wurden nicht simuliert.

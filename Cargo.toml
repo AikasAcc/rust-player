@@ -1,6 +1,6 @@
 [package]
 name = "rust-player"
-version = "0.6.0"
+version = "0.6.1"
 default-run = "rust-player"
 edition = "2024"
 license = "MIT"

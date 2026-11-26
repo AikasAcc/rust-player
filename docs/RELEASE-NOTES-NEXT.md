@@ -1,7 +1,8 @@
-# Rust Player v0.6.0 – What's New
+# Rust Player v0.6.1 – What's New
 
-This stable release makes the library, favorites, and playback significantly more robust.
-New audio formats and a hardware verification guide are included. Your files stay where they are.
+This stable patch release fixes the facet quick filters from **v0.6.0**. Your files stay where they are and the audio path is unchanged.
+
+**Facet filter fixes:** **All filters** next to the facet bar expands every cached Artist, Album, Genre and Year value in a scrollable, wrapped panel. The compact bar scrolls left and right with the mouse wheel. Clicking an active chip again removes that filter, even when two filters are active or a value contains spaces. The published `v0.6.0` release is left unchanged.
 
 ---
 

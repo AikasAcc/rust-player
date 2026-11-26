@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "rust-player"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "ape-decoder",
  "bs1770",
