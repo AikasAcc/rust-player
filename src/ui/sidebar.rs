@@ -50,6 +50,17 @@ impl Player {
                             name: String::new(),
                         });
                     }
+                    if ui
+                        .small_button("Smart")
+                        .on_hover_text("New smart playlist from a saved query")
+                        .clicked()
+                    {
+                        self.dialogs.playlist_dialog = Some(PlaylistDialog::Smart {
+                            target: None,
+                            name: String::new(),
+                            query: String::new(),
+                        });
+                    }
                 });
                 let mut selected = self.library.selected;
                 ui.horizontal_wrapped(|ui| {
@@ -157,6 +168,24 @@ impl Player {
                                     ui.close();
                                 }
                                 ui.separator();
+                            }
+                            if list.smart_query.is_some() {
+                                if ui.button("Edit smart query").clicked() {
+                                    action = Some((index, PlaylistAction::EditSmartQuery));
+                                    ui.close();
+                                }
+                                if ui.button("Refresh from query").clicked() {
+                                    action = Some((index, PlaylistAction::RefreshSmart));
+                                    ui.close();
+                                }
+                                if ui.button("Make normal playlist").clicked() {
+                                    action = Some((index, PlaylistAction::MakeNormal));
+                                    ui.close();
+                                }
+                                ui.separator();
+                            } else if ui.button("Make smart playlist").clicked() {
+                                action = Some((index, PlaylistAction::EditSmartQuery));
+                                ui.close();
                             }
                             for (label, item) in [
                                 ("Rename", PlaylistAction::Rename),

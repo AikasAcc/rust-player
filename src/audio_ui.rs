@@ -8,6 +8,24 @@ use crate::{
 use eframe::egui;
 use std::time::{Duration, Instant};
 
+/// Settings that keep the decoded PCM unchanged all the way to the WASAPI
+/// endpoint. Format conversion and resampling stay off; if the device cannot
+/// accept the source format, playback fails instead of silently processing it.
+fn bit_perfect_options() -> crate::audio::OutputOptions {
+    crate::audio::OutputOptions {
+        mode: OutputMode::Exclusive,
+        convert_exclusive: false,
+        fallback_shared: false,
+        software_gain: false,
+        transition_fades: false,
+        replay_gain: crate::audio::replaygain::Settings::default(),
+        verify_flac: false,
+        reject_downmix: true,
+        resampler: ResamplerQuality::Maximum,
+        effects_requested: false,
+    }
+}
+
 impl Player {
     pub(super) fn output_request(&self) -> OutputRequest {
         OutputRequest {
@@ -30,6 +48,16 @@ impl Player {
                     || self.library.audio_output.software_gain,
                 |output| output.software_gain,
             )
+    }
+
+    pub(super) fn apply_bit_perfect_preset(&mut self, ctx: &egui::Context) {
+        self.library.audio_output = bit_perfect_options();
+        self.library.audio_dsp = Default::default();
+        self.status =
+            "Bit-perfect preset applied. Use hardware volume; verify with a loopback capture."
+                .into();
+        self.save();
+        self.reopen_audio(ctx, true);
     }
 
     pub(super) fn update_audio(&mut self, ctx: &egui::Context) {
@@ -108,16 +136,28 @@ impl Player {
             }
             Err(error) => self.status = format!("Could not reopen the audio output: {error}"),
         }
+        // Reopening can emit the same text twice in a row; restart the fade so
+        // the second event is visible for its full lifetime.
+        self.status_timer.arm(&self.status);
         self.sync_presence();
     }
 
     pub(super) fn audio_settings(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Audio setup and PCM check").clicked() {
-            self.setup.open(
-                self.library.audio_device.clone(),
-                self.library.audio_output.mode,
-            );
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Audio setup and PCM check").clicked() {
+                self.setup.open(
+                    self.library.audio_device.clone(),
+                    self.library.audio_output.mode,
+                );
+            }
+            if ui
+                .button("Apply bit-perfect preset")
+                .on_hover_text("WASAPI Exclusive with no conversion, DSP, ReplayGain, fades, or software volume. Hardware verification still needs a digital loopback capture.")
+                .clicked()
+            {
+                self.apply_bit_perfect_preset(ui.ctx());
+            }
+        });
         let mut selected = self.library.audio_device.clone();
         let mut options = self.library.audio_output;
         if let Some(monitor) = &self.audio_devices {
@@ -449,5 +489,25 @@ fn mode_label(mode: OutputMode) -> &'static str {
     match mode {
         OutputMode::Shared => "WASAPI Shared",
         OutputMode::Exclusive => "WASAPI Exclusive",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bit_perfect_preset_bypasses_every_pcm_stage() {
+        let options = bit_perfect_options();
+        assert_eq!(options.mode, OutputMode::Exclusive);
+        assert!(!options.convert_exclusive);
+        assert!(!options.fallback_shared);
+        assert!(!options.software_gain);
+        assert!(!options.transition_fades);
+        assert!(!options.replay_gain.enabled());
+        assert!(options.reject_downmix);
+        assert!(!options.effects_requested);
+        assert_eq!(options.resampler, ResamplerQuality::Maximum);
+        assert!(!crate::audio::dsp::Settings::default().active());
     }
 }

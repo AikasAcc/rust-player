@@ -12,7 +12,7 @@ Starting with v0.5.0, keep the updater helper alongside the player. Open **Setti
 
 To build from source, run `cargo build --release --locked` with a current Rust toolchain. Use `cargo run --locked` for a development run. For repeatable checks, `scripts/run-benchmarks.ps1` archives benchmark data and `scripts/run-frame-log.ps1` records an opt-in UI frame-time session; neither stops an already running player.
 
-Building from source requires the Windows SDK resource compiler with the MSVC toolchain, or MinGW-w64 `windres` and `ar` on PATH with the GNU toolchain. The executable embeds the [Rust Player logo](assets/ATTRIBUTION.md) at 16 sizes. The app sets DPI-appropriate small and large window icons.
+Building from source requires the Windows SDK resource compiler with the MSVC toolchain, or MinGW-w64 `windres` and `ar` on PATH with the GNU toolchain. WavPack support additionally needs CMake and LLVM/libclang on PATH; `.cargo/config.toml` supplies the CMake policy level required by the bundled WavPack sources. The executable embeds the [Rust Player logo](assets/ATTRIBUTION.md) at 16 sizes. The app sets DPI-appropriate small and large window icons.
 
 ## Settings and media keys
 
@@ -28,7 +28,7 @@ If `library.json` cannot be read, Rust Player saves a copy as `library.invalid-*
 
 ## Audio output
 
-The player decodes MPEG audio (MP1/MP2/MP3), FLAC, WAV, Ogg Vorbis, AAC, M4A/ALAC, AIFF, and supported audio inside CAF, MKA and MKV. ADPCM inside WAV and CAF is supported as well; in MKV with video, Rust Player uses the first decodable audio track. WavPack, Monkey's Audio and DSD are currently unsupported. CAF, AIFF and MKV containers can also hold encodings the player cannot decode.
+The player decodes MPEG audio (MP1/MP2/MP3), FLAC, WAV, Ogg Vorbis, AAC, M4A/ALAC, AIFF, Monkey's Audio (`.ape`), WavPack (`.wv`), and supported audio inside CAF, MKA and MKV. ADPCM inside WAV and CAF is supported as well; in MKV with video, Rust Player uses the first decodable audio track. WavPack integer and float files seek normally; hybrid files decode the `.wv` part without an optional `.wvc` correction file, and DSD stored inside WavPack is not handled. DSF and DFF files play as DSD-to-PCM conversion (up to 96 kHz), not as native DSD or DoP. CAF, AIFF and MKV containers can also hold encodings the player cannot decode.
 
 Open or drop an external CUE sheet, whether it references one file or several, to add its tracks with their `INDEX 01` boundaries and titles. A CUE sheet embedded as text in a FLAC file is recognized as well. Each track keeps its own source file; the last track of a file plays to that file's end. The CUE sheet and its source files stay on disk. Rust Player can re-import its own M3U8 exports containing these entries. Other players can open the original CUE sheet.
 
@@ -44,7 +44,7 @@ Choose **Windows default** or a specific endpoint in **Settings → Audio**. A s
 
 **Settings → Audio → Signal path** shows each processing stage, its status, and its PCM format, from the decoder through ReplayGain, channel mapping, resampling, volume and dither to WASAPI and the selected device. It also shows buffer size and underruns. The player reports **Bit-perfect PCM at the Windows driver input** during direct Exclusive playback with the original samples, rate and channel layout. Lossless integer padding preserves the sample values. A digital capture is needed to verify the hardware path.
 
-**Audio setup and PCM check** lists the shared mix format and driver-reported stereo Exclusive rates and bit depths. You can play a quiet half-second test tone, apply the selected endpoint and mode, or verify the generated PCM against the bytes written by the software FileBackend. The PCM hash tests the software path. See [hardware loopback testing](docs/TESTING.md#exclusive-playback) for end-to-end verification.
+**Audio setup and PCM check** lists the shared mix format and driver-reported stereo Exclusive rates and bit depths. You can play a quiet half-second test tone, apply the selected endpoint and mode, or verify the generated PCM against the bytes written by the software FileBackend. The PCM hash tests the software path. See [hardware loopback testing](docs/TESTING.md#exclusive-playback) and the [hardware verification workflow](docs/HARDWARE-VERIFICATION.md) for capture procedures and the limits of each method.
 
 **Settings → Audio → DSP** offers AutoEQ parametric profile import, mono or stereo WAV FIR convolution, and stereo crossfeed. Effects are off by default. FIR is limited to 16,384 samples per channel at the output rate. Active DSP changes the PCM and disables the bit-perfect indicator.
 
@@ -137,7 +137,7 @@ Rust Player keeps a metadata cache beside those settings. It stores tags and CUE
 | Discord shows a placeholder | Enable artwork lookup or supply a public HTTPS cover URL or application asset. Check the lookup and RPC status in the Discord dialog. |
 | A background falls back to the theme color | Open **Theme Editor** to check the file path and decoder message. Background files are limited to 64 MiB. An animation can contain up to 600 frames and 48 MiB of decoded image data after resizing. |
 
-WavPack, Monkey's Audio, DSD/DoP, ASIO output, and video backgrounds are outside this build. CUE support covers external single-file and multi-file sheets plus embedded `CUESHEET` text in FLAC; a binary FLAC CUEDATA block is not read. See the [manual regression checklist](docs/TESTING.md), [release notes for the next version](docs/RELEASE-NOTES-NEXT.md), [release workflow (Windows PC only)](docs/RELEASE-WORKFLOW.md), and [completion report](docs/COMPLETION-REPORT.md).
+WavPack, native DSD/DoP, ASIO output, and video backgrounds are outside this build; DSF/DFF are decoded to PCM. CUE support covers external single-file and multi-file sheets plus embedded `CUESHEET` text in FLAC; a binary FLAC CUEDATA block is not read. See the [manual regression checklist](docs/TESTING.md), [release notes for the next version](docs/RELEASE-NOTES-NEXT.md), [release workflow (Windows PC only)](docs/RELEASE-WORKFLOW.md), and [completion report](docs/COMPLETION-REPORT.md).
 
 [![Star History Chart](https://api.star-history.com/svg?repos=AikasAcc/rust-player&type=Date)](https://star-history.com/#AikasAcc/rust-player&Date)
 

@@ -101,6 +101,43 @@ impl Player {
                 .unwrap_or(self.library.theme)
                 .album_colors();
             let view = self.views.get(&list);
+            if self.facets.as_ref().is_none_or(|cache| cache.list != list) {
+                let values = view
+                    .map(|view| search::collect_facets(&view.tracks, 6))
+                    .unwrap_or_default();
+                self.facets = Some(FacetCache { list, values });
+            }
+            let toggled = self.facets.as_ref().and_then(|cache| {
+                if cache.values.is_empty() {
+                    return None;
+                }
+                let mut toggled = None;
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for facet in &cache.values {
+                            let clause = facet.clause();
+                            let active = self.track_search.contains(&clause);
+                            let label = format!(
+                                "{}: {} · {}",
+                                facet.kind.label(),
+                                facet.value,
+                                facet.count
+                            );
+                            if ui
+                                .selectable_label(active, label)
+                                .on_hover_text(format!("Filter: {clause}"))
+                                .clicked()
+                            {
+                                toggled = Some((facet.kind.field(), facet.value.clone()));
+                            }
+                        }
+                    });
+                });
+                toggled
+            });
+            if let Some((field, value)) = toggled {
+                self.track_search = search::toggle_clause(&self.track_search, field, &value);
+            }
             let query = self.track_search.trim();
             if query.is_empty() {
                 self.search_results = None;
@@ -132,7 +169,8 @@ impl Player {
             let show_art = self.library.track_artwork;
             // Reordering is only meaningful in "Date added" order, and only
             // when the visible rows map one-to-one to stored playlist entries.
-            let can_reorder = playlist.sort == Sort::Added
+            let can_reorder = playlist.smart_query.is_none()
+                && playlist.sort == Sort::Added
                 && filtered_rows.is_none()
                 && view.is_none_or(|view| view.tracks.len() == playlist.tracks.len());
             let height = ui
@@ -142,6 +180,7 @@ impl Player {
                 .max(if show_art { 32.0 } else { 0.0 });
             let mut enqueue_many = None;
             let mut favorite_many = None;
+            let mut tag_many = None;
             let mut remove_many = None;
             playlist_columns(
                 ui,
@@ -321,6 +360,10 @@ impl Player {
                                 favorite_many = Some(targets.clone());
                                 ui.close();
                             }
+                            if ui.button(format!("Edit tags…{suffix}")).clicked() {
+                                tag_many = Some(targets.clone());
+                                ui.close();
+                            }
                             ui.separator();
                             if ui
                                 .add_enabled(
@@ -341,11 +384,13 @@ impl Player {
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button(format!("Remove from playlist{suffix}")).clicked() {
+                            if playlist.smart_query.is_none()
+                                && ui.button(format!("Remove from playlist{suffix}")).clicked()
+                            {
                                 remove_many = Some(targets.clone());
                                 ui.close();
                             }
-                            if playlist.sort == Sort::Added {
+                            if playlist.smart_query.is_none() && playlist.sort == Sort::Added {
                                 if ui
                                     .add_enabled(index > 0, egui::Button::new("Move up"))
                                     .clicked()
@@ -368,6 +413,12 @@ impl Player {
                     }
                 },
             );
+            let tag_paths = tag_many.map(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|&index| playlist.tracks.get(index).cloned())
+                    .collect::<Vec<_>>()
+            });
             if let Some(indices) = enqueue_many {
                 self.enqueue_tracks(list, &indices);
             }
@@ -379,6 +430,9 @@ impl Player {
                 for id in ids {
                     self.toggle_favorite_id(id);
                 }
+            }
+            if let Some(paths) = tag_paths {
+                self.open_tag_editor(paths);
             }
             if let Some(indices) = remove_many {
                 self.remove_tracks(list, &indices);

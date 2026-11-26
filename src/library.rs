@@ -10,7 +10,7 @@ use std::{
 
 /// Normalized key used by every path lookup. Components remove separator
 /// differences; Windows additionally ignores letter case.
-fn path_key(path: &Path) -> String {
+pub(crate) fn path_key(path: &Path) -> String {
     let mut value = String::new();
     for component in path.components() {
         value.push_str(&component.as_os_str().to_string_lossy());
@@ -60,7 +60,7 @@ pub fn timed_lyrics(text: &str) -> Vec<(Duration, String)> {
 
 pub const AUDIO: &[&str] = &[
     "mp3", "mp1", "mp2", "flac", "wav", "ogg", "m4a", "aac", "alac", "aiff", "aif", "aifc", "caf",
-    "mka", "mkv", "cue",
+    "mka", "mkv", "ape", "dsf", "dff", "wv", "cue",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -80,6 +80,10 @@ pub struct Playlist {
     pub sort: Sort,
     #[serde(default)]
     pub descending: bool,
+    /// Saved foobar-style query. When set, the playlist is recalculated from
+    /// the rest of the library instead of being edited track by track.
+    #[serde(default)]
+    pub smart_query: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +119,8 @@ pub struct TrackInfo {
     pub artist: String,
     pub album: String,
     pub album_artist: String,
+    pub genre: String,
+    pub year: Option<u16>,
     pub disc: Option<u32>,
     pub number: Option<u32>,
     pub duration: Option<Duration>,
@@ -127,6 +133,8 @@ impl TrackInfo {
             &self.artist,
             &self.album,
             &self.album_artist,
+            &self.genre,
+            &self.year.map_or_else(String::new, |year| year.to_string()),
             &file_title(path),
         ]
         .join("\0")
@@ -155,6 +163,54 @@ impl TrackInfo {
             title: file_title(path),
             ..Self::default()
         };
+        // Lofty cannot probe DSF/DFF; dsd-reader already parses their ID3 tag
+        // and the DSD header carries an exact duration.
+        if path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("dsf") || extension.eq_ignore_ascii_case("dff")
+        }) {
+            if let Some(tag) = crate::audio::dsd::metadata(path) {
+                if let Some(title) = tag.title.filter(|title| !title.trim().is_empty()) {
+                    info.title = title;
+                }
+                info.artist = tag.artist;
+                info.album = tag.album;
+                info.album_artist = if tag.album_artist.is_empty() {
+                    info.artist.clone()
+                } else {
+                    tag.album_artist
+                };
+                info.genre = tag.genre;
+                info.year = tag.year;
+                info.disc = tag.disc;
+                info.number = tag.number;
+            }
+            info.duration = crate::audio::container_duration(path);
+            return info;
+        }
+        // libwavpack reads APEv2 tags itself; lofty does not probe `.wv`.
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wv"))
+        {
+            if let Some(tag) = crate::audio::wavpack::metadata(path) {
+                if let Some(title) = tag.title.filter(|title| !title.trim().is_empty()) {
+                    info.title = title;
+                }
+                info.artist = tag.artist;
+                info.album = tag.album;
+                info.album_artist = if tag.album_artist.is_empty() {
+                    info.artist.clone()
+                } else {
+                    tag.album_artist
+                };
+                info.genre = tag.genre;
+                info.year = tag.year;
+                info.disc = tag.disc;
+                info.number = tag.number;
+            }
+            info.duration = crate::audio::container_duration(path);
+            return info;
+        }
         let options = lofty::config::ParseOptions::new().read_cover_art(false);
         let tagged = lofty::probe::Probe::open(path)
             .and_then(|probe| Ok(probe.guess_file_type()?))
@@ -174,6 +230,12 @@ impl TrackInfo {
                     .unwrap_or(&info.artist)
                     .trim()
                     .to_owned();
+                info.genre = tag
+                    .get_string(ItemKey::Genre)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                info.year = tag.date().map(|date| date.year).filter(|&year| year > 0);
                 info.disc = tag.disk().filter(|&disc| disc > 0);
                 info.number = tag.track().filter(|&number| number > 0);
             }
@@ -375,6 +437,7 @@ impl Default for Library {
                 sidebar_position: None,
                 sort: Sort::Album,
                 descending: false,
+                smart_query: None,
             }],
             selected: 0,
             shuffle: false,
@@ -588,6 +651,7 @@ impl Library {
             sidebar_position: None,
             sort: Sort::Album,
             descending: false,
+            smart_query: None,
         });
         self.favorites = Some(index);
         index
@@ -1327,6 +1391,7 @@ mod tests {
             sidebar_position: None,
             sort: Sort::Added,
             descending: false,
+            smart_query: None,
         });
 
         assert_eq!(library.unique_playlist_name("Favorites"), "Favorites (2)");

@@ -9,7 +9,7 @@ use std::{
     time::SystemTime,
 };
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct CueStamp {
@@ -124,7 +124,14 @@ impl Cache {
             return Ok((
                 Self {
                     version: CACHE_VERSION,
-                    ..cache
+                    // Old entries lack newer facet fields (genre, year); a
+                    // version bump forces a one-time rescan instead of showing
+                    // permanently empty facets.
+                    entries: if upgraded {
+                        HashMap::new()
+                    } else {
+                        cache.entries
+                    },
                 },
                 upgraded,
             ));
@@ -254,6 +261,31 @@ enum Job {
         ctx: eframe::egui::Context,
     },
     Paths(Vec<PathBuf>),
+}
+
+/// Read-only snapshot of cached metadata, used to evaluate saved smart-query
+/// playlists without re-reading tags on the UI thread. The indexer remains the
+/// sole owner of the cache file; this never rewrites or backs it up.
+pub fn cached_infos(file: &Path, paths: &[PathBuf]) -> HashMap<PathBuf, TrackInfo> {
+    let Ok(bytes) = fs::read(file) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return HashMap::new();
+    };
+    let entries_value = value.get("entries").unwrap_or(&value);
+    let Ok(entries) = serde_json::from_value::<HashMap<PathBuf, Entry>>(entries_value.clone())
+    else {
+        return HashMap::new();
+    };
+    paths
+        .iter()
+        .filter_map(|path| {
+            let mut info = entries.get(path)?.info.clone();
+            info.prepare_search(path);
+            Some((path.clone(), info))
+        })
+        .collect()
 }
 
 pub struct Indexer(mpsc::Sender<Job>);

@@ -22,10 +22,11 @@ The scripts in `scripts/` deliberately stop at the package boundary.
 
 ## Current release state
 
-- Stable: **v0.5.0**.
-- Preview: **v0.6.0-rc1**, `prerelease = true`, tag `v0.6.0-rc1` at commit `f0e05adca0b405af7e9012956fa34be155b56633`.
-- Preview ZIP SHA-256: `e5f36b2b27f7b0735ff270de49308960db0d6e0b2ca2367cfa078bbffc9f0a26`.
-- The worktree after `f0e05ad` contains further uncommitted changes (identity cleanup, backup fix, benchmark tooling). They must be committed with approval before any new tag or release is made.
+- Stable: **v0.6.0**, `prerelease = false`, tag `v0.6.0` from the committed worktree on branch `ai/rust-player-improvements`.
+- Previous stable: **v0.5.0**.
+- Superseded preview: **v0.6.0-rc1**, `prerelease = true`, tag `v0.6.0-rc1` at commit `f0e05adca0b405af7e9012956fa34be155b56633`. It remains unchanged.
+- Stable ZIP SHA-256: `6f2bed58ce6d8ff3fd986cb3a33ca205da4a07a6177dae48e294c91a151f5e03`.
+- The work after `f0e05ad` is included in `v0.6.0`: identity cleanup, backup fix, benchmark tooling, parity features, MP1/MP2, ADPCM, MKA/MKV, Monkey's Audio, DSD-to-PCM, ReplayGain, tag editor, bit-perfect preset, WavPack and the hardware verification guide.
 
 ## Prepare a release
 
@@ -112,4 +113,4 @@ in these scripts.
 - Android: no build, no artifact, no tag. The untracked `android/` tree is untouched by this workflow.
 - Automatic commits, pushes, merges, tags and releases.
 - Signing the unsigned executable and SmartScreen reputation.
-- WavPack, Monkey's Audio, DSD/DoP, ASIO, VST and UPnP.
+- Native DSD/DoP (DSF/DFF and DSD inside WavPack are decoded to PCM), ASIO, VST and UPnP.

@@ -91,7 +91,15 @@ struct SavedTrack {
 }
 
 enum PlaylistDialog {
-    Name { target: Option<usize>, name: String },
+    Name {
+        target: Option<usize>,
+        name: String,
+    },
+    Smart {
+        target: Option<usize>,
+        name: String,
+        query: String,
+    },
     Delete(usize),
 }
 
@@ -101,6 +109,27 @@ enum TrackEdit {
     Move(usize),
     /// Remove a row and insert it before the target (drag and drop).
     Reorder(usize),
+}
+
+/// Pure membership evaluation for a saved smart query. Metadata is keyed by
+/// `library::path_key`; paths without metadata still match path/file terms.
+fn smart_query_members(
+    query: &str,
+    universe: &[PathBuf],
+    metadata: &HashMap<String, TrackInfo>,
+) -> Vec<PathBuf> {
+    let query = search::Query::compile(query);
+    universe
+        .iter()
+        .filter(|path| {
+            let info = metadata
+                .get(&library::path_key(path))
+                .cloned()
+                .unwrap_or_else(|| TrackInfo::read(path));
+            query.matches(Some(&info), path)
+        })
+        .cloned()
+        .collect()
 }
 
 fn apply_track_edit<T>(items: &mut Vec<T>, index: usize, edit: TrackEdit) {
@@ -131,6 +160,9 @@ struct PlaylistSnapshot {
 enum PlaylistAction {
     TogglePin,
     Rename,
+    EditSmartQuery,
+    RefreshSmart,
+    MakeNormal,
     Copy,
     Delete,
     ExportAbsolute,
@@ -287,9 +319,214 @@ struct CoverViewer {
     source: Option<PathBuf>,
 }
 
-struct Notice {
-    message: String,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TagAction {
+    #[default]
+    Keep,
+    Set,
+    Clear,
+}
+
+impl TagAction {
+    const ALL: [Self; 3] = [Self::Keep, Self::Set, Self::Clear];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keep => "Keep",
+            Self::Set => "Set",
+            Self::Clear => "Clear",
+        }
+    }
+}
+
+#[derive(Default)]
+struct TagField {
+    action: TagAction,
+    value: String,
+}
+
+impl TagField {
+    fn value(&self) -> Option<String> {
+        match self.action {
+            TagAction::Keep => None,
+            TagAction::Clear => Some(String::new()),
+            TagAction::Set => Some(self.value.trim().to_owned()),
+        }
+    }
+}
+
+/// One bulk-edit dialog for a multi-row playlist selection.
+#[derive(Default)]
+struct TagEditor {
+    paths: Vec<PathBuf>,
+    title: TagField,
+    artist: TagField,
+    album: TagField,
+    album_artist: TagField,
+    genre: TagField,
+    year: TagField,
+}
+
+struct TagJob {
+    total: usize,
+    received: usize,
+    errors: Vec<String>,
+    rx: mpsc::Receiver<Result<(), String>>,
+}
+
+const STATUS_VISIBLE: Duration = Duration::from_secs(3);
+const STATUS_FADE: Duration = Duration::from_millis(450);
+
+/// Tracks how long the current `Player.status` text has been on screen.
+///
+/// The status text itself stays a plain `String`, so every existing write site
+/// keeps working. One-shot messages (`"Audio output changed. Playback paused."`)
+/// disappear after three seconds. Messages ending in an ellipsis are progress
+/// reports and stay until a worker replaces them, so a long import does not
+/// vanish while it is still running.
+#[derive(Debug)]
+struct StatusTimer {
+    shown: String,
     started: Instant,
+    hold: bool,
+}
+
+impl StatusTimer {
+    fn new() -> Self {
+        Self {
+            shown: String::new(),
+            started: Instant::now(),
+            hold: false,
+        }
+    }
+
+    /// Progress reports and state-bearing errors must not fade away while
+    /// they are still true. The signal-path panel reads the audio error text
+    /// from `status`, so it has to stay until the sink recovers.
+    fn is_held(message: &str) -> bool {
+        message.contains('…')
+            || message.contains("...")
+            || message.starts_with("Audio output:")
+            || message.starts_with("Could not reopen the audio output:")
+            || message.starts_with("Could not load playlists:")
+    }
+
+    /// Restarts the timer unconditionally, used by explicit notices.
+    fn arm(&mut self, message: &str) {
+        self.shown = message.to_owned();
+        self.started = Instant::now();
+        self.hold = Self::is_held(message);
+    }
+
+    /// Restarts only when the status text changed, used once per UI frame.
+    fn observe(&mut self, message: &str) {
+        if self.shown != message {
+            self.arm(message);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.shown.clear();
+        self.started = Instant::now();
+        self.hold = false;
+    }
+
+    fn alpha_at(&self, now: Instant) -> f32 {
+        if self.shown.is_empty() || self.hold {
+            return 1.0;
+        }
+        let elapsed = now.saturating_duration_since(self.started);
+        (STATUS_VISIBLE.saturating_sub(elapsed).as_secs_f32() / STATUS_FADE.as_secs_f32())
+            .clamp(0.0, 1.0)
+    }
+
+    fn expired_at(&self, now: Instant) -> bool {
+        !self.shown.is_empty()
+            && !self.hold
+            && now.saturating_duration_since(self.started) >= STATUS_VISIBLE
+    }
+
+    fn repaint_after(&self, now: Instant) -> Option<Duration> {
+        if self.shown.is_empty() || self.hold {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(self.started);
+        let fade_start = STATUS_VISIBLE.saturating_sub(STATUS_FADE);
+        Some(if elapsed < fade_start {
+            fade_start - elapsed
+        } else {
+            Duration::from_millis(16)
+        })
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn timer(message: &str) -> StatusTimer {
+        let mut timer = StatusTimer::new();
+        timer.arm(message);
+        timer
+    }
+
+    #[test]
+    fn one_shot_status_fades_and_expires() {
+        let timer = timer("Audio output changed. Playback paused.");
+        let started = timer.started;
+        assert_eq!(timer.alpha_at(started + Duration::from_secs(2)), 1.0);
+        let fading = timer.alpha_at(started + Duration::from_millis(2700));
+        assert!((0.0..1.0).contains(&fading), "unexpected alpha {fading}");
+        assert_eq!(timer.alpha_at(started + STATUS_VISIBLE), 0.0);
+        assert!(timer.expired_at(started + STATUS_VISIBLE));
+    }
+
+    #[test]
+    fn progress_status_stays_until_it_is_replaced() {
+        let timer = timer("Importing audio…");
+        let late = timer.started + Duration::from_secs(30);
+        assert!(timer.hold);
+        assert_eq!(timer.alpha_at(late), 1.0);
+        assert!(!timer.expired_at(late));
+        assert_eq!(timer.repaint_after(late), None);
+    }
+
+    #[test]
+    fn audio_failure_stays_visible_but_the_pause_notice_fades() {
+        let failure = timer("Audio output: device is in use");
+        let late = failure.started + Duration::from_secs(30);
+        assert!(failure.hold);
+        assert!(!failure.expired_at(late));
+
+        let paused = timer("Audio output changed. Playback paused.");
+        assert!(!paused.hold);
+        assert!(paused.expired_at(paused.started + STATUS_VISIBLE));
+    }
+
+    #[test]
+    fn repaint_wakes_for_the_fade_window() {
+        let timer = timer("Undid playlist edit.");
+        assert_eq!(
+            timer.repaint_after(timer.started),
+            Some(STATUS_VISIBLE - STATUS_FADE)
+        );
+        assert_eq!(
+            timer.repaint_after(timer.started + Duration::from_millis(2600)),
+            Some(Duration::from_millis(16))
+        );
+    }
+
+    #[test]
+    fn observing_restarts_only_for_a_new_message() {
+        let mut timer = timer("Old message");
+        let old = timer.started;
+        timer.observe("Old message");
+        assert_eq!(timer.started, old);
+        timer.observe("Audio output changed. Playback paused.");
+        assert!(timer.started >= old);
+        assert!(!timer.expired_at(timer.started + Duration::from_secs(2)));
+        assert!(!timer.hold);
+    }
 }
 
 impl TrackProperties {
@@ -473,6 +710,7 @@ mod search_results_tests {
             sidebar_position: None,
             sort: Sort::Added,
             descending: false,
+            smart_query: None,
         }
     }
 
@@ -500,10 +738,70 @@ mod search_results_tests {
     }
 }
 
+#[cfg(test)]
+mod smart_playlist_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn info(title: &str, artist: &str) -> TrackInfo {
+        let mut info = TrackInfo {
+            title: title.into(),
+            artist: artist.into(),
+            ..Default::default()
+        };
+        info.prepare_search(Path::new("Music/A/Help.flac"));
+        info
+    }
+
+    #[test]
+    fn saved_query_filters_the_library_universe() {
+        let universe = vec![
+            PathBuf::from("Music/A/Help.flac"),
+            PathBuf::from("Music/B/Other.flac"),
+        ];
+        let metadata = HashMap::from([
+            (
+                library::path_key(&universe[0]),
+                info("Help!", "The Beatles"),
+            ),
+            (
+                library::path_key(&universe[1]),
+                info("Other", "Miles Davis"),
+            ),
+        ]);
+        let members = smart_query_members("artist:beatles", &universe, &metadata);
+        assert_eq!(members, vec![universe[0].clone()]);
+    }
+
+    #[test]
+    fn path_terms_work_without_cached_metadata() {
+        let universe = vec![PathBuf::from("Music/B/Other.flac")];
+        let members = smart_query_members("file:other.flac", &universe, &HashMap::new());
+        assert_eq!(members, universe);
+    }
+
+    #[test]
+    fn old_saved_playlists_default_to_a_normal_playlist() {
+        let playlist: Playlist = serde_json::from_str(
+            r#"{"name":"Old","tracks":[],"ids":[],"pinned":false,
+                "sidebar_position":null,"sort":"Album","descending":false}"#,
+        )
+        .expect("old playlist loads");
+        assert_eq!(playlist.smart_query, None);
+    }
+}
+
+#[derive(Default)]
+struct FacetCache {
+    list: usize,
+    values: Vec<search::Facet>,
+}
+
 #[derive(Default)]
 struct Dialogs {
     playlist_dialog: Option<PlaylistDialog>,
     track_properties: Option<TrackProperties>,
+    tag_editor: Option<TagEditor>,
     cover_viewer: Option<CoverViewer>,
     activity_open: bool,
     plugins_open: bool,
@@ -518,8 +816,10 @@ struct Player {
     media_job: Option<(u64, mpsc::Receiver<Media>)>,
     media_generation: u64,
     property_jobs: HashMap<PathBuf, mpsc::Receiver<TrackProperties>>,
+    tag_job: Option<TagJob>,
     cached_favorite: Option<(TrackId, bool)>,
     search_deadline: Option<Instant>,
+    facets: Option<FacetCache>,
     dialogs: Dialogs,
     indexer: metadata_cache::Indexer,
     save_worker: save_worker::SaveWorker,
@@ -537,7 +837,7 @@ struct Player {
     volume_changed: bool,
     volume_save_at: Option<Instant>,
     status: String,
-    notice: Option<Notice>,
+    status_timer: StatusTimer,
     updater: update::State,
     thumbs: thumbnails::Cache,
 
@@ -663,14 +963,16 @@ impl Player {
         if let Some(log) = &mut frame_log {
             let _ = writeln!(log, "frame,micros");
         }
-        let player = Self {
+        let mut player = Self {
             relink: None,
             gain_jobs: HashMap::new(),
             media_job: None,
             media_generation: 0,
             property_jobs: HashMap::new(),
+            tag_job: None,
             cached_favorite: None,
             search_deadline: None,
+            facets: None,
             background: background::Preview::default(),
             indexer: metadata_cache::Indexer::new(
                 library_path.with_file_name("metadata-cache.json"),
@@ -695,7 +997,7 @@ impl Player {
             volume_changed: false,
             volume_save_at: None,
             status,
-            notice: None,
+            status_timer: StatusTimer::new(),
             updater,
             thumbs: thumbnails::Cache::new(ctx),
 
@@ -728,6 +1030,7 @@ impl Player {
             frame_log,
             frame_log_count: 0,
         };
+        player.refresh_smart_playlists();
         player.sync_cache_paths();
         player
     }
@@ -742,9 +1045,14 @@ impl Player {
         self.indexer.set_paths(paths);
     }
 
+    fn invalidate_search(&mut self) {
+        self.search_results = None;
+        self.facets = None;
+    }
+
     fn save(&mut self) {
         self.cached_favorite = None;
-        self.search_results = None;
+        self.invalidate_search();
         self.volume_save_at = None;
         if self.library.prune_favorites() {
             // Favorites rows may have been removed or repointed to a relinked
@@ -856,10 +1164,8 @@ impl Player {
     }
 
     fn show_notice(&mut self, message: impl Into<String>) {
-        self.notice = Some(Notice {
-            message: message.into(),
-            started: Instant::now(),
-        });
+        self.status = message.into();
+        self.status_timer.arm(&self.status);
     }
 
     fn flush_volume(&mut self, ctx: &egui::Context) {
@@ -1075,6 +1381,28 @@ impl Player {
                     target: Some(index),
                     name: self.library.playlists[index].name.clone(),
                 });
+            }
+            PlaylistAction::EditSmartQuery => {
+                let playlist = &self.library.playlists[index];
+                self.dialogs.playlist_dialog = Some(PlaylistDialog::Smart {
+                    target: Some(index),
+                    name: playlist.name.clone(),
+                    query: playlist.smart_query.clone().unwrap_or_default(),
+                });
+            }
+            PlaylistAction::RefreshSmart => {
+                if self.refresh_smart_playlists() {
+                    self.status = "Smart playlists updated".into();
+                    self.save();
+                } else {
+                    self.status = "Smart playlists are already up to date".into();
+                }
+                self.request_index(index, ctx);
+            }
+            PlaylistAction::MakeNormal => {
+                self.library.playlists[index].smart_query = None;
+                self.status = "Smart query removed; the current tracks were kept".into();
+                self.save();
             }
             PlaylistAction::Copy => {
                 let mut playlist = self.library.playlists[index].clone();
@@ -1364,7 +1692,7 @@ impl Player {
             );
         }
         self.cached_favorite = None;
-        self.search_results = None;
+        self.invalidate_search();
         self.library.rebuild_locations();
         self.save();
         self.refresh_playback_ids(saved);
@@ -1555,6 +1883,7 @@ impl Player {
                     let first_new = playlist.tracks.len();
                     playlist.tracks.extend(tracks);
                     self.library.rebuild_locations();
+                    self.refresh_smart_playlists();
                     let playlist = &self.library.playlists[list];
                     if self.order_list == Some(list) {
                         let mut extra: Vec<_> =
@@ -1621,7 +1950,84 @@ impl Player {
             self.indexing.remove(&list);
             self.request_index(list, ctx);
         }
-        self.search_results = None;
+        self.invalidate_search();
+    }
+
+    /// Rebuild smart playlists from the ordinary library playlists. Membership
+    /// is materialized so sorting, playback order and stable IDs keep working;
+    /// only the query editor changes the list contents.
+    fn refresh_smart_playlists(&mut self) -> bool {
+        let mut metadata: HashMap<String, TrackInfo> = HashMap::new();
+        let mut universe: Vec<PathBuf> = Vec::new();
+        let mut seen = HashSet::new();
+        for (list, playlist) in self.library.playlists.iter().enumerate() {
+            if playlist.smart_query.is_some() {
+                continue;
+            }
+            let view = self.views.get(&list);
+            for (index, path) in playlist.tracks.iter().enumerate() {
+                let key = library::path_key(path);
+                if seen.insert(key.clone()) {
+                    universe.push(path.clone());
+                }
+                let info = view
+                    .and_then(|view| view.tracks.get(index))
+                    .cloned()
+                    .unwrap_or_else(|| TrackInfo::read(path));
+                metadata.insert(key, info);
+            }
+        }
+        let cache_file = self.library_path.with_file_name("metadata-cache.json");
+        let cached = metadata_cache::cached_infos(&cache_file, &universe);
+        for path in &universe {
+            let key = library::path_key(path);
+            if !metadata.contains_key(&key)
+                && let Some(info) = cached.get(path)
+            {
+                metadata.insert(key, info.clone());
+            }
+        }
+        let mut updates: Vec<(usize, Vec<PathBuf>, Vec<TrackId>)> = Vec::new();
+        for (list, playlist) in self.library.playlists.iter().enumerate() {
+            let Some(query_text) = &playlist.smart_query else {
+                continue;
+            };
+            let mut old_ids = HashMap::new();
+            for (path, id) in playlist.tracks.iter().zip(playlist.ids.iter()) {
+                old_ids.insert(library::path_key(path), *id);
+            }
+            let tracks = smart_query_members(query_text, &universe, &metadata);
+            let mut ids = Vec::new();
+            for path in &tracks {
+                // Zero is replaced by `rebuild_locations` with a fresh,
+                // collision-free identity.
+                ids.push(
+                    old_ids
+                        .get(&library::path_key(path))
+                        .copied()
+                        .unwrap_or(TrackId(0)),
+                );
+            }
+            if tracks != playlist.tracks || ids != playlist.ids {
+                updates.push((list, tracks, ids));
+            }
+        }
+        let changed = !updates.is_empty();
+        for (list, tracks, ids) in updates {
+            let playlist = &mut self.library.playlists[list];
+            playlist.tracks = tracks;
+            playlist.ids = ids;
+        }
+        if changed {
+            self.library.rebuild_locations();
+            for list in 0..self.library.playlists.len() {
+                self.views.remove(&list);
+                self.indexing.remove(&list);
+            }
+            self.invalidate_search();
+            self.track_selection.clear();
+        }
+        changed
     }
 
     /// Collect background ReplayGain scans without blocking the UI thread.
@@ -1706,7 +2112,9 @@ impl Player {
             Err(mpsc::TryRecvError::Empty) => true,
         });
         if !changed.is_empty() {
-            self.search_results = None;
+            self.invalidate_search();
+            // Fresh metadata can change which tracks a saved query matches.
+            self.refresh_smart_playlists();
         }
         if let Some(id) = self.order_id()
             && !self.queue_order_edited
@@ -1996,6 +2404,100 @@ impl Player {
             {
                 self.dialogs.track_properties = Some(properties);
             }
+        }
+    }
+
+    fn open_tag_editor(&mut self, paths: Vec<PathBuf>) {
+        self.dialogs.tag_editor = Some(TagEditor {
+            paths,
+            ..TagEditor::default()
+        });
+    }
+
+    /// Hand a bulk edit to a worker thread so hundreds of files never block
+    /// the UI. Each field is independently Keep / Set / Clear.
+    fn start_tag_job(&mut self, editor: TagEditor, ctx: &egui::Context) {
+        let values = (
+            editor.title.value(),
+            editor.artist.value(),
+            editor.album.value(),
+            editor.album_artist.value(),
+            editor.genre.value(),
+            editor.year.value(),
+        );
+        let paths = editor.paths;
+        if paths.is_empty() || values == (None, None, None, None, None, None) {
+            self.status = "No tag fields selected".into();
+            return;
+        }
+        let total = paths.len();
+        let (tx, rx) = mpsc::channel();
+        let paint = ctx.clone();
+        std::thread::spawn(move || {
+            for path in &paths {
+                let result = tagging::write_batch(
+                    path,
+                    tagging::BatchEdit {
+                        title: values.0.as_deref(),
+                        artist: values.1.as_deref(),
+                        album: values.2.as_deref(),
+                        album_artist: values.3.as_deref(),
+                        genre: values.4.as_deref(),
+                        year: values.5.as_deref(),
+                    },
+                );
+                let _ = tx.send(result);
+            }
+            paint.request_repaint();
+        });
+        self.tag_job = Some(TagJob {
+            total,
+            received: 0,
+            errors: Vec::new(),
+            rx,
+        });
+        self.status = format!("Writing tags for {total} files…");
+    }
+
+    fn finish_tag_jobs(&mut self, ctx: &egui::Context) {
+        let mut done = false;
+        if let Some(job) = &mut self.tag_job {
+            loop {
+                match job.rx.try_recv() {
+                    Ok(Ok(())) => job.received += 1,
+                    Ok(Err(error)) => {
+                        job.received += 1;
+                        if !job.errors.contains(&error) {
+                            job.errors.push(error);
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            done |= job.received >= job.total;
+            if done {
+                let ok = job.received.saturating_sub(job.errors.len());
+                let errors = job.errors.clone();
+                self.status = if errors.is_empty() {
+                    format!("Tagged {ok} files")
+                } else {
+                    format!(
+                        "Tagged {ok} files · {} failed: {}",
+                        errors.len(),
+                        errors.first().map_or("", String::as_str)
+                    )
+                };
+            } else {
+                self.status = format!("Writing tags… {}/{}", job.received, job.total);
+            }
+        }
+        if done {
+            self.tag_job = None;
+            self.refresh_metadata(ctx);
         }
     }
 
@@ -2344,15 +2846,13 @@ impl eframe::App for Player {
         self.setup.update(ctx);
         self.lastfm.poll(ctx);
         self.updater.poll(ctx);
-        if let Some(notice) = &self.notice {
-            let elapsed = notice.started.elapsed();
-            if elapsed >= Duration::from_secs(3) {
-                self.notice = None;
-            } else if elapsed < Duration::from_millis(2550) {
-                ctx.request_repaint_after(Duration::from_millis(2550) - elapsed);
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(16));
-            }
+        self.status_timer.observe(&self.status);
+        let now = Instant::now();
+        if self.status_timer.expired_at(now) {
+            self.status.clear();
+            self.status_timer.clear();
+        } else if let Some(delay) = self.status_timer.repaint_after(now) {
+            ctx.request_repaint_after(delay);
         }
         if std::mem::take(&mut self.restore_track) && self.library.restore_last_track {
             self.restore_playback(ctx);
@@ -2383,6 +2883,7 @@ impl eframe::App for Player {
         self.finish_imports();
         self.finish_playlist_io();
         self.finish_property_jobs();
+        self.finish_tag_jobs(ctx);
         self.finish_media_job(ctx);
         self.finish_artwork(ctx);
         self.finish_lyrics();
@@ -2416,16 +2917,10 @@ impl eframe::App for Player {
             .show(ctx, |ui| {
                 self.transport(ui, ctx);
                 if !self.status.is_empty() {
-                    ui.weak(&self.status);
-                }
-                if let Some(notice) = &self.notice {
-                    let fade = ((Duration::from_secs(3).saturating_sub(notice.started.elapsed()))
-                        .as_secs_f32()
-                        / 0.45)
-                        .clamp(0.0, 1.0);
+                    let fade = self.status_timer.alpha_at(Instant::now());
                     ui.colored_label(
                         ui.visuals().weak_text_color().gamma_multiply(fade),
-                        &notice.message,
+                        &self.status,
                     );
                 }
             });

@@ -1,5 +1,5 @@
 use super::OutputOptions;
-use std::{fs::File, io::ErrorKind, path::Path, time::Duration};
+use std::{borrow::Cow, fs::File, io::ErrorKind, path::Path, time::Duration};
 use symphonia::{
     core::{
         audio::{AudioBufferRef, SampleBuffer},
@@ -103,6 +103,24 @@ fn duration(frames: u64, base: TimeBase) -> Option<Duration> {
 }
 
 pub fn container_duration(path: &Path) -> Option<Duration> {
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("ape")) {
+        return super::ape::ApeSource::open(path)
+            .ok()
+            .and_then(|(_, _, duration)| duration);
+    }
+    if extension.is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("dsf") || extension.eq_ignore_ascii_case("dff")
+    }) {
+        return super::dsd::DsdSource::open(path)
+            .ok()
+            .and_then(|(_, _, duration)| duration);
+    }
+    if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("wv")) {
+        return super::wavpack::WavpackSource::open(path)
+            .ok()
+            .and_then(|(_, _, duration)| duration);
+    }
     let reader = open_format(path).ok()?;
     let params = &audio_track(reader.as_ref())?.codec_params;
     let frames = params.n_frames.filter(|&frames| frames > 0)?;
@@ -115,7 +133,7 @@ pub fn container_duration(path: &Path) -> Option<Duration> {
     duration(frames, base)
 }
 
-pub struct Source {
+struct SymphoniaSource {
     reader: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     id: u32,
@@ -123,120 +141,16 @@ pub struct Source {
     skipped_frames: u64,
     initial_pending: bool,
     verifying: bool,
-    offset: Duration,
     start_ts: u64,
-    remaining_frames: Option<u64>,
-    pub info: SourceFormat,
-    pub duration: Option<Duration>,
 }
 
-impl Source {
-    #[cfg(test)]
-    pub fn open(path: &Path) -> Result<Self, String> {
-        Self::open_with_options(path, OutputOptions::default())
-    }
-
-    pub fn open_with_options(path: &Path, options: OutputOptions) -> Result<Self, String> {
-        let cue = crate::cue::resolve(path)?;
-        let path = cue.as_ref().map_or(path, |track| track.audio.as_path());
-        let mut reader = open_format(path)?;
-        let track = audio_track(reader.as_ref()).ok_or("No supported audio track")?;
-        let id = track.id;
-        let params = track.codec_params.clone();
-        let verifying = options.verify_flac && params.codec == CODEC_TYPE_FLAC && cue.is_none();
-        let mut decoder = get_codecs()
-            .make(&params, &DecoderOptions { verify: verifying })
-            .map_err(|error| error.to_string())?;
-        // Inspect a decoded packet. Container bits and the decoder sample type can differ.
-        let (spec, kind) = loop {
-            let packet = reader.next_packet().map_err(|error| error.to_string())?;
-            if packet.track_id() != id {
-                continue;
-            }
-            let decoded = decoder.decode(&packet).map_err(|error| error.to_string())?;
-            if decoded.frames() == 0 {
-                continue;
-            }
-            let kind = SampleKind::decoded(&decoded, params.bits_per_sample);
-            break (*decoded.spec(), kind);
-        };
-        let rate = spec.rate;
-        if !(1..=768_000).contains(&rate) {
-            return Err("Unsupported source sample rate".into());
-        }
-        let channels = spec.channels.count() as u16;
-        if !(1..=32).contains(&channels) {
-            return Err("Unsupported source channel count".into());
-        }
-        let time_base = params.time_base.or_else(|| Some(TimeBase::new(1, rate)));
-        let full_duration = params
-            .n_frames
-            .zip(time_base)
-            .and_then(|(frames, base)| duration(frames, base));
-        let offset = cue
-            .as_ref()
-            .map_or(Duration::ZERO, |track| crate::cue::duration(track.start));
-        let duration = if let Some(track) = &cue {
-            track
-                .end
-                .map(crate::cue::duration)
-                .map(|end| full_duration.map_or(end, |full| end.min(full)))
-                .or(full_duration)
-                .map(|end| end.saturating_sub(offset))
-        } else {
-            full_duration
-        };
-        if cue.is_some() && duration.is_some_and(|duration| duration.is_zero()) {
-            return Err("CUE track starts beyond the audio file".into());
-        }
-        let info = SourceFormat {
-            codec: get_codecs()
-                .get_codec(params.codec)
-                .map_or("Unknown", |desc| desc.short_name),
-            rate,
-            channels,
-            mask: spec.channels.bits(),
-            bits: params.bits_per_sample,
-            kind,
-            gain: options.replay_gain.factor(path),
-        };
-        let mut source = Self {
-            reader,
-            decoder,
-            id,
-            time_base,
-            skipped_frames: 0,
-            initial_pending: true,
-            verifying,
-            offset,
-            start_ts: params.start_ts,
-            remaining_frames: cue
-                .as_ref()
-                .and_then(|track| track.end)
-                .and(duration)
-                .map(|duration| frames_for(duration, rate)),
-            info,
-            duration,
-        };
-        if !offset.is_zero() {
-            source.seek(Duration::ZERO)?;
-        }
-        Ok(source)
-    }
-
-    pub fn seek(&mut self, position: Duration) -> Result<(), String> {
-        let cue = self.remaining_frames.is_some() || !self.offset.is_zero();
-        if self.remaining_frames.is_some() {
-            self.remaining_frames = self
-                .duration
-                .map(|duration| frames_for(duration.saturating_sub(position), self.info.rate));
-        }
-        let position = position.saturating_add(self.offset);
+impl SymphoniaSource {
+    fn seek(&mut self, position: Duration, info: &SourceFormat, cue: bool) -> Result<(), String> {
         let time = Time::new(position.as_secs(), f64::from(position.subsec_nanos()) / 1e9);
         let target = if let Some(base) = self.time_base.filter(|_| cue) {
-            let frame = u128::from(frames_for(position, self.info.rate));
-            let ts = frame * u128::from(base.denom)
-                / (u128::from(base.numer) * u128::from(self.info.rate));
+            let frame = u128::from(frames_for(position, info.rate));
+            let ts =
+                frame * u128::from(base.denom) / (u128::from(base.numer) * u128::from(info.rate));
             SeekTo::TimeStamp {
                 ts: (ts.min(u128::from(u64::MAX)) as u64).saturating_add(self.start_ts),
                 track_id: self.id,
@@ -257,18 +171,16 @@ impl Source {
         let ticks = seek.required_ts.saturating_sub(seek.actual_ts);
         self.skipped_frames = self.time_base.map_or(ticks, |base| {
             let time = base.calc_time(ticks);
-            ((time.seconds as f64 + time.frac) * f64::from(self.info.rate)).round() as u64
+            ((time.seconds as f64 + time.frac) * f64::from(info.rate)).round() as u64
         });
         Ok(())
     }
 
-    pub fn next<'a, T: ConvertibleSample>(
+    fn next<'a, T: ConvertibleSample>(
         &mut self,
+        info: &SourceFormat,
         scratch: &'a mut Option<SampleBuffer<T>>,
     ) -> Result<Option<&'a [T]>, String> {
-        if self.remaining_frames == Some(0) {
-            return Ok(None);
-        }
         loop {
             let decoded = if std::mem::take(&mut self.initial_pending) {
                 self.decoder.last_decoded()
@@ -292,9 +204,9 @@ impl Source {
                     .decode(&packet)
                     .map_err(|error| error.to_string())?
             };
-            if decoded.spec().rate != self.info.rate
-                || decoded.spec().channels.bits() != self.info.mask
-                || SampleKind::decoded(&decoded, self.info.bits) != self.info.kind
+            if decoded.spec().rate != info.rate
+                || decoded.spec().channels.bits() != info.mask
+                || SampleKind::decoded(&decoded, info.bits) != info.kind
             {
                 return Err("The audio format changed inside the track".into());
             }
@@ -303,7 +215,7 @@ impl Source {
             if skip == decoded.frames() {
                 continue;
             }
-            let capacity = decoded.capacity() * usize::from(self.info.channels);
+            let capacity = decoded.capacity() * usize::from(info.channels);
             if scratch
                 .as_ref()
                 .is_none_or(|buffer| buffer.capacity() < capacity)
@@ -317,21 +229,195 @@ impl Source {
                 .as_mut()
                 .ok_or("Could not initialize decoder buffer")?;
             buffer.copy_interleaved_ref(decoded);
-            let start = skip * usize::from(self.info.channels);
-            let mut samples = &buffer.samples()[start..];
-            if let Some(remaining) = &mut self.remaining_frames {
-                let channels = usize::from(self.info.channels);
-                let available = (samples.len() / channels) as u64;
-                let take = available.min(*remaining);
-                *remaining -= take;
-                samples = &samples[..take as usize * channels];
-            }
-            return Ok(Some(samples));
+            let start = skip * usize::from(info.channels);
+            return Ok(Some(&buffer.samples()[start..]));
         }
     }
 }
 
-fn frames_for(duration: Duration, rate: u32) -> u64 {
+enum Inner {
+    Symphonia(SymphoniaSource),
+    Ape(Box<super::ape::ApeSource>),
+    Dsd(Box<super::dsd::DsdSource>),
+    Wavpack(Box<super::wavpack::WavpackSource>),
+}
+
+pub struct Source {
+    inner: Inner,
+    offset: Duration,
+    remaining_frames: Option<u64>,
+    pub info: SourceFormat,
+    pub duration: Option<Duration>,
+}
+
+impl Source {
+    #[cfg(test)]
+    pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_options(path, OutputOptions::default())
+    }
+
+    pub fn open_with_options(path: &Path, options: OutputOptions) -> Result<Self, String> {
+        let cue = crate::cue::resolve(path)?;
+        let audio = cue.as_ref().map_or(path, |track| track.audio.as_path());
+        let extension = audio.extension().and_then(|extension| extension.to_str());
+        let (inner, info, full_duration) = if extension
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("ape"))
+        {
+            let (source, format, duration) = super::ape::ApeSource::open(audio)?;
+            (Inner::Ape(Box::new(source)), format, duration)
+        } else if extension.is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("dsf") || extension.eq_ignore_ascii_case("dff")
+        }) {
+            let (source, format, duration) = super::dsd::DsdSource::open(audio)?;
+            (Inner::Dsd(Box::new(source)), format, duration)
+        } else if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("wv")) {
+            let (source, format, duration) = super::wavpack::WavpackSource::open(audio)?;
+            (Inner::Wavpack(Box::new(source)), format, duration)
+        } else {
+            let mut reader = open_format(audio)?;
+            let track = audio_track(reader.as_ref()).ok_or("No supported audio track")?;
+            let id = track.id;
+            let params = track.codec_params.clone();
+            let verifying = options.verify_flac && params.codec == CODEC_TYPE_FLAC && cue.is_none();
+            let mut decoder = get_codecs()
+                .make(&params, &DecoderOptions { verify: verifying })
+                .map_err(|error| error.to_string())?;
+            // Inspect a decoded packet. Container bits and the decoder sample type can differ.
+            let (spec, kind) = loop {
+                let packet = reader.next_packet().map_err(|error| error.to_string())?;
+                if packet.track_id() != id {
+                    continue;
+                }
+                let decoded = decoder.decode(&packet).map_err(|error| error.to_string())?;
+                if decoded.frames() == 0 {
+                    continue;
+                }
+                let kind = SampleKind::decoded(&decoded, params.bits_per_sample);
+                break (*decoded.spec(), kind);
+            };
+            let rate = spec.rate;
+            if !(1..=768_000).contains(&rate) {
+                return Err("Unsupported source sample rate".into());
+            }
+            let channels = spec.channels.count() as u16;
+            if !(1..=32).contains(&channels) {
+                return Err("Unsupported source channel count".into());
+            }
+            let time_base = params.time_base.or_else(|| Some(TimeBase::new(1, rate)));
+            let full_duration = params
+                .n_frames
+                .zip(time_base)
+                .and_then(|(frames, base)| duration(frames, base));
+            let info = SourceFormat {
+                codec: get_codecs()
+                    .get_codec(params.codec)
+                    .map_or("Unknown", |desc| desc.short_name),
+                rate,
+                channels,
+                mask: spec.channels.bits(),
+                bits: params.bits_per_sample,
+                kind,
+                gain: options.replay_gain.factor(audio),
+            };
+            (
+                Inner::Symphonia(SymphoniaSource {
+                    reader,
+                    decoder,
+                    id,
+                    time_base,
+                    skipped_frames: 0,
+                    initial_pending: true,
+                    verifying,
+                    start_ts: params.start_ts,
+                }),
+                info,
+                full_duration,
+            )
+        };
+        let offset = cue
+            .as_ref()
+            .map_or(Duration::ZERO, |track| crate::cue::duration(track.start));
+        let duration = if let Some(track) = &cue {
+            track
+                .end
+                .map(crate::cue::duration)
+                .map(|end| full_duration.map_or(end, |full| end.min(full)))
+                .or(full_duration)
+                .map(|end| end.saturating_sub(offset))
+        } else {
+            full_duration
+        };
+        if cue.is_some() && duration.is_some_and(|duration| duration.is_zero()) {
+            return Err("CUE track starts beyond the audio file".into());
+        }
+        let mut source = Self {
+            inner,
+            offset,
+            remaining_frames: cue
+                .as_ref()
+                .and_then(|track| track.end)
+                .zip(duration)
+                .map(|(_, duration)| frames_for(duration, info.rate)),
+            info,
+            duration,
+        };
+        // APE and WavPack take absolute sample positions; CUE offsets are
+        // applied by the common `Source::seek` path.
+        if !offset.is_zero() {
+            source.seek(Duration::ZERO)?;
+        }
+        Ok(source)
+    }
+
+    pub fn seek(&mut self, position: Duration) -> Result<(), String> {
+        let cue = self.remaining_frames.is_some() || !self.offset.is_zero();
+        if self.remaining_frames.is_some() {
+            self.remaining_frames = self
+                .duration
+                .map(|duration| frames_for(duration.saturating_sub(position), self.info.rate));
+        }
+        let position = position.saturating_add(self.offset);
+        match &mut self.inner {
+            Inner::Symphonia(source) => source.seek(position, &self.info, cue),
+            Inner::Ape(source) => source.seek(position),
+            Inner::Dsd(source) => source.seek(position),
+            Inner::Wavpack(source) => source.seek(position),
+        }
+    }
+
+    pub fn next<'a, T: ConvertibleSample>(
+        &mut self,
+        scratch: &'a mut Option<SampleBuffer<T>>,
+    ) -> Result<Option<Cow<'a, [T]>>, String> {
+        if self.remaining_frames == Some(0) {
+            return Ok(None);
+        }
+        let samples = match &mut self.inner {
+            Inner::Symphonia(source) => source.next(&self.info, scratch)?.map(Cow::Borrowed),
+            Inner::Ape(source) => source.next()?.map(Cow::Owned),
+            Inner::Dsd(source) => source.next()?.map(Cow::Owned),
+            Inner::Wavpack(source) => source.next()?.map(Cow::Owned),
+        };
+        let Some(mut samples) = samples else {
+            return Ok(None);
+        };
+        if let Some(remaining) = &mut self.remaining_frames {
+            let channels = usize::from(self.info.channels);
+            let take = ((samples.len() / channels) as u64).min(*remaining) as usize;
+            *remaining -= take as u64;
+            samples = match samples {
+                Cow::Borrowed(samples) => Cow::Borrowed(&samples[..take * channels]),
+                Cow::Owned(mut samples) => {
+                    samples.truncate(take * channels);
+                    Cow::Owned(samples)
+                }
+            };
+        }
+        Ok(Some(samples))
+    }
+}
+
+pub(super) fn frames_for(duration: Duration, rate: u32) -> u64 {
     duration
         .as_secs()
         .saturating_mul(u64::from(rate))

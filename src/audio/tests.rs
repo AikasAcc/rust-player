@@ -32,7 +32,7 @@ fn cue_segments_decode_and_seek_within_their_own_track() -> Result<(), Box<dyn s
         let mut buffer = None;
         let mut read = Vec::new();
         while let Some(packet) = source.next::<i16>(&mut buffer)? {
-            read.extend_from_slice(packet);
+            read.extend_from_slice(&packet);
         }
         assert!(
             read == samples[index * 640..(index + 1) * 640],
@@ -402,6 +402,64 @@ fn file_backend_preserves_pcm_bytes_at_multiple_depths_and_rates()
             assert_eq!(fs::read(output)?, expected, "{stem}");
         }
     }
+    Ok(())
+}
+
+#[test]
+fn file_backend_preserves_wavpack_pcm_bytes() -> Result<(), Box<dyn std::error::Error>> {
+    use pcm::PCM16;
+
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("wavpack.wv");
+    let output = directory.path().join("wavpack.pcm");
+    let rate = 48_000_u32;
+    let values = [257_i32, -257, 32_767, -32_768, 1_000, -1_000, 1_234, -1_234];
+    let mut samples = values.to_vec();
+    let mut writer = ::wavpack::WavpackWriter::create(&input)?
+        .add_bits_per_sample(16)
+        .add_bytes_per_sample(2)
+        .add_num_channels(2)
+        .add_sample_rate(rate as i32)
+        .add_channel_mask(3)
+        .build()?;
+    writer.pack_samples(&mut samples)?;
+    writer.close()?;
+
+    let source = Source::open(&input)?;
+    let kind = SampleKind::Integer(16);
+    assert_eq!(source.info.kind, kind);
+    assert_eq!(source.info.rate, rate);
+    assert_eq!(source.info.channels, 2);
+    let backend = FileBackend {
+        format: OutputFormat {
+            id: "file".into(),
+            device: "File".into(),
+            rate,
+            channels: 2,
+            sample: PCM16.label().into(),
+            buffer_frames: None,
+            dither: false,
+            mode: OutputMode::Exclusive,
+            direct: Some(kind),
+            software_gain: false,
+            transition_fades: false,
+            effects: Default::default(),
+        },
+        encoding: PCM16,
+        path: output.clone(),
+    };
+    let state = Arc::new(RenderState::new(Duration::ZERO, 0.0, false));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    pump(backend, source, Duration::ZERO, &state, &|_| {}, || {
+        state.closed.store(true, Release);
+    })?;
+    assert!(Instant::now() < deadline);
+    assert_eq!(state.frames.load(Relaxed), 4);
+    let expected: Vec<u8> = values
+        .iter()
+        .flat_map(|sample| (*sample as i16).to_le_bytes())
+        .collect();
+    assert_eq!(fs::read(output)?, expected);
     Ok(())
 }
 

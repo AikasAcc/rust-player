@@ -1,9 +1,10 @@
 //! Small foobar-style query language for playlist filtering.
 //!
 //! Plain words are ANDed and match any indexed field or the file path.
-//! Field filters (`title:`, `artist:`, `album:`, `albumartist:`, `path:`,
-//! `file:`, `missing:`), quoted phrases, `OR`, `NOT` and a leading `-` are
-//! supported. This is pure UI logic; no decoder or audio code is involved.
+//! Field filters (`title:`, `artist:`, `album:`, `albumartist:`, `genre:`,
+//! `year:`, `path:`, `file:`, `missing:`), quoted phrases, `OR`, `NOT` and a
+//! leading `-` are supported. This is pure UI logic; no decoder or audio code
+//! is involved.
 
 use crate::library::TrackInfo;
 use std::path::Path;
@@ -15,6 +16,8 @@ enum Field {
     Artist,
     Album,
     AlbumArtist,
+    Genre,
+    Year,
     Path,
     Filename,
     Missing,
@@ -65,6 +68,8 @@ fn parse_clause(token: &str) -> (Field, String, bool) {
             "artist" => Field::Artist,
             "album" => Field::Album,
             "albumartist" | "album_artist" => Field::AlbumArtist,
+            "genre" => Field::Genre,
+            "year" => Field::Year,
             "path" => Field::Path,
             "file" | "filename" => Field::Filename,
             "missing" => Field::Missing,
@@ -133,6 +138,9 @@ impl Clause {
             Field::Artist => track.is_some_and(|track| contains(&track.artist)),
             Field::Album => track.is_some_and(|track| contains(&track.album)),
             Field::AlbumArtist => track.is_some_and(|track| contains(&track.album_artist)),
+            Field::Genre => track.is_some_and(|track| contains(&track.genre)),
+            Field::Year => track
+                .is_some_and(|track| track.year.is_some_and(|year| contains(&year.to_string()))),
             Field::Path => contains(&path.to_string_lossy()),
             Field::Filename => path
                 .file_name()
@@ -148,6 +156,120 @@ impl Clause {
         };
         found != self.negate
     }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum FacetKind {
+    Artist,
+    Album,
+    Genre,
+    Year,
+}
+
+impl FacetKind {
+    pub const ALL: [Self; 4] = [Self::Artist, Self::Album, Self::Genre, Self::Year];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+            Self::Genre => "Genre",
+            Self::Year => "Year",
+        }
+    }
+
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::Artist => "artist",
+            Self::Album => "album",
+            Self::Genre => "genre",
+            Self::Year => "year",
+        }
+    }
+
+    fn values(self, track: &TrackInfo) -> Vec<String> {
+        let one = |value: &str| {
+            (!value.trim().is_empty())
+                .then(|| value.trim().to_owned())
+                .into_iter()
+        };
+        match self {
+            Self::Artist => one(&track.artist).collect(),
+            Self::Album => one(&track.album).collect(),
+            Self::Genre => track.genre.split([';', '/']).flat_map(one).collect(),
+            Self::Year => track
+                .year
+                .map(|year| year.to_string())
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Facet {
+    pub kind: FacetKind,
+    pub value: String,
+    pub count: usize,
+}
+
+impl Facet {
+    pub fn clause(&self) -> String {
+        clause(self.kind.field(), &self.value)
+    }
+}
+
+fn clause(field: &str, value: &str) -> String {
+    if value.chars().any(char::is_whitespace) {
+        format!("{field}:\"{value}\"")
+    } else {
+        format!("{field}:{value}")
+    }
+}
+
+/// Most frequent values per facet, counted from indexed playlist metadata.
+pub fn collect_facets(tracks: &[TrackInfo], per_kind: usize) -> Vec<Facet> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<(FacetKind, String), usize> = HashMap::new();
+    for track in tracks {
+        for kind in FacetKind::ALL {
+            for value in kind.values(track) {
+                *counts.entry((kind, value)).or_default() += 1;
+            }
+        }
+    }
+    let mut result = Vec::new();
+    for kind in FacetKind::ALL {
+        let mut group: Vec<Facet> = counts
+            .iter()
+            .filter_map(|((facet, value), &count)| {
+                (*facet == kind).then_some(Facet {
+                    kind,
+                    value: value.clone(),
+                    count,
+                })
+            })
+            .collect();
+        group.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
+        group.truncate(per_kind);
+        result.extend(group);
+    }
+    result
+}
+
+/// Add or remove one facet clause while preserving the rest of the query.
+pub fn toggle_clause(query: &str, field: &str, value: &str) -> String {
+    let needle = clause(field, value);
+    let mut existing = tokens(query);
+    if let Some(position) = existing
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case(&needle))
+    {
+        existing.remove(position);
+        return existing.join(" ");
+    }
+    existing.push(needle);
+    existing.join(" ")
 }
 
 #[cfg(test)]
@@ -214,5 +336,53 @@ mod tests {
         let query = Query::compile("NOT artist:beatles");
         assert!(!query.matches(Some(&track()), Path::new("x.flac")));
         assert!(query.matches(Some(&TrackInfo::default()), Path::new("x.flac")));
+    }
+
+    #[test]
+    fn facet_fields_filter_genre_and_year() {
+        let mut track = track();
+        track.genre = "Jazz; Bebop".into();
+        track.year = Some(1959);
+        assert!(Query::compile("genre:bebop").matches(Some(&track), Path::new("x.flac")));
+        assert!(Query::compile("year:1959").matches(Some(&track), Path::new("x.flac")));
+        assert!(!Query::compile("year:1960").matches(Some(&track), Path::new("x.flac")));
+    }
+
+    #[test]
+    fn facet_values_are_counted_and_quoted_when_needed() {
+        let mut first = track();
+        first.genre = "Jazz".into();
+        first.year = Some(1959);
+        let mut second = first.clone();
+        second.artist = "Miles Davis".into();
+        let facets = collect_facets(&[first, second], 4);
+        let genre = facets
+            .iter()
+            .find(|facet| facet.kind == FacetKind::Genre)
+            .expect("genre facet");
+        assert_eq!(genre.value, "Jazz");
+        assert_eq!(genre.count, 2);
+        let year = facets
+            .iter()
+            .find(|facet| facet.kind == FacetKind::Year)
+            .expect("year facet");
+        assert_eq!(year.clause(), "year:1959");
+
+        let quoted = Facet {
+            kind: FacetKind::Artist,
+            value: "The Beatles".into(),
+            count: 1,
+        };
+        assert_eq!(quoted.clause(), "artist:\"The Beatles\"");
+    }
+
+    #[test]
+    fn toggling_a_facet_preserves_other_clauses() {
+        let query = toggle_clause("title:help", "genre", "Jazz");
+        assert_eq!(query, "title:help genre:Jazz");
+        let query = toggle_clause(&query, "genre", "Jazz");
+        assert_eq!(query, "title:help");
+        let query = toggle_clause("", "artist", "The Beatles");
+        assert_eq!(query, "artist:\"The Beatles\"");
     }
 }

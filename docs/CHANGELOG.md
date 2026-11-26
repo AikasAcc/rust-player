@@ -1,6 +1,6 @@
-# Rust Player v0.6.0-rc1 – What's New
+# Rust Player v0.6.0 – What's New
 
-This is a **preview** (release candidate). The current stable version remains **v0.5.0**. Please report any problems before this becomes a full release.
+This is the stable **v0.6.0** release. It succeeds the preview `v0.6.0-rc1` and the previous stable `v0.5.0`. All automated build, lint and regression checks passed. Hardware bit-perfect capture and listening checks are described in `docs/HARDWARE-VERIFICATION.md` and are performed by the maintainer; the audio signal path itself is unchanged.
 
 ## In Short
 
@@ -13,8 +13,11 @@ Newly supported:
 - **MP1 and MP2** – older MPEG audio files
 - **ADPCM in WAV and CAF files** – older recordings
 - **MKA and MKV** – audio containers. Even if they contain a video track, the player finds the audio track.
+- **Monkey's Audio (`.ape`)** – lossless files with seeking and CUE offsets.
+- **DSF and DFF (DSD)** – converted to high-rate PCM (DSD64 → 88.2 kHz) so normal audio devices can play them. This is *not* native-DSD/DoP playback.
+- **WavPack (`.wv`)** – lossless, hybrid and float files with seeking and APEv2 tags. Hybrid files use the `.wv` stream without an optional `.wvc` correction file; DSD inside WavPack is not covered.
 
-Still **not** supported: WavPack, Monkey's Audio, DSD, ASIO, VST plugins, and UPnP.
+Still **not** supported: SACD-ISO, native DSD/DoP, DSD in WavPack, ASIO, VST plugins, and UPnP/DLNA. Building from source now also needs CMake and LLVM/libclang for libwavpack.
 
 ## Playback Runs More Smoothly
 
@@ -50,12 +53,18 @@ Still **not** supported: WavPack, Monkey's Audio, DSD, ASIO, VST plugins, and UP
 - Save album art as `cover.png` beside the audio file; existing covers are kept.
 - Love/unlove the current track on Last.fm from the now-playing panel.
 - GitHub button under **Tools** and under **Settings → About**.
+- **Smart playlists** – save a query and refresh it from the library; sorting, favorites, undo/redo and stable track IDs still work.
+- **Facet chips** above the track list for Artist, Album, Genre and Year, with new `genre:` and `year:` search fields.
+- **Bulk tag editing** for a multi-row selection: Keep, Set or Clear title, artist, album, album artist, genre and year.
+- **Fading status messages** – transient notices disappear after a short delay; progress and audio-error text remain until the work or failure state ends.
+- **Hardware verification guide** – a step-by-step Shared-mode loopback comparison with a sample-alignment script, plus an explicit boundary between software checks, digital captures and listening tests.
 
 ## Sound and Tags
 
 - Under **Settings → Audio** there are four quality levels. **"High" is unchanged** – if you change nothing, you'll hear no difference.
 - Correction files (FIR) can be twice as long.
 - **ReplayGain** can be measured in the background. Only the loudness information is written to the file; the music remains untouched.
+- **Apply bit-perfect preset** in Settings → Audio: WASAPI Exclusive, no conversion, no DSP, no ReplayGain, hardware volume only.
 - In the track properties window, you can change title, artist, album, album artist, and track number.
 - External CUE files can reference multiple audio files.
 - CUE sheets embedded in FLAC files are now split into individual tracks.
@@ -77,6 +86,8 @@ Still **not** supported: WavPack, Monkey's Audio, DSD, ASIO, VST plugins, and UP
 2. Skip forward and backward during playback: no stuck or incorrect positions?
 3. Load a `.mp1`/`.mp2`, an ADPCM WAV, and a `.mka` file.
 4. Open a FLAC with an embedded CUE sheet: are the individual titles and track starts correct?
+5. Load a `.ape` file and skip forward/backward.
+6. Load a `.dsf` or `.dff` file: are the ID3 title and duration right, and does seeking work? Listen for clicks at the start and end of a track.
 
 ## Installation
 

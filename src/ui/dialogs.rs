@@ -40,9 +40,66 @@ impl Player {
                                 sidebar_position: None,
                                 sort: Sort::Album,
                                 descending: false,
+                                smart_query: None,
                             });
                             self.library.selected = self.library.playlists.len() - 1;
                         }
+                        self.save();
+                        open = false;
+                    }
+                    open &= !cancel;
+                }
+                PlaylistDialog::Smart {
+                    target,
+                    name,
+                    query,
+                } => {
+                    let title = if target.is_some() {
+                        "Edit smart playlist"
+                    } else {
+                        "New smart playlist"
+                    };
+                    let mut submit = false;
+                    let mut cancel = false;
+                    egui::Window::new(title)
+                        .open(&mut open)
+                        .collapsible(false)
+                        .show(ctx, |ui| {
+                            ui.label("Playlist name");
+                            ui.text_edit_singleline(name);
+                            ui.label("Query");
+                            ui.text_edit_singleline(query);
+                            ui.small(
+                                "Fields: title, artist, album, albumartist, path, file, missing\n\
+                                 Example: artist:\"Miles Davis\" OR album:\"Kind of Blue\"",
+                            );
+                            ui.horizontal(|ui| {
+                                submit = ui
+                                    .add_enabled(!name.trim().is_empty(), egui::Button::new("Save"))
+                                    .clicked();
+                                cancel = ui.button("Cancel").clicked();
+                            });
+                        });
+                    if submit {
+                        let query = query.trim().to_owned();
+                        if let Some(list) = *target {
+                            let playlist = &mut self.library.playlists[list];
+                            playlist.name = name.trim().to_owned();
+                            playlist.smart_query = Some(query);
+                        } else {
+                            self.library.playlists.push(Playlist {
+                                ids: Vec::new(),
+                                name: name.trim().to_owned(),
+                                tracks: Vec::new(),
+                                pinned: false,
+                                sidebar_position: None,
+                                sort: Sort::Album,
+                                descending: false,
+                                smart_query: Some(query),
+                            });
+                            self.library.selected = self.library.playlists.len() - 1;
+                        }
+                        self.refresh_smart_playlists();
                         self.save();
                         open = false;
                     }
@@ -83,11 +140,76 @@ impl Player {
         if self.dialogs.plugins_open {
             self.plugin_manager(ctx);
         }
+        self.tag_editor_dialog(ctx);
         self.track_properties_dialog(ctx);
         self.cover_viewer_dialog(ctx);
         self.settings_dialog(ctx);
         self.audio_setup_dialog(ctx);
     }
+    pub(crate) fn tag_editor_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.dialogs.tag_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut submit = false;
+        let mut close = false;
+        let count = editor.paths.len();
+        egui::Window::new(format!("Edit tags · {count} tracks"))
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("Keep leaves a field untouched. Set writes the value, Clear removes it.");
+                if editor
+                    .paths
+                    .iter()
+                    .any(|path| crate::cue::reference(path).is_some())
+                {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "CUE virtual tracks are skipped; edit the source audio instead.",
+                    );
+                }
+                ui.separator();
+                for (label, field) in [
+                    ("Title", &mut editor.title),
+                    ("Artist", &mut editor.artist),
+                    ("Album", &mut editor.album),
+                    ("Album artist", &mut editor.album_artist),
+                    ("Genre", &mut editor.genre),
+                    ("Year", &mut editor.year),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([90.0, 20.0], egui::Label::new(label));
+                        egui::ComboBox::from_id_salt(label)
+                            .selected_text(field.action.label())
+                            .width(62.0)
+                            .show_ui(ui, |ui| {
+                                for action in TagAction::ALL {
+                                    ui.selectable_value(&mut field.action, action, action.label());
+                                }
+                            });
+                        ui.add_enabled(
+                            field.action == TagAction::Set,
+                            egui::TextEdit::singleline(&mut field.value).desired_width(180.0),
+                        );
+                    });
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    submit = ui.button("Write tags").clicked();
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        open &= !close;
+        if submit {
+            self.start_tag_job(editor, ctx);
+        } else if open {
+            self.dialogs.tag_editor = Some(editor);
+        }
+    }
+
     pub(crate) fn track_properties_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut properties) = self.dialogs.track_properties.take() else {
             return;

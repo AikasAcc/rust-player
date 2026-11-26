@@ -1,5 +1,7 @@
+mod ape;
 mod convert;
 mod decoder;
+pub(crate) mod dsd;
 pub mod dsp;
 mod exclusive;
 mod gapless;
@@ -10,6 +12,7 @@ pub mod setup;
 mod shared;
 #[cfg(test)]
 mod tests;
+pub(crate) mod wavpack;
 
 use std::{
     path::Path,
@@ -675,7 +678,7 @@ fn pump<B: Backend>(
                 if let Some(converter) = &mut converter {
                     converted.clear();
                     converter.set_gain(source.info.gain.unwrap_or(1.0));
-                    converter.push(samples, &mut converted)?;
+                    converter.push(&samples, &mut converted)?;
                     effects.process(&mut converted);
                     pending.extend(converted.iter().map(|sample| sample.to_bits()));
                 } else {

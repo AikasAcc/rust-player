@@ -152,6 +152,7 @@ impl Player {
         }
         self.status = format!("Relinked {count} files · {} unresolved", result.unresolved);
         if count > 0 {
+            self.refresh_smart_playlists();
             self.save();
         }
     }

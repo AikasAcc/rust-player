@@ -1,0 +1,6 @@
+# WavPack's bundled CMake project predates CMake 4. CMake 4 rejects the old
+# compatibility level by default; 3.5 is the level that project declares.
+# Keep this in the repository so a plain `cargo build --locked` works without
+# callers having to know about the native dependency.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

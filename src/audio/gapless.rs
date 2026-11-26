@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{borrow::Cow, path::PathBuf, time::Duration};
 use symphonia::core::{audio::SampleBuffer, conv::ConvertibleSample};
 
 use super::{
@@ -41,7 +41,7 @@ pub(super) fn next_packet<'a, T: ConvertibleSample>(
     source: &mut Source,
     scratch: &'a mut Option<SampleBuffer<T>>,
     report: &impl Fn(Event),
-) -> Option<&'a [T]> {
+) -> Option<Cow<'a, [T]>> {
     match source.next(scratch) {
         Ok(samples) => samples,
         Err(error) => {

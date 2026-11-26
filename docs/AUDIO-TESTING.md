@@ -30,5 +30,6 @@ The SHA-256 values should match. The other fixture variants use `s16le`, `s24le`
 
 - CPAL 0.18 (Apache-2.0) exposes stable endpoint IDs and WASAPI streams. Its realtime feature registers the Windows callback thread with the MMCSS Audio profile. [CPAL](https://github.com/RustAudio/cpal)
 - Symphonia 0.5.5 (MPL-2.0) was already in the lockfile. It now provides the decoder directly. [Symphonia](https://github.com/pdeljanov/Symphonia)
+- wavpack 0.4.0 (BSD-3-Clause) wraps the reference libwavpack for `.wv` files. It builds the bundled C library with CMake and generated bindings with libclang; both tools are build-time requirements, not runtime dependencies of the player. [wavpack-rs](https://github.com/irh/wavpack-rs)
 - rtrb 0.3 (MIT or Apache-2.0) provides a bounded, wait-free single-producer single-consumer buffer. [rtrb](https://github.com/mgeier/rtrb)
 - Rubato 0.16.2 (MIT) provides the sinc resampler. The code uses its fixed-input API with the FFT feature disabled. [Rubato](https://github.com/HEnquist/rubato)

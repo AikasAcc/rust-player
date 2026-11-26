@@ -73,6 +73,7 @@ pub fn import(path: &Path) -> io::Result<(Playlist, usize)> {
             sidebar_position: None,
             sort: Sort::Added,
             descending: false,
+            smart_query: None,
         },
         skipped,
     ))
@@ -251,6 +252,7 @@ mod tests {
             sidebar_position: None,
             sort: Sort::Added,
             descending: false,
+            smart_query: None,
         };
         export(&source, &path, PathMode::Absolute).unwrap();
         let (loaded, skipped) = import(&path).unwrap();
@@ -274,6 +276,7 @@ mod tests {
             sidebar_position: None,
             sort: Sort::Added,
             descending: false,
+            smart_query: None,
         };
         export(&source, &path, PathMode::Relative).unwrap();
         let text = fs::read_to_string(&path).unwrap();
@@ -298,6 +301,7 @@ mod tests {
             sidebar_position: None,
             sort: Sort::Added,
             descending: false,
+            smart_query: None,
         };
         export(&source, &path, PathMode::Relative).unwrap();
         let text = fs::read_to_string(&path).unwrap();

@@ -1,6 +1,6 @@
 # Playback testing
 
-Run the [Windows build and playback regression checks](AUDIO-TESTING.md) on Windows 10 and 11. Record the Windows build, device and driver version, source format, negotiated output format and underruns.
+Run the [Windows build and playback regression checks](AUDIO-TESTING.md) on Windows 10 and 11. Record the Windows build, device and driver version, source format, negotiated output format and underruns. For sample-level loopback captures and a clear boundary between software and hardware claims, use the [hardware verification workflow](HARDWARE-VERIFICATION.md).
 
 ## Manual release checklist
 
@@ -11,6 +11,7 @@ Run the [Windows build and playback regression checks](AUDIO-TESTING.md) on Wind
 - [ ] Use keyboard media keys, Windows media controls and the thumbnail buttons with Rust Player focused and minimized. Switch to another player and confirm that the active Windows media session gets the keys.
 - [ ] Apply and cancel theme edits. Drag in still and animated images, vary blur, opacity and fit, and restart. Check a missing image and verify that blur leaves the playlist text and controls sharp.
 - [ ] With separate test accounts or fixtures, check Discord artwork, Last.fm authentication and offline recovery, and LRCLIB lookup.
+- [ ] Trigger a short status message (for example by changing the audio device while paused) and confirm it fades out after a few seconds. Start an import and confirm its progress text stays visible until the import finishes.
 
 ## Exclusive playback
 
@@ -18,7 +19,7 @@ Run the [Windows build and playback regression checks](AUDIO-TESTING.md) on Wind
 2. Play 16-, 24- and 32-bit PCM at rates supported by your device. Check the negotiated format, channels, rate and underrun counter. A 24-bit track can use packed 24-bit PCM, 24-in-32, or another lossless integer container. A track with an unsupported native format displays an error until a conversion or Shared fallback is enabled. A 192 kHz test file can exercise this behavior on an iD4 MKII.
 3. Play a second track with a different rate. The endpoint reopens for the new format. A short gap is expected at this boundary. Check pause, seek, stop, track switches, saved position and device volume. Enable software gain or transition fades individually and verify the corresponding indicator and transport behavior.
 4. Check the in-use message when another app holds the endpoint. Enable **Fall back to WASAPI Shared on an Exclusive error** and repeat. **Signal path** should show the actual mode. Repeat after disconnecting and reconnecting the device or resuming Windows from sleep.
-5. Verify the rate on the DAC or its control application. For an end-to-end sample comparison, use a verified digital capture point, align the samples, then compare the PCM. A normal WASAPI loopback capture runs in Shared. [Microsoft WASAPI loopback documentation](https://learn.microsoft.com/windows/win32/coreaudio/loopback-recording)
+5. Verify the rate on the DAC or its control application. For an end-to-end sample comparison, use a verified digital capture point, align the samples, then compare the PCM with [the loopback script](../scripts/compare_loopback.py). A normal WASAPI loopback capture runs in Shared and cannot capture an Exclusive stream. See [hardware verification](HARDWARE-VERIFICATION.md) for the full procedure and the limits of each capture method. [Microsoft WASAPI loopback documentation](https://learn.microsoft.com/windows/win32/coreaudio/loopback-recording)
 
 The [FileBackend verification](AUDIO-TESTING.md#verify-the-pcm-sent-to-the-backend) checks the PCM bytes at the application output using a separate reference decoder.
 
@@ -34,13 +35,22 @@ Run `cargo test --release --locked compatible_tracks_write_the_continuous_refere
 
 - Minimize the player and hover over its Windows taskbar icon. Check Previous, Play/Pause, Next and Shuffle. Repeat with a fresh window and after the thumbnail toolbar is registered again.
 - Open ALAC in M4A, AIFF and PCM CAF through **Add files** and drag-and-drop. Compare the decoded rate, depth and channels in **Signal path**. A file can decode at 384 kHz while the output requires conversion.
-- Drop a single-file CUE sheet. Play two adjacent entries and seek within the second one. Compare the titles, starts and ends against the sheet. Embedded and multi-file CUE sheets are unsupported.
+- Drop a single-file, multi-file, and FLAC-embedded CUE sheet. Play two adjacent entries and seek within the second one. Compare the titles, starts and ends against the sheet.
+- Open a Monkey's Audio `.ape` file and seek in both directions. Confirm that a CUE sheet referencing APE still applies its start offsets.
+- Open 16-, 24- and 32-bit integer and 32-bit float `.wv` files. Check rate, depth and channels in **Signal path**, seek in both directions, and verify APEv2 title/artist/album/genre/year/track fields. Repeat with a hybrid file without its `.wvc` correction file and confirm that it decodes from the `.wv` stream.
 - Enable ReplayGain Track and Album with tagged fixtures and compare the displayed gain. Test a positive gain with a peak tag and check that gain is capped to the available headroom. Switch ReplayGain off to restore the direct PCM path.
 - Enable **Verify FLAC MD5 during playback** and play a complete FLAC from the beginning. A bad embedded checksum produces a warning. Test with a generated copy before changing any files in a library.
 
-## DSD feasibility
+## DSD-to-PCM and native DSD
 
-DoP needs a compatible DAC and an unchanged PCM transport. DSD64 uses a 24-bit, 176.4 kHz transport. The Audient iD4 MKII documentation specifies PCM up to 96 kHz, so this interface cannot verify that path. DSD remains outside the supported formats. [dCS DoP explanation](https://dcsltd.fra1.cdn.digitaloceanspaces.com/media/2014/03/Puccini-Player-Manual-v1_4x.pdf) · [Audient specifications](https://docs.audient.com/id4/technical-specifications/)
+- Open a tagged `.dsf` and `.dff` file. Check the ID3 title, artist, album, genre, year, duration and **Signal path** (88.2 kHz for DSD64, 96 kHz for DSD48-family files). Seek near the beginning, middle and end; listen for clicks at the start and end of the track.
+- Native DSD and DoP are not offered. DoP needs a compatible DAC and an unchanged PCM transport; DSD64 uses a 24-bit, 176.4 kHz transport. The Audient iD4 MKII documentation specifies PCM up to 96 kHz, so this interface cannot verify that path. [dCS DoP explanation](https://dcsltd.fra1.cdn.digitaloceanspaces.com/media/2014/03/Puccini-Player-Manual-v1_4x.pdf) · [Audient specifications](https://docs.audient.com/id4/technical-specifications/)
+
+## Library queries and bulk tagging
+
+- Save a playlist search as **Smart**, change the library and refresh it. Confirm that the query filters the current library, that stable track IDs keep favorites and playback order intact, and that **Make normal** freezes the current rows. Restart and verify persistence.
+- Click Artist, Album, Genre and Year facet chips above the track list. Verify that one click adds the field filter, a second click removes only that filter, and `genre:`/`year:` searches work after a cache upgrade.
+- Select several files and open **Edit tags…**. Set one field, clear another, and leave the rest on Keep. Re-read the files and confirm that untouched fields still hold their old values. Include a CUE virtual track and verify that it is skipped.
 
 ## Last.fm scrobbling
 
