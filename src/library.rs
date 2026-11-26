@@ -736,10 +736,6 @@ impl Library {
         self.rebuild_locations();
     }
 
-    pub fn back_up_invalid_file(path: &Path) -> std::io::Result<PathBuf> {
-        Self::back_up_invalid_json(path, "library.invalid-")
-    }
-
     pub fn back_up_invalid_json(path: &Path, prefix: &str) -> std::io::Result<PathBuf> {
         let mut original = fs::File::open(path)?;
         let directory = path.parent().ok_or_else(|| {
@@ -843,7 +839,7 @@ pub fn collect(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
 }
 
 fn add_path(path: PathBuf, tracks: &mut Vec<PathBuf>, skipped: &mut usize) {
-    if crate::cue::is_sheet(&path) {
+    if crate::cue::is_sheet(&path) || crate::cue::has_embedded(&path) {
         match crate::cue::entries(&path) {
             Ok(entries) => tracks.extend(entries),
             Err(_) => *skipped += 1,
@@ -1101,8 +1097,8 @@ mod tests {
         fs::write(&path, broken_json)?;
         assert!(Library::load(&path).is_err());
 
-        let first = Library::back_up_invalid_file(&path)?;
-        let second = Library::back_up_invalid_file(&path)?;
+        let first = Library::back_up_invalid_json(&path, "library.invalid-")?;
+        let second = Library::back_up_invalid_json(&path, "library.invalid-")?;
         assert_ne!(first, second);
         assert_eq!(fs::read(&path)?, broken_json);
 

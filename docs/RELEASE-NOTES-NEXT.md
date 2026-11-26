@@ -20,6 +20,7 @@ Two small actions have been added to the interface. Your files stay where they a
 - **Write ReplayGain yourself** – one click in Track properties measures the file and saves the tags.
 - **Edit tags directly** – title, artist, album, album artist, and track number can be changed.
 - **CUE with multiple files** – albums with one audio file per track are now supported as well.
+- **CUE inside FLAC** – a sheet stored in the audio file itself is now read and split into tracks.
 - **Heart icon next to each song** – favorites can now be set and removed line by line in any playlist.
 - **Start a playlist with a double-click** – double-clicking a playlist plays it; with shuffle enabled, a random track starts.
 - **The UI stays responsive while saving** – settings are written in the background; on exit, everything is fully written.
@@ -82,6 +83,7 @@ Important: **no** "Favorites" folder is created. Favorites remain a normal playl
 - In Track properties, "Scan and write ReplayGain" measures the loudness according to ITU-R BS.1770-4 and writes `REPLAYGAIN_TRACK_GAIN` and `REPLAYGAIN_TRACK_PEAK` to the file. Only tags are changed; the music itself is untouched. The scan runs in the background, the UI stays responsive, and playback continues.
 - Also in Track properties, you can change title, artist, album, album artist, and track number and write them back with "Save tags". Empty fields remove the old value. For CUE entries, the associated audio file is edited instead.
 - External CUE files may now reference multiple audio files. The last track of a file plays to the end of that file.
+- A CUE sheet embedded in a FLAC file is now recognized too. Its tracks appear as separate entries, with the titles and start positions from the sheet. Nothing is written to the audio file.
 - New file formats: MP1 and MP2 (MPEG Layer I/II), audio in MKA/MKV, and ADPCM in WAV and CAF. For MKV files with a video track, the first decodable audio track is selected. WavPack, Monkey's Audio, and DSD remain unsupported.
 - The audio worker no longer queries and clones the next playback item via a lock on every iteration. It keeps track of the last state and reacts only to actual changes. This reduces locking and allocations in the real-time path; the sound itself is unchanged.
 
@@ -113,4 +115,6 @@ Important: **no** "Favorites" folder is created. Favorites remain a normal playl
 - `library.json`, `playback.json`, and `listening.json` are still written atomically (temporary file + `fsync` + replace), but from a background thread. The UI thread only serializes the snapshot; multiple snapshots of the same file are coalesced. On exit, the UI waits for completion (`shutdown()`).
 - Playlist import and export use worker threads with `mpsc`; only library changes and status messages happen on the UI thread.
 - `Media::placeholder()` returns only the file title (including CUE resolution); the full `Media::read()` runs in `media_job` on a worker. `finish_media_job()` takes over the cover texture, lyrics, and notification of plugins/media keys, then starts cover and lyrics lookup. A generation counter discards stale results on rapid track changes. `property_jobs` does the same for the properties dialog; `loading` prevents a later worker result from overwriting user changes.
-- Before/after measurements are in `docs/BENCHMARK-REPORT.md`. With 100,000 tracks, the work in the UI thread drops from around 8–20 ms to around 5 ms; the variation in disk latency is disclosed in the report.
+- Before/after measurements are in `docs/BENCHMARK-REPORT.md`. With 100,000 tracks, the work in the UI thread drops from around 9–15 ms to around 5 ms; the variation in disk latency is disclosed in the report.
+- `scripts/run-benchmarks.ps1` runs the four ignored benchmarks in one step and archives environment, logs, raw CSV and process metadata (wall/CPU time, page faults, peak working set) under `target/benchmark-runs/<timestamp>/`. UI frame timing is opt-in via `RUST_PLAYER_FRAME_LOG=<csv path>`; without the variable there is no file I/O per frame. `scripts/run-frame-log.ps1` runs a complete session and reports p50/p95/p99/max, but refuses to stop an already running player.
+- Embedded CUE: `src/cue.rs` reads the FLAC Vorbis-comment block directly because lofty's generic `Tag` does not expose the `CUESHEET` key. Tracks are addressed as virtual `audio.flac/<n>` paths and share the same resolver, cache stamps, tag redirect and decoder offsets as external sheets.

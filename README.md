@@ -6,11 +6,11 @@ A standalone Windows x64 audio player written in Rust with egui, Symphonia, and 
 
 ## Quick start
 
-Rust Player targets Windows 10 and 11 on x64. Download the Windows ZIP from [GitHub Releases](https://github.com/AikasAcc/rust-player/releases), extract it, and run `Rust-Player.exe`. The executable is unsigned, so Windows SmartScreen or antivirus software may flag it. The release includes a SHA-256 checksum for verifying the ZIP.
+Rust Player targets Windows 10 and 11 on x64. Download the Windows ZIP from [GitHub Releases](https://github.com/AikasAcc/rust-player/releases), extract it, and run `rust-player.exe`. The executable is unsigned, so Windows SmartScreen or antivirus software may flag it. The release includes a SHA-256 checksum for verifying the ZIP.
 
 Starting with v0.5.0, keep the updater helper alongside the player. Open **Settings → General** to check for and install updates. Users of v0.4.0 need to extract the v0.5.0 ZIP once.
 
-To build from source, run `cargo build --release --locked` with a current Rust toolchain. Use `cargo run --locked` for a development run.
+To build from source, run `cargo build --release --locked` with a current Rust toolchain. Use `cargo run --locked` for a development run. For repeatable checks, `scripts/run-benchmarks.ps1` archives benchmark data and `scripts/run-frame-log.ps1` records an opt-in UI frame-time session; neither stops an already running player.
 
 Building from source requires the Windows SDK resource compiler with the MSVC toolchain, or MinGW-w64 `windres` and `ar` on PATH with the GNU toolchain. The executable embeds the [Rust Player logo](assets/ATTRIBUTION.md) at 16 sizes. The app sets DPI-appropriate small and large window icons.
 
@@ -30,7 +30,7 @@ If `library.json` cannot be read, Rust Player saves a copy as `library.invalid-*
 
 The player decodes MPEG audio (MP1/MP2/MP3), FLAC, WAV, Ogg Vorbis, AAC, M4A/ALAC, AIFF, and supported audio inside CAF, MKA and MKV. ADPCM inside WAV and CAF is supported as well; in MKV with video, Rust Player uses the first decodable audio track. WavPack, Monkey's Audio and DSD are currently unsupported. CAF, AIFF and MKV containers can also hold encodings the player cannot decode.
 
-Open or drop an external CUE sheet, whether it references one file or several, to add its tracks with their `INDEX 01` boundaries and titles. Each track keeps its own source file; the last track of a file plays to that file's end. The CUE sheet and its source files stay on disk. Rust Player can re-import its own M3U8 exports containing these entries. Other players can open the original CUE sheet.
+Open or drop an external CUE sheet, whether it references one file or several, to add its tracks with their `INDEX 01` boundaries and titles. A CUE sheet embedded as text in a FLAC file is recognized as well. Each track keeps its own source file; the last track of a file plays to that file's end. The CUE sheet and its source files stay on disk. Rust Player can re-import its own M3U8 exports containing these entries. Other players can open the original CUE sheet.
 
 **Settings → Audio** includes ReplayGain by track or album, preamp and peak-based clipping protection. ReplayGain runs before resampling and disables the bit-perfect indicator. Use **Scan and write ReplayGain** in a track's properties to measure the file (ITU-R BS.1770-4) and store `REPLAYGAIN_TRACK_GAIN` and `REPLAYGAIN_TRACK_PEAK` tags; only metadata changes, and the scan runs in the background while the current track keeps playing. You can also disable downmix and enable FLAC verification against the embedded MD5 during continuous playback. A seek or a CUE segment does not verify the entire FLAC.
 
@@ -137,7 +137,7 @@ Rust Player keeps a metadata cache beside those settings. It stores tags and CUE
 | Discord shows a placeholder | Enable artwork lookup or supply a public HTTPS cover URL or application asset. Check the lookup and RPC status in the Discord dialog. |
 | A background falls back to the theme color | Open **Theme Editor** to check the file path and decoder message. Background files are limited to 64 MiB. An animation can contain up to 600 frames and 48 MiB of decoded image data after resizing. |
 
-WavPack, Monkey's Audio, DSD/DoP, ASIO output, and video backgrounds are outside this build. CUE support covers external single-file and multi-file sheets, not embedded CUE data inside FLAC tags. See the [manual regression checklist](docs/TESTING.md), [release notes for the next version](docs/RELEASE-NOTES-NEXT.md), and [completion report](docs/COMPLETION-REPORT.md).
+WavPack, Monkey's Audio, DSD/DoP, ASIO output, and video backgrounds are outside this build. CUE support covers external single-file and multi-file sheets plus embedded `CUESHEET` text in FLAC; a binary FLAC CUEDATA block is not read. See the [manual regression checklist](docs/TESTING.md), [release notes for the next version](docs/RELEASE-NOTES-NEXT.md), [release workflow (Windows PC only)](docs/RELEASE-WORKFLOW.md), and [completion report](docs/COMPLETION-REPORT.md).
 
 [![Star History Chart](https://api.star-history.com/svg?repos=AikasAcc/rust-player&type=Date)](https://star-history.com/#AikasAcc/rust-player&Date)
 

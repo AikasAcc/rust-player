@@ -47,6 +47,12 @@ Still **not** supported: WavPack, Monkey's Audio, DSD, ASIO, VST plugins, and UP
 - **ReplayGain** can be measured in the background. Only the loudness information is written to the file; the music remains untouched.
 - In the track properties window, you can change title, artist, album, album artist, and track number.
 - External CUE files can reference multiple audio files.
+- CUE sheets embedded in FLAC files are now split into individual tracks.
+
+## Diagnostics for Troubleshooting
+
+- `scripts/run-benchmarks.ps1` repeats the four ignored benchmarks and archives raw data with CPU and memory metadata.
+- `scripts/run-frame-log.ps1` records one CSV row per UI frame only while it runs and summarizes p50/p95/p99/max after the player closes. It never stops a player that is already open.
 
 ## What Stays the Same
 
@@ -59,6 +65,7 @@ Still **not** supported: WavPack, Monkey's Audio, DSD, ASIO, VST plugins, and UP
 1. Two songs with the same sample rate and bit depth one after the other: is the transition free of clicks?
 2. Skip forward and backward during playback: no stuck or incorrect positions?
 3. Load a `.mp1`/`.mp2`, an ADPCM WAV, and a `.mka` file.
+4. Open a FLAC with an embedded CUE sheet: are the individual titles and track starts correct?
 
 ## Installation
 

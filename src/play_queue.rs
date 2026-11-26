@@ -76,8 +76,10 @@ impl Player {
         self.queue_order_edited = false;
     }
 
-    pub(super) fn order_track(&self) -> Option<Track> {
-        self.library.locate(*self.order.get(self.cursor)?)
+    /// Identity of the current order entry. Locations can move on a reorder;
+    /// the ID does not.
+    pub(super) fn order_id(&self) -> Option<TrackId> {
+        self.order.get(self.cursor).copied()
     }
 
     pub(super) fn adjacent_cursor(&self, offset: isize) -> Option<usize> {
@@ -96,7 +98,7 @@ impl Player {
             if self.library.locate(entry.track).is_none() {
                 continue;
             }
-            match self.open_id(entry.track, ctx, None) {
+            match self.open(entry.track, ctx, None) {
                 Ok(()) => {
                     self.status = warning.unwrap_or_default();
                     self.save_playback(Duration::ZERO);

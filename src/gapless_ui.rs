@@ -37,7 +37,12 @@ impl Player {
                 let track = self.library.locate(queued)?;
                 (NextTarget::Queue(entry, track), queued)
             } else if self.library.repeat == Repeat::One {
-                (NextTarget::Repeat(playing.track), playing.id)
+                // The handoff target still carries coordinates, but the source
+                // of truth is the ID. Derive the coordinate only when queueing.
+                (
+                    NextTarget::Repeat(self.library.locate(playing.id)?),
+                    playing.id,
+                )
             } else {
                 let cursor = self.next_cursor()?;
                 (NextTarget::Playlist(cursor), *self.order.get(cursor)?)
@@ -128,7 +133,7 @@ impl Player {
             Err(warning) => warning,
         };
         if self.library.repeat == Repeat::One {
-            match self.open_id(current, ctx, None) {
+            match self.open(current, ctx, None) {
                 Ok(()) => {
                     self.status = warning.unwrap_or_default();
                     self.save_playback(Duration::ZERO);
@@ -147,7 +152,7 @@ impl Player {
                 let Some(id) = self.order.get(candidate).copied() else {
                     continue;
                 };
-                match self.open_id(id, ctx, None) {
+                match self.open(id, ctx, None) {
                     Ok(()) => {
                         self.cursor = candidate;
                         self.status = warning.unwrap_or_default();

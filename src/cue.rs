@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -24,14 +25,22 @@ pub fn is_sheet(path: &Path) -> bool {
 pub fn reference(path: &Path) -> Option<(&Path, u32)> {
     let sheet = path.parent()?;
     let number = path.file_name()?.to_str()?.parse().ok()?;
-    (is_sheet(sheet) && (1..=99).contains(&number)).then_some((sheet, number))
+    if !(1..=99).contains(&number) {
+        return None;
+    }
+    (is_sheet(sheet) || has_embedded(sheet)).then_some((sheet, number))
+}
+
+/// True when the audio file carries a usable embedded CUE sheet.
+pub fn has_embedded(path: &Path) -> bool {
+    embedded(path).is_some()
 }
 
 pub fn resolve(path: &Path) -> Result<Option<Track>, String> {
     let Some((sheet, number)) = reference(path) else {
         return Ok(None);
     };
-    read(sheet)?
+    tracks(sheet)?
         .into_iter()
         .find(|track| track.number == number)
         .map(Some)
@@ -39,12 +48,98 @@ pub fn resolve(path: &Path) -> Result<Option<Track>, String> {
 }
 
 pub fn entries(sheet: &Path) -> Result<Vec<PathBuf>, String> {
-    read(sheet).map(|tracks| {
-        tracks
-            .into_iter()
-            .map(|track| sheet.join(track.number.to_string()))
-            .collect()
-    })
+    Ok(tracks(sheet)?
+        .into_iter()
+        .map(|track| sheet.join(track.number.to_string()))
+        .collect())
+}
+
+fn tracks(source: &Path) -> Result<Vec<Track>, String> {
+    if is_sheet(source) {
+        read(source)
+    } else {
+        embedded(source).ok_or_else(|| format!("No embedded CUE in {}", source.display()))
+    }
+}
+
+/// Reads `CUESHEET` text from a FLAC Vorbis comment metadata block.
+///
+/// lofty maps unknown Vorbis keys into a format-specific companion tag that is
+/// not exposed through the generic `Tag`, so the block is parsed directly.
+fn embedded(audio: &Path) -> Option<Vec<Track>> {
+    let text = flac_comments(audio)
+        .into_iter()
+        .filter(|(key, _)| {
+            key.eq_ignore_ascii_case("CUESHEET") || key.eq_ignore_ascii_case("CUESHEET_TEXT")
+        })
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>()
+        .join("\n");
+    parse_inner(audio, Some(audio), &text).ok()
+}
+
+fn flac_comments(path: &Path) -> Vec<(String, String)> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() || &magic != b"fLaC" {
+        return Vec::new();
+    }
+    loop {
+        let mut header = [0u8; 4];
+        if file.read_exact(&mut header).is_err() {
+            break;
+        }
+        let last = header[0] & 0x80 != 0;
+        let kind = header[0] & 0x7f;
+        let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        if length > 16 * 1024 * 1024 {
+            break;
+        }
+        if kind == 4 {
+            let mut block = vec![0u8; length];
+            if file.read_exact(&mut block).is_err() {
+                break;
+            }
+            return parse_vorbis_block(&block).unwrap_or_default();
+        }
+        if file.seek(SeekFrom::Current(length as i64)).is_err() {
+            break;
+        }
+        if last {
+            break;
+        }
+    }
+    Vec::new()
+}
+
+fn parse_vorbis_block(block: &[u8]) -> Option<Vec<(String, String)>> {
+    fn field<'a>(bytes: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+        let length = u32::from_le_bytes(bytes.get(*offset..*offset + 4)?.try_into().ok()?);
+        *offset = offset.checked_add(4)?;
+        let start = *offset;
+        *offset = offset.checked_add(length as usize)?;
+        bytes.get(start..*offset)
+    }
+    let mut offset = 0;
+    field(block, &mut offset)?;
+    let count = u32::from_le_bytes(block.get(offset..offset + 4)?.try_into().ok()?);
+    offset += 4;
+    let mut pairs = Vec::new();
+    for _ in 0..count.min(4096) {
+        let Some(item) = field(block, &mut offset) else {
+            break;
+        };
+        let Some(separator) = item.iter().position(|&byte| byte == b'=') else {
+            continue;
+        };
+        pairs.push((
+            String::from_utf8_lossy(&item[..separator]).into_owned(),
+            String::from_utf8_lossy(&item[separator + 1..]).into_owned(),
+        ));
+    }
+    Some(pairs)
 }
 
 pub fn duration(frames: u64) -> Duration {
@@ -75,9 +170,17 @@ fn read(sheet: &Path) -> Result<Vec<Track>, String> {
 }
 
 fn parse(sheet: &Path, text: &str) -> Result<Vec<Track>, String> {
+    parse_inner(sheet, None, text)
+}
+
+fn parse_inner(
+    sheet: &Path,
+    default_audio: Option<&Path>,
+    text: &str,
+) -> Result<Vec<Track>, String> {
     let mut title = String::new();
     let mut artist = String::new();
-    let mut audio = None;
+    let mut audio = default_audio.map(Path::to_path_buf);
     let mut seen_track = false;
     let mut current = None::<Track>;
     let mut tracks: Vec<Track> = Vec::new();
@@ -227,6 +330,67 @@ mod tests {
             "FILE \"a.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:10:00\nTRACK 02 AUDIO\nINDEX 01 00:05:00"
         )
         .is_err());
+        Ok(())
+    }
+
+    fn flac_with_cuesheet(text: &str) -> Vec<u8> {
+        let mut entry = b"CUESHEET=".to_vec();
+        entry.extend_from_slice(text.as_bytes());
+        let mut item = Vec::new();
+        item.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        item.extend_from_slice(&entry);
+        let mut block = Vec::new();
+        block.extend_from_slice(&4u32.to_le_bytes());
+        block.extend_from_slice(b"test");
+        block.extend_from_slice(&1u32.to_le_bytes());
+        block.extend_from_slice(&item);
+        let mut bytes = b"fLaC".to_vec();
+        bytes.push(0x80 | 4);
+        bytes.extend_from_slice(&(block.len() as u32).to_be_bytes()[1..]);
+        bytes.extend_from_slice(&block);
+        bytes
+    }
+
+    #[test]
+    fn parses_embedded_cue_without_file_entry() -> Result<(), String> {
+        let tracks = parse_inner(
+            Path::new("Album/whole.flac"),
+            Some(Path::new("Album/whole.flac")),
+            "TITLE \"Album\"\nTRACK 01 AUDIO\nTITLE \"First\"\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nTITLE \"Second\"\nINDEX 01 00:13:37",
+        )?;
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].audio, PathBuf::from("Album/whole.flac"));
+        assert_eq!(tracks[0].title, "First");
+        assert_eq!(tracks[1].start, 1012);
+        assert_eq!(tracks[1].title, "Second");
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_virtual_track_from_flac_cuesheet_comment() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let audio = directory.path().join("whole.flac");
+        let text = "TITLE \"Album\"\nTRACK 01 AUDIO\nTITLE \"First\"\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nTITLE \"Second\"\nINDEX 01 00:13:37";
+        let bytes = flac_with_cuesheet(text);
+        assert_eq!(&bytes[..4], b"fLaC");
+        assert_eq!(bytes[4], 0x84);
+        assert_eq!(
+            u32::from_be_bytes([0, bytes[5], bytes[6], bytes[7]]) as usize,
+            bytes.len() - 8
+        );
+        std::fs::write(&audio, bytes)?;
+        let comments = flac_comments(&audio);
+        assert_eq!(comments.len(), 1, "comments: {comments:?}");
+        assert!(embedded(&audio).is_some(), "embedded CUE missing");
+        let virtual_track = audio.join("2");
+        let (source, number) = reference(&virtual_track).ok_or("missing CUE reference")?;
+        assert_eq!(source, audio.as_path());
+        assert_eq!(number, 2);
+        let track = resolve(&virtual_track)?.ok_or("missing CUE track")?;
+        assert_eq!(track.title, "Second");
+        assert_eq!(track.audio, audio);
+        assert_eq!(entries(&audio)?, vec![audio.join("1"), audio.join("2")]);
         Ok(())
     }
 }

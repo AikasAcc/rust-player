@@ -1,5 +1,6 @@
 use super::*;
 use std::hint::black_box;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Row {
     scenario: &'static str,
@@ -26,9 +27,109 @@ fn write_csv(name: &str, rows: &[Row]) {
     std::fs::write(format!("target/benchmark-{name}.csv"), csv).expect("write benchmark CSV");
 }
 
+#[derive(Default)]
+struct ProcessUsage {
+    user_micros: u128,
+    kernel_micros: u128,
+    page_faults: u32,
+    peak_working_set: usize,
+}
+
+#[cfg(windows)]
+fn process_usage() -> ProcessUsage {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    fn ticks(time: FILETIME) -> u128 {
+        ((u128::from(time.dwHighDateTime) << 32) | u128::from(time.dwLowDateTime)) / 10
+    }
+
+    let process = unsafe { GetCurrentProcess() };
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let (user_micros, kernel_micros) =
+        if unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .is_ok()
+        {
+            (ticks(user), ticks(kernel))
+        } else {
+            (0, 0)
+        };
+    let mut memory = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    let (page_faults, peak_working_set) =
+        if unsafe { GetProcessMemoryInfo(process, &mut memory, memory.cb) }.is_ok() {
+            (memory.PageFaultCount, memory.PeakWorkingSetSize)
+        } else {
+            (0, 0)
+        };
+    ProcessUsage {
+        user_micros,
+        kernel_micros,
+        page_faults,
+        peak_working_set,
+    }
+}
+
+#[cfg(not(windows))]
+fn process_usage() -> ProcessUsage {
+    ProcessUsage::default()
+}
+
+/// Wall/CPU/memory context for one ignored benchmark process. The values are
+/// process-wide, so they describe this benchmark run and nothing else.
+struct BenchRun {
+    name: &'static str,
+    started_unix_secs: u64,
+    started: Instant,
+}
+
+impl BenchRun {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            started_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            started: Instant::now(),
+        }
+    }
+
+    fn finish(self, rows: &[Row]) {
+        let wall_micros = self.started.elapsed().as_micros();
+        let usage = process_usage();
+        write_csv(self.name, rows);
+        let meta = format!(
+            "key,value\n\
+             started_unix_secs,{}\n\
+             wall_micros,{}\n\
+             cpu_user_micros,{}\n\
+             cpu_kernel_micros,{}\n\
+             page_faults,{}\n\
+             peak_working_set_bytes,{}\n\
+             profile,release\n",
+            self.started_unix_secs,
+            wall_micros,
+            usage.user_micros,
+            usage.kernel_micros,
+            usage.page_faults,
+            usage.peak_working_set,
+        );
+        std::fs::write(format!("target/benchmark-{}.meta.csv", self.name), meta)
+            .expect("write benchmark metadata CSV");
+    }
+}
+
 #[test]
 #[ignore = "Run individually with --ignored --nocapture --test-threads=1"]
 fn library_search_scale() {
+    let run = BenchRun::new("search");
     let mut rows = Vec::new();
     for n in [1000, 10000, 50000, 100000] {
         let mut list = Library::default().playlists.remove(0);
@@ -60,7 +161,7 @@ fn library_search_scale() {
             record(&mut rows, "search", n, start.elapsed().as_micros());
         }
     }
-    write_csv("search", &rows);
+    run.finish(&rows);
 }
 
 fn save_bench_library(n: usize) -> Library {
@@ -82,6 +183,7 @@ fn save_bench_library(n: usize) -> Library {
 #[test]
 #[ignore = "Run individually with --ignored --nocapture --test-threads=1"]
 fn library_save_scale() {
+    let run = BenchRun::new("save");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("library.json");
     let mut rows = Vec::new();
@@ -114,12 +216,13 @@ fn library_save_scale() {
         }
         worker.shutdown();
     }
-    write_csv("save", &rows);
+    run.finish(&rows);
 }
 
 #[test]
 #[ignore = "Creates 1000 temporary PCM WAV files"]
 fn tag_scan() {
+    let run = BenchRun::new("tag_scan");
     let dir = tempfile::tempdir().unwrap();
     let seed = dir.path().join("seed.wav");
     crate::audio::setup::tone(&seed, 48000).unwrap();
@@ -142,7 +245,7 @@ fn tag_scan() {
     for row in &rows {
         println!("{},{},{}", row.scenario, row.size, row.micros);
     }
-    write_csv("tag_scan", &rows);
+    run.finish(&rows);
 }
 
 /// UI-thread cost of a track change: the old path called `Media::read`
@@ -151,6 +254,7 @@ fn tag_scan() {
 #[test]
 #[ignore = "Run individually with --ignored --nocapture --test-threads=1"]
 fn media_read_scale() {
+    let run = BenchRun::new("media");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("track.wav");
     crate::audio::setup::tone(&path, 48000).unwrap();
@@ -173,5 +277,5 @@ fn media_read_scale() {
             micros,
         });
     }
-    write_csv("media", &rows);
+    run.finish(&rows);
 }

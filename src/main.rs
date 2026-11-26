@@ -43,6 +43,7 @@ use library::{
 use rand::seq::SliceRandom;
 use std::{
     collections::HashMap,
+    io::Write,
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -59,7 +60,6 @@ struct Playing {
     id: TrackId,
     counted: bool,
     lastfm: lastfm::Listen,
-    track: Track,
     sink: audio::AudioTrack,
     duration: Option<Duration>,
     media: Media,
@@ -366,9 +366,7 @@ struct Player {
     playing: Option<Playing>,
     library: Library,
     library_path: PathBuf,
-    library_needs_backup: bool,
-    playback_needs_backup: bool,
-    listening_needs_backup: bool,
+    backup: save_worker::BackupTracker,
     restore_track: bool,
     volume_changed: bool,
     volume_save_at: Option<Instant>,
@@ -403,6 +401,9 @@ struct Player {
     playlist_exports: Vec<mpsc::Receiver<PlaylistExportResult>>,
     views: HashMap<usize, PlaylistView>,
     indexing: HashMap<usize, mpsc::Receiver<Vec<TrackInfo>>>,
+    /// Opt-in UI frame timing: set RUST_PLAYER_FRAME_LOG to a CSV path.
+    frame_log: Option<std::io::BufWriter<std::fs::File>>,
+    frame_log_count: usize,
 }
 
 impl Player {
@@ -435,6 +436,21 @@ impl Player {
         if library.check_for_updates {
             updater.check(ctx, env!("CARGO_PKG_VERSION"));
         }
+        let mut backup = save_worker::BackupTracker::default();
+        if library_needs_backup {
+            backup.need(library_path.clone());
+        }
+        if listening_needs_backup {
+            backup.need(library_path.with_file_name("listening.json"));
+        }
+        let mut frame_log = std::env::var_os("RUST_PLAYER_FRAME_LOG").and_then(|path| {
+            std::fs::File::create(path)
+                .ok()
+                .map(|file| std::io::BufWriter::with_capacity(64 * 1024, file))
+        });
+        if let Some(log) = &mut frame_log {
+            let _ = writeln!(log, "frame,micros");
+        }
         let player = Self {
             relink: None,
             gain_jobs: HashMap::new(),
@@ -462,9 +478,7 @@ impl Player {
             playing: None,
             library,
             library_path,
-            library_needs_backup,
-            playback_needs_backup: false,
-            listening_needs_backup,
+            backup,
             restore_track: true,
             volume_changed: false,
             volume_save_at: None,
@@ -494,6 +508,8 @@ impl Player {
             playlist_exports: Vec::new(),
             views: HashMap::new(),
             indexing: HashMap::new(),
+            frame_log,
+            frame_log_count: 0,
         };
         player.sync_cache_paths();
         player
@@ -516,41 +532,31 @@ impl Player {
         self.library.prune_favorites();
         self.sync_cache_paths();
         let mut notices = Vec::new();
-        if self.library_needs_backup {
-            match Library::back_up_invalid_file(&self.library_path) {
-                Ok(backup) => notices.push(format!(
-                    "Saved a copy of unreadable settings to {}",
-                    backup.display()
-                )),
-                Err(error) => {
-                    self.status = format!("Could not back up unreadable settings: {error}");
-                    return;
-                }
-            }
+        if !self.prepare_backup(
+            self.library_path.clone(),
+            "library.invalid-",
+            "settings",
+            &mut notices,
+        ) {
+            return;
         }
-        if self.listening_needs_backup {
-            let path = self.library_path.with_file_name("listening.json");
-            match Library::back_up_invalid_json(&path, "listening.invalid-") {
-                Ok(backup) => notices.push(format!(
-                    "Saved a copy of unreadable listening activity to {}",
-                    backup.display()
-                )),
-                Err(error) => {
-                    self.status =
-                        format!("Could not back up unreadable listening activity: {error}");
-                    return;
-                }
-            }
+        let listening_path = self.library_path.with_file_name("listening.json");
+        if !self.prepare_backup(
+            listening_path,
+            "listening.invalid-",
+            "listening activity",
+            &mut notices,
+        ) {
+            return;
         }
         // Serialize on the UI thread, let the worker do the atomic write.
         // The snapshot belongs to the state right now, so a later save simply
-        // replaces it in the worker's queue.
+        // replaces it in the worker's queue. The backup stays pending until the
+        // worker confirms that the replacement reached the disk.
         match serde_json::to_vec(&self.library) {
             Ok(bytes) => {
                 self.save_worker.enqueue(self.library_path.clone(), bytes);
                 self.volume_changed = false;
-                self.library_needs_backup = false;
-                self.listening_needs_backup = false;
                 if !notices.is_empty() {
                     self.status = notices.join(" ");
                 }
@@ -558,6 +564,34 @@ impl Player {
             Err(error) => {
                 notices.push(format!("Could not save playlists or settings: {error}"));
                 self.status = notices.join(" ");
+            }
+        }
+    }
+
+    /// Copy a corrupt file before its replacement is written. `false` aborts
+    /// the save so the original stays untouched for a later retry.
+    fn prepare_backup(
+        &mut self,
+        path: PathBuf,
+        prefix: &str,
+        label: &str,
+        notices: &mut Vec<String>,
+    ) -> bool {
+        if !self.backup.should_back_up(&path) {
+            return true;
+        }
+        match Library::back_up_invalid_json(&path, prefix) {
+            Ok(backup) => {
+                self.backup.mark_backed_up(path);
+                notices.push(format!(
+                    "Saved a copy of unreadable {label} to {}",
+                    backup.display()
+                ));
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not back up unreadable {label}: {error}");
+                false
             }
         }
     }
@@ -616,7 +650,7 @@ impl Player {
             Ok(None) => return None,
             Err(error) => {
                 self.status = format!("Could not read saved playback: {error}");
-                self.playback_needs_backup = true;
+                self.backup.need(path.clone());
                 self.back_up_invalid_playback(&path);
                 return None;
             }
@@ -647,22 +681,22 @@ impl Player {
         let Some(track) = self.library.locate(id) else {
             return;
         };
-        match self.open_id(id, ctx, Some(saved.position)) {
+        match self.open(id, ctx, Some(saved.position)) {
             Ok(()) => {
                 self.library.selected = track.0;
-                self.plan(track);
+                self.plan(id);
             }
             Err(error) => self.status = format!("Could not restore last track: {error}"),
         }
     }
 
     fn back_up_invalid_playback(&mut self, path: &std::path::Path) {
-        if !self.playback_needs_backup {
+        if !self.backup.should_back_up(path) {
             return;
         }
         match Library::back_up_invalid_json(path, "playback.invalid-") {
             Ok(backup) => {
-                self.playback_needs_backup = false;
+                self.backup.mark_backed_up(path.to_path_buf());
                 self.status = format!(
                     "Saved a copy of unreadable playback state to {}",
                     backup.display()
@@ -676,8 +710,9 @@ impl Player {
 
     fn save_playback(&mut self, position: Duration) {
         let Some(playing) = &self.playing else { return };
-        let track = playing.track;
         let id = playing.id;
+        // The coordinates are only written for older builds; identity is the ID.
+        let track = self.library.locate(id).unwrap_or((0, 0));
         let saved = SavedTrack {
             id: Some(id),
             track,
@@ -694,22 +729,17 @@ impl Player {
     fn write_playback(&mut self, saved: Option<SavedTrack>) {
         let path = self.library_path.with_file_name("playback.json");
         let mut notices = Vec::new();
-        if self.playback_needs_backup {
-            match Library::back_up_invalid_json(&path, "playback.invalid-") {
-                Ok(backup) => notices.push(format!(
-                    "Saved a copy of unreadable playback state to {}",
-                    backup.display()
-                )),
-                Err(error) => {
-                    self.status = format!("Could not back up unreadable playback state: {error}");
-                    return;
-                }
-            }
+        if !self.prepare_backup(
+            path.clone(),
+            "playback.invalid-",
+            "playback state",
+            &mut notices,
+        ) {
+            return;
         }
         match serde_json::to_vec(&saved) {
             Ok(bytes) => {
-                self.save_worker.enqueue(path.clone(), bytes);
-                self.playback_needs_backup = false;
+                self.save_worker.enqueue(path, bytes);
                 if !notices.is_empty() {
                     self.status = notices.join(" ");
                 }
@@ -736,8 +766,8 @@ impl Player {
             .and_then(|id| locations.get(id))
             .map(|loc| loc.0);
         if let Some(playing) = &mut self.playing {
-            if let Some(&new) = locations.get(&playing.id) {
-                playing.track = new;
+            if locations.contains_key(&playing.id) {
+                // The ID survives the reorder; no coordinate rebase is needed.
                 let position = playing.sink.get_pos();
                 self.save_playback(position);
                 return;
@@ -942,11 +972,10 @@ impl Player {
 
     /// Toggle a track by identity, whether it is currently playing or only a row.
     fn toggle_favorite_id(&mut self, id: TrackId) {
-        let playing_track = self
+        let playing_in_favorites = self
             .playing
             .as_ref()
-            .filter(|playing| playing.id == id)
-            .map(|playing| playing.track);
+            .is_some_and(|playing| playing.id == id);
         let path = self
             .library
             .track_path(id)
@@ -963,7 +992,9 @@ impl Player {
         }
 
         let notice = format!("Removed from {}", self.library.playlists[index].name);
-        if playing_track.is_some_and(|track| track.0 == index) {
+        if playing_in_favorites {
+            // The sink keeps playing the file. Point the identity at the same
+            // path in another playlist before the favorite entry disappears.
             let replacement = self
                 .library
                 .playlists
@@ -976,12 +1007,11 @@ impl Player {
                         .iter()
                         .position(|track| same_path(track, &path))
                         .map(|entry| (list, entry))
-                });
-            if let Some(track) = replacement {
-                let p = self.playing.as_mut().expect("active track");
-                p.track = track;
-                p.id = self.library.track_id(track).unwrap_or(p.id);
-                self.plan(track);
+                })
+                .and_then(|track| self.library.track_id(track));
+            if let Some(new_id) = replacement {
+                self.playing.as_mut().expect("active track").id = new_id;
+                self.plan(new_id);
             }
         }
         let saved = self.previously_saved();
@@ -1024,8 +1054,22 @@ impl Player {
             .record(path, &playing.media.title, &playing.media.artist);
         self.listening_ranks = None;
         let path = self.library_path.with_file_name("listening.json");
+        let mut notices = Vec::new();
+        if !self.prepare_backup(
+            path.clone(),
+            "listening.invalid-",
+            "listening activity",
+            &mut notices,
+        ) {
+            return;
+        }
         match serde_json::to_vec(&self.listening) {
-            Ok(bytes) => self.save_worker.enqueue(path, bytes),
+            Ok(bytes) => {
+                self.save_worker.enqueue(path, bytes);
+                if !notices.is_empty() {
+                    self.status = notices.join(" ");
+                }
+            }
             Err(error) => self.status = format!("Could not save listening activity: {error}"),
         }
     }
@@ -1082,9 +1126,10 @@ impl Player {
         self.refresh_playback_ids(saved);
         if matches!(edit, TrackEdit::Move(_))
             && !self.library.shuffle
-            && let Some(track) = self.order_track().filter(|track| track.0 == list)
+            && self.order_list == Some(list)
+            && let Some(id) = self.order_id()
         {
-            self.plan(track);
+            self.plan(id);
         }
     }
 
@@ -1153,7 +1198,13 @@ impl Player {
         }
     }
 
-    fn plan(&mut self, (list, index): Track) {
+    /// Build the playback order around a track identity. Coordinates are
+    /// looked up once here; no caller has to keep a `(list, index)` in sync
+    /// with the library after a reorder.
+    fn plan(&mut self, id: TrackId) {
+        let Some((list, index)) = self.library.locate(id) else {
+            return;
+        };
         self.queue_order_edited = false;
         self.order_list = Some(list);
         let ids = &self.library.playlists[list].ids;
@@ -1161,9 +1212,9 @@ impl Player {
         self.order.clear();
         if self.library.shuffle {
             self.order
-                .extend(ids.iter().copied().filter(|&id| id != ids[index]));
+                .extend(ids.iter().copied().filter(|&item| item != id));
             self.order.shuffle(&mut rand::rng());
-            self.order.insert(0, ids[index]);
+            self.order.insert(0, id);
             self.cursor = 0;
         } else if let Some(view) = self.views.get(&list) {
             self.order.extend(view.order.iter().map(|&i| ids[i]));
@@ -1171,7 +1222,7 @@ impl Player {
             self.cursor = self
                 .order
                 .iter()
-                .position(|&item| item == ids[index])
+                .position(|&item| item == id)
                 .unwrap_or(index);
         } else {
             self.order.extend_from_slice(ids);
@@ -1223,10 +1274,18 @@ impl Player {
         }
     }
 
-    /// Report disk failures from the background writer on the next frame.
+    /// Report disk failures and retire pending backups on the next frame.
     fn finish_saves(&mut self) {
-        for error in self.save_worker.take_errors() {
-            self.status = error;
+        for report in self.save_worker.take_reports() {
+            match report.error {
+                Some(error) => {
+                    // The corrupt original is still on disk. Require a fresh
+                    // backup before the next attempt can overwrite it.
+                    self.backup.failed(report.path);
+                    self.status = error;
+                }
+                None => self.backup.written(&report.path),
+            }
         }
     }
 
@@ -1265,18 +1324,20 @@ impl Player {
         if !changed.is_empty() {
             self.search_results = None;
         }
-        if let Some(track) = self.order_track()
+        if let Some(id) = self.order_id()
             && !self.queue_order_edited
             && !self.library.shuffle
-            && changed.contains(&track.0)
+            && self
+                .library
+                .locate(id)
+                .is_some_and(|track| changed.contains(&track.0))
         {
-            self.plan(track);
+            self.plan(id);
         }
     }
 
-    /// ID-based entry point for playback. Locations are derived and may move,
-    /// the ID is not.
-    fn open_id(
+    /// Playback entry point. Locations are derived and may move, the ID is not.
+    fn open(
         &mut self,
         id: TrackId,
         ctx: &egui::Context,
@@ -1285,19 +1346,6 @@ impl Player {
         let track = self
             .library
             .locate(id)
-            .ok_or_else(|| "Track is no longer in the library".to_string())?;
-        self.open(track, ctx, restore)
-    }
-
-    fn open(
-        &mut self,
-        track: Track,
-        ctx: &egui::Context,
-        restore: Option<Duration>,
-    ) -> Result<(), String> {
-        let id = self
-            .library
-            .track_id(track)
             .ok_or_else(|| "Track is no longer in the library".to_string())?;
         self.setup.stop_tone();
         let path = &self.library.playlists[track.0].tracks[track.1];
@@ -1367,7 +1415,6 @@ impl Player {
             id,
             counted: false,
             lastfm: lastfm::Listen::default(),
-            track,
             sink,
             duration,
             media,
@@ -1620,10 +1667,10 @@ impl Player {
         }
     }
 
-    fn start(&mut self, track: Track, ctx: &egui::Context) {
-        match self.open(track, ctx, None) {
+    fn start(&mut self, id: TrackId, ctx: &egui::Context) {
+        match self.open(id, ctx, None) {
             Ok(()) => {
-                self.plan(track);
+                self.plan(id);
                 self.refresh_gapless();
                 self.status.clear();
                 self.save_playback(Duration::ZERO);
@@ -1638,8 +1685,10 @@ impl Player {
     fn start_playlist(&mut self, list: usize, ctx: &egui::Context) {
         let len = self.library.playlists[list].tracks.len();
         let order = self.views.get(&list).map(|view| view.order.as_slice());
-        if let Some(index) = playlist_entry(len, self.library.shuffle, order) {
-            self.start((list, index), ctx);
+        if let Some(index) = playlist_entry(len, self.library.shuffle, order)
+            && let Some(id) = self.library.track_id((list, index))
+        {
+            self.start(id, ctx);
         }
     }
 
@@ -1670,7 +1719,7 @@ impl Player {
             && let Some(&id) = self.order.get(cursor)
             && self.library.locate(id).is_some()
         {
-            match self.open_id(id, ctx, None) {
+            match self.open(id, ctx, None) {
                 Ok(()) => {
                     self.cursor = cursor;
                     self.refresh_gapless();
@@ -1708,8 +1757,8 @@ impl Player {
         if self.previous_restarts_track() && self.seek(Duration::ZERO, ctx) {
             return;
         }
-        if let Some(anchor) = self.order_track()
-            && self.playing.as_ref().is_some_and(|p| p.track != anchor)
+        if let Some(anchor) = self.order_id()
+            && self.playing.as_ref().is_some_and(|p| p.id != anchor)
         {
             match self.open(anchor, ctx, None) {
                 Ok(()) => {
@@ -1782,8 +1831,8 @@ impl Player {
 
     fn toggle_shuffle(&mut self) {
         self.library.shuffle = !self.library.shuffle;
-        if let Some(track) = self.order_track() {
-            self.plan(track);
+        if let Some(id) = self.order_id() {
+            self.plan(id);
         }
         self.save();
     }
@@ -1793,8 +1842,8 @@ impl Player {
         taskbar::Buttons {
             previous: (loaded
                 && (self.adjacent_cursor(-1).is_some()
-                    || self.order_track().is_some_and(|anchor| {
-                        self.playing.as_ref().is_some_and(|p| p.track != anchor)
+                    || self.order_id().is_some_and(|anchor| {
+                        self.playing.as_ref().is_some_and(|p| p.id != anchor)
                     })))
                 || self.previous_restarts_track(),
             can_play: loaded
@@ -1844,6 +1893,7 @@ impl Player {
 
 impl eframe::App for Player {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        let frame_started = self.frame_log.as_ref().map(|_| Instant::now());
         self.setup.update(ctx);
         self.lastfm.poll(ctx);
         self.updater.poll(ctx);
@@ -1942,6 +1992,18 @@ impl eframe::App for Player {
         self.refresh_gapless();
         self.flush_volume(ctx);
         self.refresh_windows_controls();
+        if let (Some(log), Some(started)) = (&mut self.frame_log, frame_started) {
+            let _ = writeln!(
+                log,
+                "{},{}",
+                self.frame_log_count,
+                started.elapsed().as_micros()
+            );
+            self.frame_log_count += 1;
+            if self.frame_log_count.is_multiple_of(120) {
+                let _ = log.flush();
+            }
+        }
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
@@ -1954,6 +2016,9 @@ impl eframe::App for Player {
         }
         // Drain and join: graceful exit must never lose a queued snapshot.
         self.save_worker.shutdown();
+        if let Some(log) = &mut self.frame_log {
+            let _ = log.flush();
+        }
     }
 }
 

@@ -66,9 +66,10 @@ impl Player {
                     );
                 }
                 if !self.library.shuffle
-                    && let Some(track) = self.order_track().filter(|track| track.0 == list)
+                    && self.order_list == Some(list)
+                    && let Some(id) = self.order_id()
                 {
-                    self.plan(track);
+                    self.plan(id);
                 }
                 self.request_index(list, ctx);
                 self.save();
@@ -294,8 +295,10 @@ impl Player {
             }
             if let Some((index, change)) = edit {
                 self.edit_track((list, index), change);
-            } else if let Some(index) = play {
-                self.start((list, index), ctx);
+            } else if let Some(index) = play
+                && let Some(id) = self.library.track_id((list, index))
+            {
+                self.start(id, ctx);
             }
             if let Some(path) = properties {
                 self.open_track_properties(path, ctx);
