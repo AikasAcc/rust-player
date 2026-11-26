@@ -139,7 +139,7 @@ Rust Player keeps a metadata cache beside those settings. It stores tags and CUE
 
 WavPack, Monkey's Audio, DSD/DoP, ASIO output, and video backgrounds are outside this build. CUE support covers external single-file and multi-file sheets, not embedded CUE data inside FLAC tags. See the [manual regression checklist](docs/TESTING.md), [release notes for the next version](docs/RELEASE-NOTES-NEXT.md), and [completion report](docs/COMPLETION-REPORT.md).
 
-[![Star History Chart](https://api.star-history.com/svg?repos=AikasAcc/rust-player&type=Date)](https://star-history.com/#AikasAcc/rust-player&Date)
+[![Star History Chart](https://www.star-history.com/?repos=aikasacc%2Frust-player&type=date&legend=top-left)
 
 ## License
 
