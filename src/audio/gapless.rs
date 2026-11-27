@@ -45,9 +45,7 @@ pub(super) fn next_packet<'a, T: ConvertibleSample>(
     match source.next(scratch) {
         Ok(samples) => samples,
         Err(error) => {
-            report(Event::Warning(format!(
-                "Skipped unreadable audio at the end of the track: {error}"
-            )));
+            report(Event::Error(format!("Could not decode audio: {error}")));
             None
         }
     }

@@ -206,12 +206,6 @@ impl Fir {
             }
         }
         let ratio = f64::from(source.info.rate) / f64::from(rate);
-        let length = (response[0].len() as f64 / ratio).round() as usize;
-        if !(1..=MAX_TAPS).contains(&length) {
-            return Err(format!(
-                "The FIR impulse must fit {MAX_TAPS} samples at the output rate."
-            ));
-        }
         if source.info.rate != rate {
             let input: Vec<_> = (0..response[0].len())
                 .flat_map(|frame| response.iter().map(move |channel| channel[frame]))
@@ -233,6 +227,15 @@ impl Fir {
                     channel.push(*sample * ratio as f32);
                 }
             }
+        }
+        // The resampler decides the final tap count. Deriving the history size
+        // from the pre-resample estimate can round one sample short and panic
+        // on the first process() call.
+        let length = response[0].len();
+        if !(1..=MAX_TAPS).contains(&length) {
+            return Err(format!(
+                "The FIR impulse must fit {MAX_TAPS} samples at the output rate."
+            ));
         }
         Ok(Self {
             taps: response,
@@ -339,6 +342,39 @@ impl Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, io::Write};
+
+    fn write_impulse(path: &Path, rate: u32, frames: usize) {
+        let bytes = (frames * 2) as u32;
+        let mut wav = fs::File::create(path).unwrap();
+        wav.write_all(b"RIFF").unwrap();
+        wav.write_all(&(bytes + 36).to_le_bytes()).unwrap();
+        wav.write_all(b"WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00")
+            .unwrap();
+        wav.write_all(&rate.to_le_bytes()).unwrap();
+        wav.write_all(&(rate * 2).to_le_bytes()).unwrap();
+        wav.write_all(b"\x02\x00\x10\x00data").unwrap();
+        wav.write_all(&bytes.to_le_bytes()).unwrap();
+        for index in 0..frames {
+            let sample = if index % 2 == 0 { i16::MAX } else { i16::MIN };
+            wav.write_all(&sample.to_le_bytes()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_resampled_impulse_sizes_its_history_after_the_resampler() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("impulse.wav");
+        // 400 frames at 48 kHz become 368 at 44.1 kHz, while the old estimate
+        // rounded this to 367 and indexed one sample past the history.
+        write_impulse(&path, 48_000, 400);
+
+        let mut fir = Fir::load(&path, 44_100, 1).expect("impulse loads");
+        assert_eq!(fir.histories[0].len(), fir.taps[0].len() * 2);
+        let mut frame = [0.5];
+        fir.process(&mut frame);
+        assert!(frame[0].is_finite());
+    }
 
     #[test]
     fn reads_autoeq_and_applies_an_impulse_across_packet_boundaries() {

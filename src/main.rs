@@ -10,6 +10,7 @@ mod benchmarks;
 mod cue;
 mod diagnostics;
 mod digest;
+mod file_assoc;
 mod fonts;
 mod gain;
 mod gapless_ui;
@@ -286,12 +287,45 @@ mod shortcut_tests {
     }
 }
 
+#[cfg(test)]
+mod queue_title_tests {
+    use super::*;
+
+    fn info(title: &str) -> TrackInfo {
+        TrackInfo {
+            title: title.into(),
+            ..TrackInfo::default()
+        }
+    }
+
+    #[test]
+    fn a_missing_owning_view_does_not_borrow_a_title_from_another_playlist() {
+        let views = HashMap::from([(
+            1,
+            PlaylistView::build(vec![info("Unrelated track")], Sort::Added, false),
+        )]);
+
+        assert_eq!(Player::view_title(&views, 0, 0), None);
+        assert_eq!(
+            Player::view_title(&views, 1, 0).as_deref(),
+            Some("Unrelated track")
+        );
+    }
+
+    #[test]
+    fn an_empty_title_is_not_used_for_a_queued_label() {
+        let views = HashMap::from([(0, PlaylistView::build(vec![info("")], Sort::Added, false))]);
+        assert_eq!(Player::view_title(&views, 0, 0), None);
+    }
+}
+
 struct ThemeDraft {
     theme: theme::Theme,
     font: Option<PathBuf>,
     font_error: String,
     background: background::Settings,
     themes: Vec<theme::NamedTheme>,
+    saved_themes_changed: bool,
     selected: Option<usize>,
     name: String,
     theme_error: String,
@@ -869,6 +903,11 @@ struct Player {
     play_queue: play_queue::PlayQueue,
     inspector_tab: InspectorTab,
     imports: Vec<(usize, mpsc::Receiver<ImportResult>)>,
+    /// Files handed over by Windows on a double-click. Imported and played on
+    /// the first frame once the UI is ready.
+    startup_files: Vec<PathBuf>,
+    play_first_import: bool,
+    file_assoc_status: String,
     playlist_imports: Vec<mpsc::Receiver<Vec<PlaylistImportResult>>>,
     playlist_exports: Vec<mpsc::Receiver<PlaylistExportResult>>,
     views: HashMap<usize, PlaylistView>,
@@ -1025,6 +1064,9 @@ impl Player {
             order: Vec::new(),
             cursor: usize::MAX,
             imports: Vec::new(),
+            startup_files: Vec::new(),
+            play_first_import: false,
+            file_assoc_status: String::new(),
             playlist_imports: Vec::new(),
             playlist_exports: Vec::new(),
             views: HashMap::new(),
@@ -1872,7 +1914,7 @@ impl Player {
         });
     }
 
-    fn finish_imports(&mut self) {
+    fn finish_imports(&mut self, ctx: &egui::Context) {
         let mut index = 0;
         while index < self.imports.len() {
             let (list, rx) = &self.imports[index];
@@ -1880,11 +1922,17 @@ impl Player {
             match rx.try_recv() {
                 Ok((tracks, skipped)) => {
                     self.imports.remove(index);
+                    let play = std::mem::take(&mut self.play_first_import);
                     let count = tracks.len();
                     let playlist = &mut self.library.playlists[list];
                     let first_new = playlist.tracks.len();
                     playlist.tracks.extend(tracks);
                     self.library.rebuild_locations();
+                    let first_id = if play {
+                        self.library.playlists[list].ids.get(first_new).copied()
+                    } else {
+                        None
+                    };
                     self.refresh_smart_playlists();
                     let playlist = &self.library.playlists[list];
                     if self.order_list == Some(list) {
@@ -1903,6 +1951,10 @@ impl Player {
                         )
                     };
                     self.save();
+                    if let Some(id) = first_id {
+                        self.library.selected = list;
+                        self.start(id, ctx);
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.imports.remove(index);
@@ -1953,6 +2005,7 @@ impl Player {
             self.request_index(list, ctx);
         }
         self.invalidate_search();
+        self.thumbs.invalidate_all();
     }
 
     /// Rebuild smart playlists from the ordinary library playlists. Membership
@@ -2093,6 +2146,42 @@ impl Player {
             .insert(list, self.indexer.request(tracks, ctx));
     }
 
+    /// Title from the owning playlist view only. A different playlist can have
+    /// a row at the same index, but that row is a different track; borrowing its
+    /// title would silently relabel the queued entry.
+    fn view_title(
+        views: &HashMap<usize, PlaylistView>,
+        list: usize,
+        track: usize,
+    ) -> Option<String> {
+        views
+            .get(&list)
+            .and_then(|view| view.tracks.get(track))
+            .filter(|info| !info.title.is_empty())
+            .map(|info| info.title.clone())
+    }
+
+    /// Best-known title for a stable ID from indexed playlist views. Mirrors
+    /// the lookup used by the queue panel so saved labels stay identical.
+    fn queued_title(&self, id: TrackId) -> Option<String> {
+        let (list, track) = self.library.locate(id)?;
+        Self::view_title(&self.views, list, track)
+    }
+
+    /// Queued titles are snapshots taken when a row was added. Re-read them
+    /// once fresh metadata arrives, e.g. after a tag edit or ReplayGain scan.
+    fn refresh_queue_titles(&mut self) {
+        let titles: HashMap<TrackId, String> = self
+            .play_queue
+            .queued_tracks()
+            .into_iter()
+            .filter_map(|id| self.queued_title(id).map(|title| (id, title)))
+            .collect();
+        if self.play_queue.refresh_titles(&titles) {
+            self.save_queue();
+        }
+    }
+
     fn finish_indexes(&mut self) {
         let mut changed = Vec::new();
         self.indexing.retain(|&list, rx| match rx.try_recv() {
@@ -2117,6 +2206,7 @@ impl Player {
             self.invalidate_search();
             // Fresh metadata can change which tracks a saved query matches.
             self.refresh_smart_playlists();
+            self.refresh_queue_titles();
         }
         if let Some(id) = self.order_id()
             && !self.queue_order_edited
@@ -2292,7 +2382,7 @@ impl Player {
             "lrc"
         };
         playing.lyrics_status =
-            match lyrics::save(&track.with_extension(extension), &playing.media.lyrics) {
+            match lyrics::overwrite(&track.with_extension(extension), &playing.media.lyrics) {
                 Ok(()) => {
                     playing.lyrics_online = false;
                     format!("Saved .{extension} next to the track.")
@@ -2856,6 +2946,14 @@ impl eframe::App for Player {
         } else if let Some(delay) = self.status_timer.repaint_after(now) {
             ctx.request_repaint_after(delay);
         }
+        if !self.startup_files.is_empty() {
+            // A file opened from Explorer takes precedence over a restored
+            // session; otherwise the old song would start before the new one.
+            self.restore_track = false;
+            self.play_first_import = true;
+            let files = std::mem::take(&mut self.startup_files);
+            self.import(files, ctx);
+        }
         if std::mem::take(&mut self.restore_track) && self.library.restore_last_track {
             self.restore_playback(ctx);
         }
@@ -2882,7 +2980,7 @@ impl eframe::App for Player {
             });
         }
         self.import(dropped, ctx);
-        self.finish_imports();
+        self.finish_imports(ctx);
         self.finish_playlist_io();
         self.finish_property_jobs();
         self.finish_tag_jobs(ctx);
@@ -3591,7 +3689,11 @@ fn main() -> eframe::Result {
         options,
         Box::new(|creation| {
             let mut player = Player::new(&creation.egui_ctx);
-            player.audio_devices = Some(audio::DeviceMonitor::new(&creation.egui_ctx));
+            player.startup_files = file_assoc::startup_paths();
+            match audio::DeviceMonitor::new(&creation.egui_ctx) {
+                Ok(monitor) => player.audio_devices = Some(monitor),
+                Err(error) => player.status = format!("Device monitor unavailable: {error}"),
+            }
             player.taskbar = taskbar::Taskbar::new(creation, &creation.egui_ctx);
             player.window_chrome = window_chrome::NativeChrome::new(creation);
             player.media_keys = media_keys::MediaKeys::new(creation, &creation.egui_ctx);

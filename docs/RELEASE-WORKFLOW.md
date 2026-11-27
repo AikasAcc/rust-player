@@ -1,4 +1,4 @@
-# Release workflow (Windows PC only)
+﻿# Release workflow (Windows PC only)
 
 Scope: **Windows 10/11 x64 desktop builds only**. Android is not part of this
 workflow. The `android/` directory in this worktree stays untracked and is neither
@@ -22,23 +22,31 @@ The scripts in `scripts/` deliberately stop at the package boundary.
 
 ## Current release state
 
-- Stable: **v0.6.1**, `prerelease = false`, tag `v0.6.1` from the committed worktree on branch `ai/rust-player-improvements`.
+- Stable: **v0.7.0**, `prerelease = false`, tag `v0.7.0` from the committed worktree on branch `ai/rust-player-improvements`.
+- Previous stable: **v0.6.1**, `prerelease = false`, tag `v0.6.1` at commit `6913d05a17684059570c1b81f404ee8fa8be76ac`. It remains unchanged.
 - Previous stable: **v0.6.0**, `prerelease = false`, tag `v0.6.0` at commit `d9b7ffd5f79815f6fa3f099f7e0bc6ae8000cdc6`. It remains unchanged.
 - Superseded preview: **v0.6.0-rc1**, `prerelease = true`, tag `v0.6.0-rc1` at commit `f0e05adca0b405af7e9012956fa34be155b56633`. It remains unchanged.
-- Stable ZIP SHA-256: `e11e1247c60eb2ebd0c3e6677a89db117d4be44381aa5d71b22212957f71621f`.
-- The work after `f0e05ad` is included in `v0.6.0`: identity cleanup, backup fix, benchmark tooling, parity features, MP1/MP2, ADPCM, MKA/MKV, Monkey's Audio, DSD-to-PCM, ReplayGain, tag editor, bit-perfect preset, WavPack and the hardware verification guide. The facet filter fixes are included in `v0.6.1`.
+- Stable ZIP SHA-256: `3a30b02d71e4e9d68e4fd66b1f9b628fa1cea1f74d89976cef0d7b5049867535`.
+- The work after `f0e05ad` is included in `v0.6.0`: identity cleanup, backup fix, benchmark tooling, parity features, MP1/MP2, ADPCM, MKA/MKV, Monkey's Audio, DSD-to-PCM, ReplayGain, tag editor, bit-perfect preset, WavPack and the hardware verification guide. The facet filter fixes are included in `v0.6.1`. Explorer double-click, liquid glass, saved themes, font fallbacks, search, codec, DSP, persistence and package fixes are included in `v0.7.0`.
 
 ## Prepare a release
 
-1. Set the version in `Cargo.toml`. Use `vX.Y.Z-rcN` for a preview and `vX.Y.Z` for a stable release.
+1. Set the version in `Cargo.toml` as `X.Y.Z` (or `X.Y.Z-rcN` for a preview). The
+   Git tag and the asset labels add the leading `v`: `vX.Y.Z` or `vX.Y.Z-rcN`.
+   `scripts/package-release.ps1` rejects a label that does not exactly match the
+   `[package]` version in `Cargo.toml`.
 2. Update `docs/CHANGELOG.md` and `docs/RELEASE-NOTES-NEXT.md`. Both are English by convention because they are GitHub-facing.
-3. Review `docs/TESTING.md` and `docs/AUDIO-TESTING.md`. A stable release requires a completed listening test of the audio handoff; a release candidate may be published with that check still open, but the release body must say so.
+3. Review `docs/TESTING.md`, `docs/AUDIO-TESTING.md` and
+   `docs/HARDWARE-VERIFICATION.md`. Digital captures at the DAC input and
+   listening tests are checks for the user or a named maintainer on their own
+   hardware; this workflow does not perform them. A release body must state
+   them as outstanding unless dated evidence has been recorded and approved.
 4. Run the local package script (section below). Do not publish artifacts that were produced from a dirty or unapproved commit.
 
 ## Build the package locally
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version v0.6.0-rc2
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version v0.7.0
 ```
 
 The script runs, in order:
@@ -50,24 +58,41 @@ cargo test --release --locked
 cargo build --release --locked
 ```
 
-It then assembles `target/release-package/<version>/`:
+It then assembles `target/release-package/<version>/`. The ZIP contains:
 
 - `rust-player.exe` from `target/release/`
-- `THIRD-PARTY-NOTICES.md`
+- `Rust-Player-Updater.exe`, renamed from `target/release/rust_player_updater.exe`
+  (`src/update.rs` looks for this exact name next to the player)
+- `LICENSE`, `THIRD-PARTY-NOTICES.md` and generated `THIRD-PARTY-LICENSES.txt`
 - `CHANGELOG.md` and `RELEASE-NOTES-NEXT.md` from `docs/`
+
+Alongside the ZIP, the script produces:
+
 - `Rust-Player-<version>-Windows-x64.zip`
 - `Rust-Player-<version>-Windows-x64.zip.sha256` with `<hash>  <filename>`
+- `Rust-Player-<version>-Windows-x64.exe`, a copy of `rust-player.exe` named for
+  the in-app updater (`src/update.rs` expects this release asset and a GitHub
+  `sha256:` digest)
+- `Rust-Player-<version>-Windows-x64.exe.sha256` for that asset
+
+`<version>` includes the leading `v`. The notice bundle is generated from local
+Cargo package sources for the build; it copies upstream license files verbatim
+where present and does not invent text. GitHub computes the asset digest from the
+uploaded EXE; after an approved upload, compare it with the local `.sha256` file.
+No Git or GitHub write is made by the script.
 
 The archive is not byte-reproducible because ZIP metadata contains timestamps;
 the checksum identifies the produced file and must be uploaded alongside it.
 `v0.6.0-rc1` contained only the executable; including the notices and notes in the
-ZIP is the corrected convention for later packages.
+ZIP is the corrected convention for later packages. Published v0.6.0/v0.6.1/v0.7.0
+artifacts were not changed by this documentation update.
 
 ## CI package artifact
 
 `.github/workflows/windows-package.yml` runs the same script on `windows-latest`.
 It triggers on pushed `v*` tags or manually via `workflow_dispatch` with a version
-input, and uploads the ZIP plus `.sha256` as the `windows-x64-package` artifact.
+input, and uploads the ZIP, its `.sha256`, the updater EXE and its `.sha256` as the
+`windows-x64-package` artifact.
 
 This is a **verification artifact only**: the workflow has `contents: read`, does
 not create a release and does not upload to GitHub Releases. Publishing the
@@ -75,14 +100,17 @@ artifact still requires the approval gates above.
 
 ## Verify before publishing
 
-- Extract the ZIP on a clean Windows 10 and a Windows 11 profile and start `rust-player.exe`.
-- Confirm the SHA-256 of the downloaded archive:
+- Extract the ZIP on a clean Windows 10 and a Windows 11 profile and start
+  `rust-player.exe`. Confirm that `Rust-Player-Updater.exe`, `LICENSE`,
+  `THIRD-PARTY-NOTICES.md` and `THIRD-PARTY-LICENSES.txt` are present.
+- Confirm the SHA-256 of the downloaded archive and of the updater asset:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 -Path Rust-Player-v0.6.0-rc2-Windows-x64.zip
+Get-FileHash -Algorithm SHA256 -Path Rust-Player-v0.7.0-Windows-x64.zip
+Get-FileHash -Algorithm SHA256 -Path Rust-Player-v0.7.0-Windows-x64.exe
 ```
 
-- Work through the manual checklist in `docs/TESTING.md`. For audio changes, follow `docs/AUDIO-TESTING.md` and record the device, driver, source format, negotiated output format and underruns.
+- Work through the manual checklist in `docs/TESTING.md`. For audio changes, follow `docs/AUDIO-TESTING.md` and record the device, driver, source format, negotiated output format and underruns. Do not describe user-side hardware captures or listening checks as performed by the maintainer unless dated evidence exists.
 - Check that the release body matches `docs/CHANGELOG.md` and that the notes asset matches `docs/RELEASE-NOTES-NEXT.md`.
 
 ## Publish (only after approval)
@@ -92,14 +120,30 @@ Get-FileHash -Algorithm SHA256 -Path Rust-Player-v0.6.0-rc2-Windows-x64.zip
 3. Create the GitHub release at
    `https://github.com/AikasAcc/rust-player/releases/new` with the new tag, the
    changelog text as body, and `prerelease = true` for `rc` versions.
-4. Upload four assets: the ZIP, its `.sha256` file, `CHANGELOG.md` and
-   `RELEASE-NOTES-NEXT.md`.
+4. Upload six assets: the ZIP, its `.sha256` file, the versioned updater EXE,
+   its `.sha256` file, `CHANGELOG.md` and `RELEASE-NOTES-NEXT.md`. The EXE asset
+   name must match `Rust-Player-v<version>-Windows-x64.exe` exactly, otherwise
+   in-app updates will not find it.
 5. Verify the published asset digests against `Get-FileHash` on the local files.
+   In particular, check GitHub's `sha256:` digest for the EXE asset; that is the
+   value `src/update.rs` requires.
 
 The `gh` CLI is not installed in the current environment. `v0.6.0-rc1` was created
 and updated through the GitHub REST API with a token obtained from the local Git
 Credential Manager (`git credential fill`). No token is stored in the repository or
 in these scripts.
+
+## Published release body correction
+
+The published v0.6.1 release body states that hardware capture and listening
+checks were performed by the maintainer. Repository documentation does not
+support that claim: `docs/HARDWARE-VERIFICATION.md` and `docs/RELEASE-NOTES-NEXT.md`
+describe digital capture and listening checks as outstanding user-side work.
+No GitHub write is made from this repository or by this workflow. After explicit
+maintainer approval, the published release text needs a correction stamped by a
+maintainer (name and date) that removes the performed-check claim and records the
+approved wording. Until that correction is published, treat the claim as
+unverified and do not repeat it in future release bodies.
 
 ## Promotion and rollback
 

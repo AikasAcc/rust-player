@@ -46,6 +46,40 @@ impl Player {
                             .changed();
                         self.media_key_status(ui);
                         ui.separator();
+                        ui.heading("Open from Windows");
+                        ui.weak(
+                            "Register the audio types Rust Player can play, then double-click a file in Explorer.",
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Set as default audio player").clicked() {
+                                self.file_assoc_status = match crate::file_assoc::register() {
+                                    Ok(()) => {
+                                        "Registered. Double-click an audio file to play it here."
+                                            .into()
+                                    }
+                                    Err(error) => format!("Could not register: {error}"),
+                                };
+                            }
+                            if ui.button("Remove association").clicked() {
+                                self.file_assoc_status = match crate::file_assoc::unregister() {
+                                    Ok(()) => "Association removed.".into(),
+                                    Err(error) => format!("Could not remove: {error}"),
+                                };
+                            }
+                            if ui.button("Check status").clicked() {
+                                self.file_assoc_status = if crate::file_assoc::is_registered() {
+                                    "Rust Player is the current default for supported audio files."
+                                        .into()
+                                } else {
+                                    "Rust Player is not the current default for audio files."
+                                        .into()
+                                };
+                            }
+                        });
+                        if !self.file_assoc_status.is_empty() {
+                            ui.label(&self.file_assoc_status);
+                        }
+                        ui.separator();
                         ui.heading("Updates");
                         changed |= ui
                             .checkbox(
@@ -91,6 +125,9 @@ impl Player {
                                         }
                                     }
                                 });
+                            }
+                            crate::update::State::Installing => {
+                                ui.weak("Installing the update; Rust Player will restart…");
                             }
                             crate::update::State::Failed(error) => {
                                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -208,18 +245,24 @@ impl Player {
     }
 
     fn begin_theme_edit(&mut self) {
-        if self.theme_draft.is_none() {
-            self.theme_draft = Some(ThemeDraft {
-                theme: self.library.theme,
-                font: self.library.font.clone(),
-                font_error: String::new(),
-                background: self.library.background.clone(),
-                themes: self.library.named_themes.clone(),
-                selected: None,
-                name: String::new(),
-                theme_error: String::new(),
-                copy_background: false,
-            });
+        if self.theme_draft.is_some() {
+            return;
         }
+        let selected = self.library.saved_theme_index();
+        let name = selected.map_or_else(String::new, |index| {
+            self.library.named_themes[index].name.clone()
+        });
+        self.theme_draft = Some(ThemeDraft {
+            theme: self.library.theme,
+            font: self.library.font.clone(),
+            font_error: String::new(),
+            background: self.library.background.clone(),
+            themes: self.library.named_themes.clone(),
+            saved_themes_changed: false,
+            selected,
+            name,
+            theme_error: String::new(),
+            copy_background: false,
+        });
     }
 }

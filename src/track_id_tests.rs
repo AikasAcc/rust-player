@@ -353,6 +353,31 @@ fn legacy_favorites_migrate_by_path_to_stable_ids() -> std::io::Result<()> {
 }
 
 #[test]
+fn stale_equal_length_favorite_ids_are_rebuilt() -> std::io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("library.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "favorites": 1,
+            "selected": 0,
+            "favorite_ids": [999],
+            "playlists": [
+                {"name":"Default","tracks":["a.wav","b.wav"]},
+                {"name":"Favorites","tracks":["b.wav"],"sort":"Album"}
+            ]
+        }"#,
+    )?;
+
+    let lib = Library::load(&path)?;
+    let source = lib.playlists[0].ids[1];
+    assert_ne!(source, TrackId(999));
+    assert_eq!(lib.favorite_ids, [Some(source)]);
+    assert!(!lib.is_favorite_id(TrackId(999)));
+    Ok(())
+}
+
+#[test]
 fn corrupt_playback_json_backup_preserves_bytes() -> std::io::Result<()> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("playback.json");

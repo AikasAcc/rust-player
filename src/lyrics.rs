@@ -83,7 +83,13 @@ fn best_match(
         .map(|(_, text)| text)
 }
 
-pub fn save(path: &Path, text: &str) -> io::Result<()> {
+/// Explicit overwrite for the "Save lyrics" action. A second save with edited
+/// text must replace the sidecar instead of reporting "already exists".
+pub fn overwrite(path: &Path, text: &str) -> io::Result<()> {
+    write(path, text, true)
+}
+
+fn write(path: &Path, text: &str, replace: bool) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -91,6 +97,27 @@ pub fn save(path: &Path, text: &str) -> io::Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     file.write_all(text.as_bytes())?;
     file.flush()?;
-    file.persist_noclobber(path)?;
+    if replace {
+        file.persist(path)?;
+    } else {
+        file.persist_noclobber(path)?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_does_not_clobber_and_overwrite_replaces() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("song.lrc");
+        write(&path, "first", false)?;
+        assert!(write(&path, "second", false).is_err());
+        assert_eq!(std::fs::read_to_string(&path)?, "first");
+        overwrite(&path, "second")?;
+        assert_eq!(std::fs::read_to_string(&path)?, "second");
+        Ok(())
+    }
 }

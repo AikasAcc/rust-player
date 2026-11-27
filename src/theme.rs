@@ -12,9 +12,27 @@ pub struct NamedTheme {
 }
 
 impl crate::ThemeDraft {
+    /// Hand saved-theme edits to the library once. This keeps them alive even
+    /// when Settings is closed without pressing Apply.
+    pub(super) fn take_saved_theme_changes(&mut self) -> Option<(Vec<NamedTheme>, Option<String>)> {
+        if !self.saved_themes_changed {
+            return None;
+        }
+        self.saved_themes_changed = false;
+        let selected = self
+            .selected
+            .and_then(|index| self.themes.get(index))
+            .map(|theme| theme.name.clone());
+        Some((self.themes.clone(), selected))
+    }
+
     pub(super) fn saved_theme_settings(&mut self, ui: &mut eframe::egui::Ui) {
         use eframe::egui::{Button, ComboBox, TextEdit};
-        self.selected = self.selected.filter(|&index| index < self.themes.len());
+        let valid = self.selected.filter(|&index| index < self.themes.len());
+        if valid != self.selected {
+            self.saved_themes_changed = true;
+        }
+        self.selected = valid;
         let title = self.selected.map_or("Choose a saved theme", |index| {
             self.themes[index].name.as_str()
         });
@@ -27,6 +45,7 @@ impl crate::ThemeDraft {
                         .clicked()
                     {
                         self.name.clone_from(&theme.name);
+                        self.saved_themes_changed = true;
                         self.theme_error.clear();
                     }
                 }
@@ -47,6 +66,7 @@ impl crate::ThemeDraft {
                     !name.is_empty() && taken.is_none(),
                     Button::new("Save as new"),
                 )
+                .on_hover_text("Saved themes are kept even if you close Settings without Apply.")
                 .clicked()
             {
                 let theme = NamedTheme {
@@ -57,6 +77,7 @@ impl crate::ThemeDraft {
                 };
                 self.selected = Some(self.themes.len());
                 self.themes.push(theme);
+                self.saved_themes_changed = true;
                 self.theme_error.clear();
             }
             if let Some(index) = self.selected {
@@ -88,6 +109,7 @@ impl crate::ThemeDraft {
                     saved.theme = self.theme;
                     saved.font.clone_from(&self.font);
                     saved.background.clone_from(&self.background);
+                    self.saved_themes_changed = true;
                 }
                 if ui
                     .add_enabled(
@@ -99,6 +121,7 @@ impl crate::ThemeDraft {
                     .clicked()
                 {
                     self.themes[index].name = name.clone();
+                    self.saved_themes_changed = true;
                 }
                 if ui.button("Duplicate").clicked() {
                     let mut duplicate = self.themes[index].clone();
@@ -114,15 +137,17 @@ impl crate::ThemeDraft {
                     self.name.clone_from(&duplicate.name);
                     self.selected = Some(self.themes.len());
                     self.themes.push(duplicate);
+                    self.saved_themes_changed = true;
                 }
                 if ui
                     .button("Delete")
-                    .on_hover_text("Remove this saved theme when you apply the editor changes.")
+                    .on_hover_text("Remove this saved theme immediately.")
                     .clicked()
                 {
                     self.themes.remove(index);
                     self.selected = None;
                     self.name.clear();
+                    self.saved_themes_changed = true;
                 }
             }
         });
@@ -381,4 +406,60 @@ fn blend(base: [u8; 3], other: [u8; 3], amount: f32) -> [u8; 3] {
         let from = f32::from(base[channel]);
         (from + (f32::from(other[channel]) - from) * amount).round() as u8
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NamedTheme, Theme};
+    use crate::{ThemeDraft, background};
+
+    fn draft() -> ThemeDraft {
+        ThemeDraft {
+            theme: Theme::default(),
+            font: None,
+            font_error: String::new(),
+            background: background::Settings::default(),
+            themes: Vec::new(),
+            saved_themes_changed: false,
+            selected: None,
+            name: String::new(),
+            theme_error: String::new(),
+            copy_background: false,
+        }
+    }
+
+    #[test]
+    fn saved_theme_changes_reach_the_library_once() {
+        let mut draft = draft();
+        assert!(draft.take_saved_theme_changes().is_none());
+
+        let theme = draft.theme;
+        let background = draft.background.clone();
+        draft.themes.push(NamedTheme {
+            name: "Night show".into(),
+            theme,
+            font: None,
+            background,
+        });
+        draft.selected = Some(0);
+        draft.name = "Night show".into();
+        draft.saved_themes_changed = true;
+
+        let (themes, selected) = draft
+            .take_saved_theme_changes()
+            .expect("saved theme changes");
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].name, "Night show");
+        assert_eq!(selected.as_deref(), Some("Night show"));
+        assert!(draft.take_saved_theme_changes().is_none());
+
+        draft.themes.clear();
+        draft.selected = None;
+        draft.saved_themes_changed = true;
+        let (themes, selected) = draft
+            .take_saved_theme_changes()
+            .expect("deleted theme changes");
+        assert!(themes.is_empty());
+        assert_eq!(selected, None);
+    }
 }

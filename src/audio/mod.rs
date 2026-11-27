@@ -399,7 +399,7 @@ impl AudioTrack {
     }
 
     pub fn poll(&mut self) -> Option<String> {
-        let mut error = None;
+        let mut messages = Vec::new();
         for event in self.events.try_iter() {
             match event {
                 Event::Opened(format) => self.output = Some(format),
@@ -408,14 +408,14 @@ impl AudioTrack {
                     self.duration = transition.duration;
                     self.transition = Some(transition);
                 }
-                Event::Warning(message) => error = Some(message),
+                Event::Warning(message) => messages.push(message),
                 Event::Error(message) => {
                     self.failed = true;
-                    error = Some(message);
+                    messages.push(message);
                 }
             }
         }
-        error
+        (!messages.is_empty()).then(|| messages.join("; "))
     }
 }
 
@@ -552,6 +552,16 @@ fn pump<B: Backend>(
         }
         let mut seek = state.seek_ns.swap(NO_SEEK, AcqRel);
         let rendered = state.frames.load(Acquire);
+        // A seek always refers to the track the user currently sees. While a
+        // gapless handoff is queued that is still the previous source, even if
+        // its boundary was crossed in this same pump iteration. Cancel the
+        // transition first so the seek cannot land on the next track by mistake.
+        if seek != NO_SEEK
+            && let Some(pending) = handoff.take()
+        {
+            source = pending.previous;
+            planned = None;
+        }
         if let Some(pending) = &handoff {
             if rendered > pending.boundary {
                 let event = Transition {
@@ -585,7 +595,12 @@ fn pump<B: Backend>(
             {
                 source = pending.previous;
                 if seek == NO_SEEK {
-                    let elapsed = rendered.saturating_sub(state.track_start.load(Relaxed));
+                    // Once the boundary is crossed, samples from the next track
+                    // are already in the ring. Do not seek the restored source
+                    // past its own end.
+                    let elapsed = rendered
+                        .min(pending.boundary)
+                        .saturating_sub(state.track_start.load(Relaxed));
                     let position = Duration::from_nanos(state.origin_ns.load(Relaxed))
                         + Duration::from_secs_f64(elapsed as f64 / f64::from(output.rate));
                     seek = nanoseconds(bounded_position(position, source.duration));
@@ -756,12 +771,12 @@ pub struct DeviceMonitor {
 }
 
 impl DeviceMonitor {
-    pub fn new(ctx: &egui::Context) -> Self {
+    pub fn new(ctx: &egui::Context) -> Result<Self, String> {
         let (sender, updates) = mpsc::sync_channel(1);
         let closed = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&closed);
         let ctx = ctx.clone();
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("audio-devices".into())
             .spawn(move || {
                 let mut sent = None;
@@ -775,12 +790,13 @@ impl DeviceMonitor {
                     }
                     thread::sleep(Duration::from_millis(1500));
                 }
-            });
-        Self {
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
             devices: shared::Devices::default(),
             updates,
             closed,
-        }
+        })
     }
 
     pub fn refresh(&mut self) -> bool {

@@ -105,19 +105,19 @@ fn duration(frames: u64, base: TimeBase) -> Option<Duration> {
 pub fn container_duration(path: &Path) -> Option<Duration> {
     let extension = path.extension().and_then(|extension| extension.to_str());
     if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("ape")) {
-        return super::ape::ApeSource::open(path)
+        return super::ape::ApeSource::open(path, None)
             .ok()
             .and_then(|(_, _, duration)| duration);
     }
     if extension.is_some_and(|extension| {
         extension.eq_ignore_ascii_case("dsf") || extension.eq_ignore_ascii_case("dff")
     }) {
-        return super::dsd::DsdSource::open(path)
+        return super::dsd::DsdSource::open(path, None)
             .ok()
             .and_then(|(_, _, duration)| duration);
     }
     if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("wv")) {
-        return super::wavpack::WavpackSource::open(path)
+        return super::wavpack::WavpackSource::open(path, None)
             .ok()
             .and_then(|(_, _, duration)| duration);
     }
@@ -263,15 +263,18 @@ impl Source {
         let (inner, info, full_duration) = if extension
             .is_some_and(|extension| extension.eq_ignore_ascii_case("ape"))
         {
-            let (source, format, duration) = super::ape::ApeSource::open(audio)?;
+            let (source, format, duration) =
+                super::ape::ApeSource::open(audio, options.replay_gain.factor(audio))?;
             (Inner::Ape(Box::new(source)), format, duration)
         } else if extension.is_some_and(|extension| {
             extension.eq_ignore_ascii_case("dsf") || extension.eq_ignore_ascii_case("dff")
         }) {
-            let (source, format, duration) = super::dsd::DsdSource::open(audio)?;
+            let (source, format, duration) =
+                super::dsd::DsdSource::open(audio, options.replay_gain.factor(audio))?;
             (Inner::Dsd(Box::new(source)), format, duration)
         } else if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("wv")) {
-            let (source, format, duration) = super::wavpack::WavpackSource::open(audio)?;
+            let (source, format, duration) =
+                super::wavpack::WavpackSource::open(audio, options.replay_gain.factor(audio))?;
             (Inner::Wavpack(Box::new(source)), format, duration)
         } else {
             let mut reader = open_format(audio)?;

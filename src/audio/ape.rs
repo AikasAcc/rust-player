@@ -20,8 +20,27 @@ pub(super) struct ApeSource {
     frame_position: usize,
 }
 
+fn channel_mask(channels: u16) -> u32 {
+    if channels >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << channels) - 1
+    }
+}
+
+fn supported_precision(bits: u32, floating_point: bool) -> bool {
+    if floating_point {
+        matches!(bits, 32 | 64)
+    } else {
+        matches!(bits, 8 | 16 | 24 | 32)
+    }
+}
+
 impl ApeSource {
-    pub(super) fn open(path: &Path) -> Result<(Self, SourceFormat, Option<Duration>), String> {
+    pub(super) fn open(
+        path: &Path,
+        gain: Option<f32>,
+    ) -> Result<(Self, SourceFormat, Option<Duration>), String> {
         let file = File::open(path).map_err(|error| error.to_string())?;
         let decoder = ApeDecoder::new(BufReader::new(file)).map_err(|error| error.to_string())?;
         let info = decoder.info().clone();
@@ -34,7 +53,7 @@ impl ApeSource {
         if !(1..=32).contains(&channels) {
             return Err("Unsupported source channel count".into());
         }
-        if !(8..=64).contains(&bits) || bits % 8 != 0 {
+        if !supported_precision(bits, info.is_floating_point) {
             return Err("Unsupported APE sample precision".into());
         }
         let kind = if info.is_floating_point {
@@ -50,10 +69,10 @@ impl ApeSource {
             codec: "Monkey's Audio",
             rate,
             channels,
-            mask: (1u32 << channels) - 1,
+            mask: channel_mask(channels),
             bits: Some(bits),
             kind,
-            gain: None,
+            gain,
         };
         let duration = if info.total_samples > 0 && rate > 0 {
             Duration::try_from_secs_f64(info.total_samples as f64 / f64::from(rate)).ok()
@@ -187,7 +206,10 @@ fn convert<T: ConvertibleSample>(
                 ),
                 _ => return Err("Unsupported APE sample precision".into()),
             };
-            T::from_sample(value)
+            // Other integer adapters emit canonical, left-aligned i32 values.
+            // Without this shift 16/24-bit APE is near-silent in Shared mode
+            // and rejected by the direct-mode precision check.
+            T::from_sample(value.wrapping_shl(32 - bits))
         };
         samples.push(sample);
     }
@@ -199,16 +221,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_signed_24_bit_little_endian_samples() {
+    fn converts_signed_24_bit_little_endian_samples_to_canonical_i32() {
         let bytes = [0x00, 0x00, 0x00, 0xff, 0xff, 0xff];
         let samples = convert::<i32>(&bytes, 24, 3, false, true).expect("24-bit samples convert");
-        assert_eq!(samples, vec![0, -1]);
+        assert_eq!(samples, vec![0, -256]);
     }
 
     #[test]
-    fn converts_unsigned_8_bit_samples_to_pcm_center() {
+    fn converts_unsigned_8_bit_samples_to_canonical_i32() {
         let samples =
             convert::<i32>(&[0x80, 0xff], 8, 1, false, false).expect("8-bit samples convert");
-        assert_eq!(samples, vec![0, 127]);
+        assert_eq!(samples, vec![0, 127 << 24]);
+    }
+
+    #[test]
+    fn integer_samples_are_left_aligned_for_every_supported_width() {
+        assert_eq!(
+            convert::<i32>(&[0x00, 0x80], 16, 2, false, true).unwrap(),
+            vec![i32::MIN]
+        );
+        assert_eq!(
+            convert::<i32>(&[0xff, 0x7f], 16, 2, false, true).unwrap(),
+            vec![0x7fff_0000_u32 as i32]
+        );
+        assert_eq!(
+            convert::<i32>(&[0xff, 0xff, 0xff, 0xff], 32, 4, false, true).unwrap(),
+            vec![-1]
+        );
+        assert_eq!(
+            convert::<f32>(&[0x00, 0x80], 16, 2, false, true).unwrap(),
+            vec![-1.0]
+        );
+    }
+
+    #[test]
+    fn channel_mask_handles_thirty_two_channels_without_an_overflow() {
+        assert_eq!(channel_mask(1), 1);
+        assert_eq!(channel_mask(31), 0x7fff_ffff);
+        assert_eq!(channel_mask(32), u32::MAX);
+    }
+
+    #[test]
+    fn only_precisions_the_converter_implements_are_advertised() {
+        for bits in [8, 16, 24, 32] {
+            assert!(supported_precision(bits, false));
+        }
+        for bits in [40, 48, 56, 64] {
+            assert!(!supported_precision(bits, false));
+        }
+        assert!(supported_precision(32, true));
+        assert!(supported_precision(64, true));
+        assert!(!supported_precision(16, true));
     }
 }

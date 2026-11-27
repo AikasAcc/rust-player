@@ -40,7 +40,11 @@ impl BackupTracker {
     /// Mark a file as corrupt on load. A backup must be made before it is
     /// overwritten.
     pub fn need(&mut self, path: PathBuf) {
-        self.needed.insert(path);
+        // A backup is already on its way for this file. Re-adding `needed`
+        // here would make a later save back up the now-valid replacement.
+        if !self.pending.contains(&path) {
+            self.needed.insert(path);
+        }
     }
 
     /// Whether the caller should copy the corrupt file now. Returns `false`
@@ -248,6 +252,17 @@ mod tests {
         assert!(tracker.should_back_up(&path));
         tracker.mark_backed_up(path.clone());
         assert!(!tracker.should_back_up(&path));
+        tracker.written(&path);
+        assert!(!tracker.should_back_up(&path));
+    }
+
+    #[test]
+    fn a_second_need_while_a_backup_is_pending_does_not_rearm_it() {
+        let path = PathBuf::from("listening.json");
+        let mut tracker = BackupTracker::default();
+        tracker.need(path.clone());
+        tracker.mark_backed_up(path.clone());
+        tracker.need(path.clone());
         tracker.written(&path);
         assert!(!tracker.should_back_up(&path));
     }

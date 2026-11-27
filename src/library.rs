@@ -377,6 +377,8 @@ pub struct Library {
     pub font: Option<PathBuf>,
     pub background: crate::background::Settings,
     pub named_themes: Vec<crate::theme::NamedTheme>,
+    #[serde(default)]
+    pub selected_theme: Option<String>,
     pub plugins: Vec<crate::plugins::PluginConfig>,
     pub favorites: Option<usize>,
     /// Source TrackId for each entry of the Favorites playlist.
@@ -418,6 +420,7 @@ impl Default for Library {
             audio_dsp: crate::audio::dsp::Settings::default(),
             background: Default::default(),
             named_themes: Vec::new(),
+            selected_theme: None,
             theme: crate::theme::Theme::default(),
             library_desk_theme_seen: true,
             font: None,
@@ -454,6 +457,18 @@ impl Default for Library {
 }
 
 impl Library {
+    /// Saved theme to preselect in the editor. Older libraries have no stored
+    /// selection yet; in that case show the most recently saved theme.
+    pub fn saved_theme_index(&self) -> Option<usize> {
+        match &self.selected_theme {
+            Some(name) => self
+                .named_themes
+                .iter()
+                .position(|theme| &theme.name == name),
+            None => self.named_themes.len().checked_sub(1),
+        }
+    }
+
     pub fn rebuild_locations(&mut self) {
         let mut locations = HashMap::new();
         let mut path_sources = HashMap::new();
@@ -665,14 +680,10 @@ impl Library {
         let Some(index) = self.favorites else {
             return;
         };
-        if self.favorite_ids.len() >= self.playlists[index].tracks.len() {
-            return;
-        }
-        self.favorite_ids = self.playlists[index]
-            .tracks
-            .iter()
-            .map(|path| self.source_id(path))
-            .collect();
+        // Rebuild unconditionally: a saved file can have the right length but
+        // stale IDs, which would mark tracks as favorites without a Favorites row.
+        let tracks = self.playlists[index].tracks.clone();
+        self.favorite_ids = tracks.iter().map(|path| self.source_id(path)).collect();
     }
 
     pub fn favorite_id_entries(&self, id: TrackId) -> Vec<usize> {
@@ -1140,6 +1151,7 @@ mod tests {
             theme: library.theme,
             background: library.background.clone(),
         });
+        library.selected_theme = Some("Night show".into());
         library.save(&path)?;
 
         let library = Library::load(&path)?;
@@ -1152,12 +1164,35 @@ mod tests {
         assert!(library.playlists[0].descending);
         assert!(library.background.enabled);
         assert_eq!(library.named_themes[0].name, "Night show");
+        assert_eq!(library.selected_theme.as_deref(), Some("Night show"));
+        assert_eq!(library.saved_theme_index(), Some(0));
         assert_eq!(
             library.named_themes[0].font.as_deref(),
             Some(Path::new("example.ttf"))
         );
         assert!(library.named_themes[0].background.enabled);
         Ok(())
+    }
+
+    #[test]
+    fn saved_theme_index_falls_back_to_the_latest_saved_theme() {
+        let mut library = Library::default();
+        assert_eq!(library.saved_theme_index(), None);
+
+        let theme = library.theme;
+        let background = library.background.clone();
+        for name in ["First", "Second"] {
+            library.named_themes.push(crate::theme::NamedTheme {
+                name: name.into(),
+                theme,
+                font: None,
+                background: background.clone(),
+            });
+        }
+        assert_eq!(library.saved_theme_index(), Some(1));
+
+        library.selected_theme = Some("Missing".into());
+        assert_eq!(library.saved_theme_index(), None);
     }
 
     #[test]

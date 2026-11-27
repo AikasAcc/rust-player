@@ -593,12 +593,26 @@ impl Player {
             return;
         };
         let previous = draft.theme;
-        let max_height = (ctx.content_rect().height() - 155.0).clamp(100.0, 520.0);
+        // Keep Apply/Cancel above the scroll area: a tall theme editor pushed
+        // them below the visible Settings window on smaller screens.
+        let (apply, cancel) = ui
+            .horizontal(|ui| {
+                ui.strong("Theme editor");
+                (ui.button("Apply").clicked(), ui.button("Cancel").clicked())
+            })
+            .inner;
+        ui.separator();
+        let max_height = (ctx.content_rect().height() - 200.0).clamp(120.0, 460.0);
         egui::ScrollArea::vertical()
             .id_salt("appearance settings")
             .max_height(max_height)
             .show(ui, |ui| {
                 draft.saved_theme_settings(ui);
+                if let Some((themes, selected)) = draft.take_saved_theme_changes() {
+                    self.library.named_themes = themes;
+                    self.library.selected_theme = selected;
+                    self.save();
+                }
                 ui.separator();
                 let name = theme::Theme::PRESETS
                     .iter()
@@ -709,10 +723,6 @@ impl Player {
                     );
                 });
             });
-        ui.separator();
-        let (apply, cancel) = ui
-            .horizontal(|ui| (ui.button("Apply").clicked(), ui.button("Cancel").clicked()))
-            .inner;
         if apply {
             if draft.copy_background
                 && draft.background.uses_file()
@@ -734,10 +744,15 @@ impl Player {
                     }
                 }
             }
+            let selected_theme = draft
+                .selected
+                .and_then(|index| draft.themes.get(index))
+                .map(|theme| theme.name.clone());
             self.library.theme = draft.theme;
             self.library.font = draft.font.clone();
             self.library.background = draft.background.clone();
             self.library.named_themes = std::mem::take(&mut draft.themes);
+            self.library.selected_theme = selected_theme;
             self.save();
         }
         if apply {

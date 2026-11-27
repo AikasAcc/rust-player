@@ -8,9 +8,18 @@ A standalone Windows x64 audio player written in Rust with egui, Symphonia, and 
 
 Rust Player targets Windows 10 and 11 on x64. Download the Windows ZIP from [GitHub Releases](https://github.com/AikasAcc/rust-player/releases), extract it, and run `rust-player.exe`. The executable is unsigned, so Windows SmartScreen or antivirus software may flag it. The release includes a SHA-256 checksum for verifying the ZIP.
 
-Starting with v0.5.0, keep the updater helper alongside the player. Open **Settings → General** to check for and install updates. Users of v0.4.0 need to extract the v0.5.0 ZIP once.
+Starting with v0.5.0, keep the updater helper `Rust-Player-Updater.exe` alongside
+`rust-player.exe`. Packaging now places both in the release ZIP; older published
+ZIPs may need the extra copy. In-app updates use a release asset named
+`Rust-Player-v<version>-Windows-x64.exe` with a SHA-256 digest. Open
+**Settings → General** to check for and install updates. Users of v0.4.0 need
+to extract the v0.5.0 ZIP once.
 
-To build from source, run `cargo build --release --locked` with a current Rust toolchain. Use `cargo run --locked` for a development run. For repeatable checks, `scripts/run-benchmarks.ps1` archives benchmark data and `scripts/run-frame-log.ps1` records an opt-in UI frame-time session; neither stops an already running player.
+To build from source, run `cargo build --release --locked` with Rust 1.100.0 as
+pinned in `rust-toolchain.toml`. Use `cargo run --locked` for a development run.
+For repeatable checks, `scripts/run-benchmarks.ps1` archives benchmark data and
+`scripts/run-frame-log.ps1` records an opt-in UI frame-time session; neither stops
+an already running player.
 
 Building from source requires the Windows SDK resource compiler with the MSVC toolchain, or MinGW-w64 `windres` and `ar` on PATH with the GNU toolchain. WavPack support additionally needs CMake and LLVM/libclang on PATH; `.cargo/config.toml` supplies the CMake policy level required by the bundled WavPack sources. The executable embeds the [Rust Player logo](assets/ATTRIBUTION.md) at 16 sizes. The app sets DPI-appropriate small and large window icons.
 
@@ -54,9 +63,17 @@ The decoder writes to a bounded ring buffer on a worker thread. The output callb
 
 The right panel switches between **Queue** and **Track**. Lyrics appear beneath the artwork and song details in **Track**. The playback bar keeps the current song, timeline, and volume in view. Use **Ctrl+K** to focus the playlist search in the toolbar.
 
-The queue shows the remaining tracks in the current playlist pass, including the actual shuffle order. Right-click a song and select **Add to Play Queue** to play it before the upcoming playlist tracks. In the queue, drag songs within their group or right-click to move or remove them. Edits to upcoming tracks apply to the current playback order. The queue lasts until Rust Player closes.
+The queue shows the remaining tracks in the current playlist pass, including the actual shuffle order. Right-click a song and select **Add to Play Queue** to play it before the upcoming playlist tracks. In the queue, drag songs within their group or right-click to move or remove them. Edits to upcoming tracks apply to the current playback order. Explicit **Add to Play Queue** entries are saved in `queue.json` and restored on the next start; the automatic remaining-playlist pass is session-only and is not restored.
 
 The file picker accepts the formats listed under [Audio output](#audio-output). Click **+** next to **Playlists** and enter a name. Drop audio files and folders anywhere in the window to add them to the selected playlist. Folder import scans subfolders. You can also use **Add files** and **Add folder**. Double-click a track to play it, or double-click a playlist in the sidebar to play that playlist (a random track when shuffle is on, otherwise the first track in the current sort order). The shuffle button randomizes the remaining order without repeating tracks within that run. Playlists and settings are saved in `%LOCALAPPDATA%\Rust Player\library.json`.
+
+Above the track list, **Artist**, **Album**, **Genre** and **Year** chips filter the
+current playlist. Clicking a chip again removes that filter; **All filters** expands
+the full cached list instead of only the most common values. Search also understands
+field names such as `artist:`, `genre:` and `year:`. A **smart playlist** stores a
+search so it can be refreshed later. You can select several rows with `Ctrl`/`Shift`
+clicks for bulk queue, favorite, remove and **Edit tags…** actions, and undo or redo
+playlist edits with `Ctrl+Z`/`Ctrl+Y` or the **Tools** menu.
 
 The **Now playing** panel reads title, artist, album, cover and lyrics from available tags. If a cover is missing, put a file such as `cover.jpg` or `folder.png` next to the track. For lyrics, put a same-name `.lrc` or `.txt` file next to the track. Timestamped LRC lyrics highlight and follow the current line. Click a line to seek. Under **Settings → Appearance**, enable album covers beside track titles to show thumbnails in the playlist.
 
@@ -94,7 +111,7 @@ Choose **Current song cover** as your background source to follow the artwork sh
 
 ## Plugins
 
-Open **Plugins**, choose **Add plugin…**, and select a local `.rhai` file. **Open Plugin Folder** opens the default folder for that picker in Explorer. Tick the plugin's checkbox to enable it. **Reload** picks up edits to the script. Try [track-summary.rhai](examples/track-summary.rhai), then load a song and look under **Now playing → Plugin details**.
+Open **Plugins**, choose **Add plugin…**, and select a local `.rhai` file. **Open Plugin Folder** opens the default folder for that picker in Explorer. Tick the plugin's checkbox to enable it. **Reload** picks up edits to the script. In a source checkout, try [track-summary.rhai](examples/track-summary.rhai); this example is repository-only and is not included in the release ZIP. Load a song and look under **Now playing → Plugin details**.
 
 The v1 plugin hook is `fn on_track(title, artist, album)`. It receives three strings when a track is loaded and returns a short line of plain text. Rhai scripts run with execution and memory-related limits, without module imports or host functions for file and network access. Plugins use the selected file path and are disabled when first added.
 
@@ -122,7 +139,11 @@ The player scrobbles tagged tracks longer than 30 seconds after half the track o
 
 Click or drag the progress bar to seek. Scroll over the **Volume** control to adjust the volume. Click the speaker to mute or restore your previous level. On restart, the last track and playback position are restored in a paused state.
 
-Rust Player stores playlists, playback position, listening activity, themes, fonts, plugin paths, and integration settings under `%LOCALAPPDATA%\Rust Player`. Audio files stay at their original paths. Apple Music artwork lookup, LRCLIB search, Discord sharing, and Last.fm scrobbling are separate features you can enable in the interface.
+Rust Player stores playlists, playback position, explicit **Play next** entries in
+`queue.json`, listening activity, themes, fonts, plugin paths, and integration
+settings under `%LOCALAPPDATA%\Rust Player`. Audio files stay at their original
+paths. Apple Music artwork lookup, LRCLIB search, Discord sharing, and Last.fm
+scrobbling are separate features you can enable in the interface.
 
 Rust Player keeps a metadata cache beside those settings. It stores tags and CUE track metadata, rebuilds itself if the cache becomes unreadable, and drops entries for tracks that are no longer in the library. Audio files are never moved or deleted by this process.
 
@@ -137,11 +158,17 @@ Rust Player keeps a metadata cache beside those settings. It stores tags and CUE
 | Discord shows a placeholder | Enable artwork lookup or supply a public HTTPS cover URL or application asset. Check the lookup and RPC status in the Discord dialog. |
 | A background falls back to the theme color | Open **Theme Editor** to check the file path and decoder message. Background files are limited to 64 MiB. An animation can contain up to 600 frames and 48 MiB of decoded image data after resizing. |
 
-WavPack, native DSD/DoP, ASIO output, and video backgrounds are outside this build; DSF/DFF are decoded to PCM. CUE support covers external single-file and multi-file sheets plus embedded `CUESHEET` text in FLAC; a binary FLAC CUEDATA block is not read. See the [manual regression checklist](docs/TESTING.md), [release notes for the next version](docs/RELEASE-NOTES-NEXT.md), [release workflow (Windows PC only)](docs/RELEASE-WORKFLOW.md), and [completion report](docs/COMPLETION-REPORT.md).
+Native DSD/DoP, ASIO output, and video backgrounds are outside this build; DSF/DFF
+are decoded to PCM, and WavPack `.wv` files play with the limits described under
+[Audio output](#audio-output). CUE support covers external single-file and multi-file
+sheets plus embedded `CUESHEET` text in FLAC; a binary FLAC CUEDATA block is not read.
+See the [manual regression checklist](docs/TESTING.md), [release notes](docs/RELEASE-NOTES-NEXT.md), [release workflow (Windows PC only)](docs/RELEASE-WORKFLOW.md), and [completion report](docs/COMPLETION-REPORT.md).
 
 [![Star History Chart](https://api.star-history.com/svg?repos=AikasAcc/rust-player&type=Date)](https://star-history.com/#AikasAcc/rust-player&Date)
 
 ## License
 
-Rust Player is available under the [MIT License](LICENSE). Windows release archives include the third-party dependency notices.
+Rust Player is available under the [MIT License](LICENSE). Windows release archives
+include `LICENSE`, `THIRD-PARTY-NOTICES.md` and a generated
+`THIRD-PARTY-LICENSES.txt` with the collected upstream license texts.
 

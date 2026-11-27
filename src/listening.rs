@@ -66,10 +66,45 @@ impl Listening {
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let mut loaded: Self = serde_json::from_slice(&bytes)?;
+                loaded.merge_duplicate_songs();
+                Ok(loaded)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error),
         }
+    }
+
+    fn merge_duplicate_songs(&mut self) {
+        let mut entries: Vec<_> = std::mem::take(&mut self.songs).into_iter().collect();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut merged: Vec<(PathBuf, Song)> = Vec::new();
+        for (path, song) in entries {
+            if let Some((_, existing)) = merged
+                .iter_mut()
+                .find(|(saved, _)| crate::library::same_path(saved, &path))
+            {
+                existing.plays = existing.plays.saturating_add(song.plays);
+                if existing.title.trim().is_empty() {
+                    existing.title = song.title;
+                }
+                if existing.artist.trim().is_empty() {
+                    existing.artist = song.artist;
+                }
+            } else {
+                merged.push((path, song));
+            }
+        }
+        self.songs = merged.into_iter().collect();
+    }
+
+    fn song_key(&self, path: &Path) -> PathBuf {
+        self.songs
+            .keys()
+            .find(|saved| crate::library::same_path(saved, path))
+            .cloned()
+            .unwrap_or_else(|| path.to_path_buf())
     }
 
     /// Kept for persistence tests; production writes go through `save_worker`.
@@ -87,7 +122,8 @@ impl Listening {
         if self.history.len() > 1000 {
             self.history.drain(..self.history.len() - 1000);
         }
-        let song = self.songs.entry(path).or_insert_with(|| Song {
+        let key = self.song_key(&path);
+        let song = self.songs.entry(key).or_insert_with(|| Song {
             title: title.into(),
             artist: artist.into(),
             plays: 0,
@@ -174,6 +210,41 @@ mod tests {
         assert_eq!(loaded.history[0].time, 0);
         assert_eq!(loaded.songs[&PathBuf::from("x.flac")].plays, 0);
         assert_eq!(loaded.artists["a"].name, "");
+        Ok(())
+    }
+
+    #[test]
+    fn the_same_spelling_counts_as_one_song() {
+        let mut data = Listening::default();
+        let path = PathBuf::from("Music/Song.flac");
+        data.record(path.clone(), "Song", "Artist");
+        data.record(path.clone(), "Song", "Artist");
+        assert_eq!(data.songs.len(), 1);
+        assert_eq!(data.songs[&path].plays, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn different_windows_spellings_of_one_file_count_as_one_song() {
+        let mut data = Listening::default();
+        data.record(PathBuf::from(r"C:\Music\Song.flac"), "Song", "Artist");
+        data.record(PathBuf::from("c:/music/song.flac"), "Song", "Artist");
+        assert_eq!(data.songs.len(), 1);
+        assert_eq!(data.songs.values().next().unwrap().plays, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_merges_old_duplicate_spellings() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("listening.json");
+        fs::write(
+            &path,
+            br#"{"songs":{"C:\\Music\\Song.flac":{"title":"Song","plays":2},"c:/music/song.flac":{"title":"Song","plays":3}}}"#,
+        )?;
+        let loaded = Listening::load(&path)?;
+        assert_eq!(loaded.songs.len(), 1);
+        assert_eq!(loaded.songs.values().next().unwrap().plays, 5);
         Ok(())
     }
 

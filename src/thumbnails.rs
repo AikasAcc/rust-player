@@ -6,8 +6,9 @@ use std::{
 };
 
 pub struct Cache {
-    jobs: mpsc::SyncSender<PathBuf>,
-    results: mpsc::Receiver<(PathBuf, Option<ColorImage>)>,
+    jobs: mpsc::SyncSender<(u64, PathBuf)>,
+    results: mpsc::Receiver<(u64, PathBuf, Option<ColorImage>)>,
+    generation: u64,
     pending: HashSet<PathBuf>,
     images: HashMap<PathBuf, Option<TextureHandle>>,
     order: VecDeque<PathBuf>,
@@ -15,13 +16,13 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(ctx: &Context) -> Self {
-        let (jobs, input) = mpsc::sync_channel::<PathBuf>(32);
+        let (jobs, input) = mpsc::sync_channel::<(u64, PathBuf)>(32);
         let (output, results) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            for path in input {
+            for (generation, path) in input {
                 let image = thumbnail(&path);
-                if output.send((path, image)).is_err() {
+                if output.send((generation, path, image)).is_err() {
                     break;
                 }
                 ctx.request_repaint();
@@ -30,14 +31,28 @@ impl Cache {
         Self {
             jobs,
             results,
+            generation: 0,
             pending: Default::default(),
             images: Default::default(),
             order: Default::default(),
         }
     }
+
+    /// Drop cached covers after tags or artwork changed on disk. In-flight jobs
+    /// from the old generation are ignored so they cannot restore a stale image.
+    pub fn invalidate_all(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending.clear();
+        self.images.clear();
+        self.order.clear();
+    }
+
     pub fn get(&mut self, ctx: &Context, path: &Path) -> Option<TextureId> {
-        while let Ok((path, image)) = self.results.try_recv() {
+        while let Ok((generation, path, image)) = self.results.try_recv() {
             self.pending.remove(&path);
+            if generation != self.generation {
+                continue;
+            }
             if self.order.len() >= 256
                 && let Some(old) = self.order.pop_front()
             {
@@ -52,7 +67,12 @@ impl Cache {
         if let Some(img) = self.images.get(path) {
             return img.as_ref().map(TextureHandle::id);
         }
-        if !self.pending.contains(path) && self.jobs.try_send(path.to_owned()).is_ok() {
+        if !self.pending.contains(path)
+            && self
+                .jobs
+                .try_send((self.generation, path.to_owned()))
+                .is_ok()
+        {
             self.pending.insert(path.to_owned());
         }
         None

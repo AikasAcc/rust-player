@@ -29,6 +29,7 @@ pub enum State {
     Available(Release),
     Downloading(Receiver<Result<(tempfile::TempPath, String), String>>),
     Ready((tempfile::TempPath, String)),
+    Installing,
     Failed(String),
 }
 
@@ -50,7 +51,10 @@ struct ApiAsset {
 
 impl State {
     pub fn check(&mut self, ctx: &egui::Context, current: &str) {
-        if matches!(self, Self::Checking(_) | Self::Downloading(_)) {
+        if matches!(
+            self,
+            Self::Checking(_) | Self::Downloading(_) | Self::Installing
+        ) {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -128,6 +132,9 @@ impl State {
             *self = State::Failed(message.clone());
             return Err(message);
         }
+        // The child now owns the staged file. A second click must not try to
+        // hand it over again while the updater is already replacing the player.
+        *self = State::Installing;
         Ok(())
     }
 }
@@ -135,6 +142,9 @@ impl State {
 /// Move the staged file out of the state machine and make it persistent. The
 /// updater takes over ownership only after this succeeds.
 fn staged_download(state: &mut State) -> Result<(PathBuf, String), String> {
+    if !matches!(state, State::Ready(_)) {
+        return Err("No verified update is ready to install.".into());
+    }
     let State::Ready((download, digest)) = std::mem::take(state) else {
         return Err("No verified update is ready to install.".into());
     };
@@ -371,6 +381,19 @@ mod tests {
 
         let mut idle = State::Idle;
         assert!(staged_download(&mut idle).is_err());
+    }
+
+    #[test]
+    fn a_second_install_cannot_reuse_the_staged_download() {
+        let ctx = egui::Context::default();
+        let mut installing = State::Installing;
+        assert!(staged_download(&mut installing).is_err());
+        assert!(
+            matches!(installing, State::Installing),
+            "a failed install attempt must not erase the installing status"
+        );
+        installing.check(&ctx, "0.7.0");
+        assert!(matches!(installing, State::Installing));
     }
 
     #[test]

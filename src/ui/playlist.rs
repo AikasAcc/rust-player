@@ -133,6 +133,11 @@ impl Player {
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
                         .max_height(26.0)
+                        // Wheel and trackpad scrolling stay available; only
+                        // the visible bar is removed from this one-line strip.
+                        .scroll_bar_visibility(
+                            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 for facet in &cache.values {

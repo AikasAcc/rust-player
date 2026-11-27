@@ -36,7 +36,10 @@ pub(super) struct WavpackSource {
 }
 
 impl WavpackSource {
-    pub(super) fn open(path: &Path) -> Result<(Self, SourceFormat, Option<Duration>), String> {
+    pub(super) fn open(
+        path: &Path,
+        gain: Option<f32>,
+    ) -> Result<(Self, SourceFormat, Option<Duration>), String> {
         // Normalization only affects float files; it guarantees +/-1.0 output.
         let mut reader = WavpackReader::open(path)
             .map_err(|error| error.to_string())?
@@ -108,7 +111,7 @@ impl WavpackSource {
             } else {
                 SampleKind::Integer(bits as u16)
             },
-            gain: None,
+            gain,
         };
         Ok((
             Self {
@@ -261,7 +264,7 @@ mod tests {
         let expected = [257_i32, -257, 32_767, -32_768];
         write_wv(&path, expected.to_vec(), 16, false);
 
-        let (mut source, info, duration) = WavpackSource::open(&path).unwrap();
+        let (mut source, info, duration) = WavpackSource::open(&path, None).unwrap();
         assert_eq!(info.codec, "WavPack");
         assert_eq!(info.rate, 48_000);
         assert_eq!(info.channels, 1);
@@ -284,7 +287,7 @@ mod tests {
         let bits = values.map(|value| value.to_bits() as i32).to_vec();
         write_wv(&path, bits, 32, true);
 
-        let (mut source, info, _) = WavpackSource::open(&path).unwrap();
+        let (mut source, info, _) = WavpackSource::open(&path, None).unwrap();
         assert_eq!(info.kind, SampleKind::Float32);
         let mut decoded = Vec::new();
         while let Some(block) = source.next::<f32>().unwrap() {
@@ -294,6 +297,16 @@ mod tests {
         for (actual, expected) in decoded.iter().zip(values) {
             assert!((*actual - expected).abs() < 1e-6, "{actual} != {expected}");
         }
+    }
+
+    #[test]
+    fn replay_gain_is_carried_into_the_source_format() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gain.wv");
+        write_wv(&path, vec![0; 16], 16, false);
+
+        let (_, info, _) = WavpackSource::open(&path, Some(0.5)).unwrap();
+        assert_eq!(info.gain, Some(0.5));
     }
 
     #[test]
@@ -312,7 +325,7 @@ mod tests {
         let samples: Vec<i32> = (0..16_384).map(|index| (index % 1_024) - 512).collect();
         write_wv(&path, samples.clone(), 16, false);
 
-        let (mut source, _, _) = WavpackSource::open(&path).unwrap();
+        let (mut source, _, _) = WavpackSource::open(&path, None).unwrap();
         source
             .seek(Duration::from_secs_f64(8_192.0 / 48_000.0))
             .unwrap();

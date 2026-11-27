@@ -63,7 +63,7 @@ Serde compatibility: `Library` has container-level `#[serde(default)]` (`src/lib
 - `.github/workflows/windows-ci.yml`: `windows-latest`, `cargo fmt --check`, `cargo clippy --release --locked --all-targets -- -D warnings`, `cargo test --release --locked`; permissions `contents: read`.
 - `.github/workflows/deploy-theme-gallery.yml`: Pages deployment with OIDC; only on changes to `theme-gallery/**`.
 - `build.rs:1-8` embeds `assets/icon.ico` via `winresource` (only on a Windows host **and** Windows target); requires the MSVC resource compiler or MinGW `windres`/`ar` (`README.md:15`).
-- `Cargo.toml`: Edition 2024, `rust-player` v0.5.0, no `[profile.*]`, no `rust-toolchain.toml`, no `[dev-dependencies]`. Lockfile v4 with 425 packages, crates.io sources only.
+- `Cargo.toml`: Edition 2024, `rust-player` v0.5.0, no `[profile.*]`, no `rust-toolchain.toml`, no `[dev-dependencies]`. Lockfile v4 with 425 packages, crates.io sources only. **Superseded:** the version is now 0.7.0, `rust-toolchain.toml` pins 1.100.0, and `.gitattributes` exists; the absence of a `[profile.*]` override is still correct (Cargo's default release profile is used).
 
 ---
 
@@ -401,3 +401,16 @@ Auf ausdrücklichen Wunsch des Nutzers wurden die Facetten-Fixes aus Abschnitt 1
 - **Paket:** `scripts/package-release.ps1 -Version v0.6.1` grün inklusive `cargo fmt --check`, Clippy, Tests (**180 + 3 bestanden, 4 ignoriert**) und Release-Build. ZIP: `Rust-Player-v0.6.1-Windows-x64.zip`, SHA-256 `e11e1247c60eb2ebd0c3e6677a89db117d4be44381aa5d71b22212957f71621f`.
 - **Veröffentlichung:** Commit auf `ai/rust-player-improvements` gepusht, Tag `v0.6.1` erstellt und gepusht, GitHub-Release `https://github.com/AikasAcc/rust-player/releases/tag/v0.6.1` mit `prerelease = false` und den vier Assets veröffentlicht. Die Veröffentlichung lief erneut über die GitHub REST API mit einem Token aus dem lokalen Git Credential Manager; `gh` ist nicht installiert.
 - **Tabu:** Kein Merge, kein Branchwechsel, kein Force-Push, kein Überschreiben von `v0.6.0`. `android/` und `phase5-complete.patch` wurden nicht committet oder veröffentlicht. Hardware- und Hörtests bleiben wie zuvor dokumentiert und wurden nicht simuliert.
+
+---
+
+## 21. Stabile Version v0.7.0 veröffentlicht
+
+Auf ausdrücklichen Wunsch des Nutzers wurde der lokale Stand als eigene stabile Version veröffentlicht. Bereits veröffentlichte Tags wurden nicht verschoben; `v0.6.1`, `v0.6.0`, `v0.6.0-rc1` und `v0.5.0` bleiben unverändert.
+
+- **Version:** `Cargo.toml`, `Cargo.lock`, der Updater-Versionsvergleich und die Release-Texte wurden auf `0.7.0` bzw. `v0.7.0` angehoben.
+- **Umfang:** Explorer-Doppelklick, Liquid glass, gespeicherte Themes, Schrift-Fallbacks, Such- und codecbezogene Fixes, Stabilitätsfixes und vollständiges Windows-Paket. Der Standard-Klangpfad bleibt unverändert.
+- **Paket:** `scripts/package-release.ps1 -Version v0.7.0` aus einer sauberen Kopie ohne `android/`, `phase5-complete.patch` und `target/` grün. ZIP `Rust-Player-v0.7.0-Windows-x64.zip`, SHA-256 `3a30b02d71e4e9d68e4fd66b1f9b628fa1cea1f74d89976cef0d7b5049867535`. Updater-Asset `Rust-Player-v0.7.0-Windows-x64.exe`, SHA-256 `e96c5d3dd13f4712f9bc2168fafb3289a136f462f330581556e539005c9b5d99`.
+- **Verifikation:** Automated Checks liefen im Paket-Skript; Hardware-Capture und Hörtests bleiben ausdrücklich Nutzerprüfungen und wurden nicht simuliert.
+- **Veröffentlichung:** Commit auf `ai/rust-player-improvements` gepusht, Tag `v0.7.0` erstellt und gepusht, GitHub-Release über die REST API mit sechs Assets veröffentlicht. Ein laufender Player wurde nicht gestoppt.
+- **Tabu:** Kein Merge, kein Branchwechsel, kein Force-Push, kein Überschreiben älterer Tags. `android/` und `phase5-complete.patch` wurden nicht committet oder veröffentlicht.

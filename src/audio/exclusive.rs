@@ -159,6 +159,10 @@ impl Exclusive {
             }
             Err(_) => {
                 quit.store(true, Release);
+                // Closing the input channel releases the worker if it is still
+                // waiting for a consumer; join so no COM thread is leaked.
+                drop(input);
+                let _ = worker.join();
                 Err("Windows did not open the Exclusive audio endpoint in time".into())
             }
         }

@@ -62,6 +62,13 @@ fn tokens(input: &str) -> Vec<String> {
     result
 }
 
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
 fn parse_clause(token: &str) -> (Field, String, bool) {
     let (token, leading_not) = match token.strip_prefix('-') {
         Some(rest) => (rest, true),
@@ -81,14 +88,12 @@ fn parse_clause(token: &str) -> (Field, String, bool) {
             _ => Field::Any,
         };
         if field != Field::Any {
-            let value = value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-                .unwrap_or(value);
-            return (field, value.to_owned(), leading_not);
+            return (field, unquote(value).to_owned(), leading_not);
         }
     }
-    (Field::Any, token.to_owned(), leading_not)
+    // Plain quoted phrases must lose their quotes too; otherwise the literal
+    // quote characters become part of the searched value.
+    (Field::Any, unquote(token).to_owned(), leading_not)
 }
 
 impl Query {
@@ -110,6 +115,15 @@ impl Query {
             }
             let (field, value, leading_not) = parse_clause(&token);
             if value.is_empty() {
+                continue;
+            }
+            if field == Field::Missing
+                && !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "1" | "false" | "no" | "0"
+                )
+            {
+                // A typo such as `missing:tru` must not silently invert the filter.
                 continue;
             }
             groups.last_mut().expect("at least one group").push(Clause {
@@ -436,6 +450,24 @@ mod tests {
             toggle_clause("-artist:beatles", "artist", "Beatles"),
             "-artist:beatles artist:Beatles"
         );
+    }
+
+    #[test]
+    fn plain_quoted_phrases_match_without_their_quotes() {
+        let query = Query::compile("\"the beatles\"");
+        assert_eq!(query.groups[0][0].value, "the beatles");
+        assert!(query.matches(Some(&track()), Path::new("x.flac")));
+
+        let excluded = Query::compile("-\"the beatles\"");
+        assert!(!excluded.matches(Some(&track()), Path::new("x.flac")));
+        assert!(excluded.matches(Some(&TrackInfo::default()), Path::new("x.flac")));
+    }
+
+    #[test]
+    fn unknown_missing_values_are_ignored_instead_of_disabling_the_filter() {
+        assert!(Query::compile("missing:tru").groups.is_empty());
+        assert!(Query::compile("missing:tru").matches(Some(&track()), Path::new("x.flac")));
+        assert_eq!(Query::compile("missing:false").groups[0][0].value, "false");
     }
 
     #[test]

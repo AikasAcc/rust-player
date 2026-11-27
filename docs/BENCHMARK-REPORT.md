@@ -7,7 +7,7 @@ test processes. They are neither UI frame times nor audio measurements.
 ## Environment
 
 - Windows 11 Pro, AMD Ryzen 7 5700X (8 physical / 16 logical cores), 31.93 GiB RAM
-- Rust 1.100.0 (pinned via `rust-toolchain.toml`), release profile from `Cargo.toml`
+- Rust 1.100.0 (pinned via `rust-toolchain.toml`), Cargo's default release profile (no `[profile.release]` override in `Cargo.toml`)
 - One ignored test per process, `--test-threads=1`; inputs pass through `black_box`
 - Run `2026-11-26_072551`, commit `f0e05ad...` with a dirty worktree (the
   uncommitted TrackId/benchmark changes). The exact file list and tool versions are

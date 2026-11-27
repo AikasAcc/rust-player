@@ -1,7 +1,12 @@
 use crate::{Player, Track, TrackId};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, io::ErrorKind, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::ErrorKind,
+    path::Path,
+    time::Duration,
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Entry {
@@ -34,23 +39,37 @@ impl PlayQueue {
         };
         let mut queue: Self = serde_json::from_slice(&bytes)
             .map_err(|error| LoadError::Invalid(error.to_string()))?;
-        queue.next_id = queue
+        let highest = queue
             .entries
             .iter()
-            .map(|entry| entry.id.saturating_add(1))
+            .map(|entry| entry.id)
             .max()
-            .unwrap_or_default()
-            .max(queue.next_id);
+            .unwrap_or(0);
+        if highest == u64::MAX || queue.next_id == u64::MAX {
+            // No larger ID is representable. The IDs are private to this file,
+            // so renumber the saved rows rather than wrapping into duplicates.
+            for (index, entry) in queue.entries.iter_mut().enumerate() {
+                entry.id = index as u64;
+            }
+            queue.next_id = queue.entries.len() as u64;
+        } else {
+            queue.next_id = highest.saturating_add(1).max(queue.next_id);
+        }
         Ok(queue)
     }
 
+    fn next_free_id(&self) -> u64 {
+        let mut candidate = self.next_id;
+        while self.entries.iter().any(|entry| entry.id == candidate) {
+            candidate = candidate.checked_add(1).unwrap_or(1);
+        }
+        candidate
+    }
+
     pub fn push(&mut self, track: TrackId, title: String) {
-        self.entries.push_back(Entry {
-            id: self.next_id,
-            track,
-            title,
-        });
-        self.next_id += 1;
+        let id = self.next_free_id();
+        self.entries.push_back(Entry { id, track, title });
+        self.next_id = id.checked_add(1).unwrap_or(1);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -81,6 +100,27 @@ impl PlayQueue {
 
     pub fn retain(&mut self, keep: impl Fn(TrackId) -> bool) {
         self.entries.retain(|e| keep(e.track));
+    }
+
+    /// Stable IDs held in the added section, for fresh metadata lookups.
+    pub fn queued_tracks(&self) -> Vec<TrackId> {
+        self.entries.iter().map(|entry| entry.track).collect()
+    }
+
+    /// Refresh stored labels from freshly indexed metadata. A track without
+    /// metadata keeps its label so a transient index gap cannot blank the UI.
+    /// Returns whether anything changed, so the caller can persist only then.
+    pub fn refresh_titles(&mut self, titles: &HashMap<TrackId, String>) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            if let Some(title) = titles.get(&entry.track)
+                && *title != entry.title
+            {
+                entry.title.clone_from(title);
+                changed = true;
+            }
+        }
+        changed
     }
 }
 
@@ -446,6 +486,7 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::{LoadError, PlayQueue, TrackId, drop_target};
+    use std::collections::HashMap;
 
     #[test]
     fn a_missing_queue_file_is_not_reported_as_corrupt() {
@@ -516,6 +557,51 @@ mod tests {
         let existing = loaded.next().unwrap().0;
         loaded.push(TrackId(8), "B".into());
         assert_ne!(loaded.entries[1].id, existing);
+    }
+
+    #[test]
+    fn a_saturated_saved_id_is_renumbered_before_the_next_push() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.json");
+        let mut queue = PlayQueue::default();
+        queue.push(TrackId(1), "A".into());
+        let bytes = serde_json::to_vec(&queue).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["entries"][0]["id"] = serde_json::json!(u64::MAX);
+        value["next_id"] = serde_json::json!(u64::MAX);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let mut loaded = PlayQueue::load(&path).unwrap();
+        loaded.push(TrackId(2), "B".into());
+        let ids: Vec<_> = loaded.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn fresh_metadata_refreshes_stored_titles_and_reports_the_change() {
+        let mut queue = PlayQueue::default();
+        queue.push(TrackId(1), "Old title".into());
+        queue.push(TrackId(2), "Second".into());
+        let id = queue.next().unwrap().0;
+        let titles = HashMap::from([(TrackId(1), "New title".to_string())]);
+
+        assert_eq!(queue.queued_tracks(), vec![TrackId(1), TrackId(2)]);
+        assert!(queue.refresh_titles(&titles));
+        assert_eq!(queue.entries[0].id, id);
+        assert_eq!(queue.entries[0].title, "New title");
+        assert_eq!(queue.entries[1].title, "Second");
+        assert!(!queue.refresh_titles(&titles));
+    }
+
+    #[test]
+    fn missing_metadata_keeps_a_queued_title() {
+        let mut queue = PlayQueue::default();
+        queue.push(TrackId(1), "Keep me".into());
+        assert!(!queue.refresh_titles(&HashMap::new()));
+        assert_eq!(queue.entries.front().unwrap().title, "Keep me");
+        assert_eq!(queue.next(), Some((0, TrackId(1))));
     }
 
     #[test]

@@ -1,4 +1,7 @@
-use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
+use eframe::egui::{
+    self, Color32, Mesh, Pos2, Rect, Shape, Vec2,
+    epaint::{Vertex, WHITE_UV},
+};
 use image::{AnimationDecoder, DynamicImage, ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +25,8 @@ const MAX_BLUR: u8 = 24;
 const BLUR_SETTLE: Duration = Duration::from_millis(90);
 const FRAME_INTERVAL: Duration = Duration::from_millis(34);
 const BLUR_CYCLE: f64 = 6.0;
+const LIQUID_CYCLE: f64 = 16.0;
+const LIQUID_AMPLITUDE: f32 = 0.012;
 
 pub fn supported(path: &Path) -> bool {
     path.extension()
@@ -61,6 +66,9 @@ pub struct Settings {
     opacity: f32,
     blur: u8,
     animate_blur: bool,
+    liquid: bool,
+    liquid_strength: f32,
+    liquid_speed: f32,
     pause_unfocused: bool,
 }
 
@@ -75,6 +83,9 @@ impl Default for Settings {
             opacity: 1.0,
             blur: 0,
             animate_blur: false,
+            liquid: false,
+            liquid_strength: 0.6,
+            liquid_speed: 1.0,
             pause_unfocused: true,
         }
     }
@@ -161,6 +172,18 @@ impl Settings {
                     .suffix(" px"),
             );
             ui.checkbox(&mut self.animate_blur, "Animate blur");
+            ui.checkbox(&mut self.liquid, "Liquid glass")
+                .on_hover_text("Adds a slow refractive sheen, like light moving over glass.");
+            if self.liquid {
+                ui.add(
+                    egui::Slider::new(&mut self.liquid_strength, 0.0..=1.0).text("Glass strength"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.liquid_speed, 0.1..=3.0)
+                        .text("Flow speed")
+                        .suffix("×"),
+                );
+            }
             ui.checkbox(
                 &mut self.pause_unfocused,
                 "Pause animation when the player loses focus",
@@ -307,6 +330,7 @@ pub struct Preview {
     frame: usize,
     elapsed: f64,
     motion_time: f64,
+    liquid_time: f64,
     updated_at: Option<Instant>,
     status: String,
 }
@@ -352,6 +376,7 @@ impl Preview {
                 self.frame = 0;
                 self.elapsed = 0.0;
                 self.motion_time = 0.0;
+                self.liquid_time = 0.0;
                 self.updated_at = None;
             }
             self.status.clear();
@@ -429,9 +454,12 @@ impl Preview {
             }
             return;
         };
+        let strength = settings.liquid_strength.clamp(0.0, 1.0);
+        let speed = settings.liquid_speed.clamp(0.0, 3.0);
+        let liquid = settings.liquid && strength > 0.0 && speed > 0.0;
         let motion = settings.animate_blur && clip.frames[self.frame].blurred.is_some();
         let animated_image = clip.frames.len() > 1;
-        if !animated_image && !motion {
+        if !animated_image && !motion && !liquid {
             self.updated_at = None;
             return;
         }
@@ -451,6 +479,10 @@ impl Preview {
             if motion {
                 self.motion_time = (self.motion_time + delta) % BLUR_CYCLE;
             }
+            if liquid {
+                // Never wrap this phase: a modulo restart makes the sheen jump.
+                self.liquid_time += delta * f64::from(speed);
+            }
         }
         if animated_image {
             self.frame = clip
@@ -458,7 +490,7 @@ impl Preview {
                 .partition_point(|&end| end <= self.elapsed)
                 .min(clip.frames.len() - 1);
         }
-        if motion {
+        if motion || liquid {
             ctx.request_repaint_after(FRAME_INTERVAL);
         } else {
             let wait = Duration::from_secs_f64((clip.ends[self.frame] - self.elapsed).max(0.0));
@@ -487,14 +519,26 @@ impl Preview {
             opacity,
             blurred.map_or(0.0, |_| blur_weight(self.motion_time)),
         );
+        let strength = settings.liquid_strength.clamp(0.0, 1.0);
+        let liquid = settings.liquid && strength > 0.0;
+        let phase = (self.liquid_time / LIQUID_CYCLE) as f32;
+        let render_layer = |id, area, uv, color| {
+            if liquid {
+                painter.add(Shape::Mesh(Arc::new(liquid_mesh(
+                    id, area, uv, color, phase, strength,
+                ))));
+            } else {
+                painter.image(id, area, uv, color);
+            }
+        };
         let render = |area, uv| {
             if base > 0.0 {
-                painter.image(frame.base.id(), area, uv, tint(base));
+                render_layer(frame.base.id(), area, uv, tint(base));
             }
             if let Some(blurred) = blurred
                 && overlay > 0.0
             {
-                painter.image(blurred.id(), area, uv, tint(overlay));
+                render_layer(blurred.id(), area, uv, tint(overlay));
             }
         };
         let scale = rect.size() / size;
@@ -529,11 +573,120 @@ impl Preview {
             0.0,
             Color32::from_black_alpha((settings.dim.clamp(0.0, 1.0) * 255.0) as u8),
         );
+        if liquid {
+            painter.add(Shape::Mesh(Arc::new(glass_mesh(rect, phase, strength))));
+        }
     }
 }
 
 fn tint(opacity: f32) -> Color32 {
     Color32::from_white_alpha((opacity * 255.0).round() as u8)
+}
+
+/// Build a lightly distorted copy of an image draw call. The on-screen quad
+/// stays in place while its texture coordinates flow, so there are no gaps at
+/// the edges and no extra texture uploads per frame.
+fn liquid_mesh(
+    texture: egui::TextureId,
+    area: Rect,
+    uv: Rect,
+    color: Color32,
+    phase: f32,
+    strength: f32,
+) -> Mesh {
+    let columns = ((area.width() / 28.0).round() as u32).clamp(2, 48);
+    let rows = ((area.height() / 28.0).round() as u32).clamp(2, 32);
+    let mut mesh = Mesh::with_texture(texture);
+    mesh.reserve_vertices(((columns + 1) * (rows + 1)) as usize);
+    mesh.reserve_triangles((columns * rows * 2) as usize);
+
+    for row in 0..=rows {
+        let t = row as f32 / rows as f32;
+        for column in 0..=columns {
+            let s = column as f32 / columns as f32;
+            mesh.vertices.push(Vertex {
+                pos: Pos2::new(
+                    area.min.x + area.width() * s,
+                    area.min.y + area.height() * t,
+                ),
+                uv: displaced_uv(uv, s, t, phase, strength),
+                color,
+            });
+        }
+    }
+
+    let stride = columns + 1;
+    for row in 0..rows {
+        for column in 0..columns {
+            let index = row * stride + column;
+            mesh.add_triangle(index, index + 1, index + stride);
+            mesh.add_triangle(index + stride, index + 1, index + stride + 1);
+        }
+    }
+    mesh
+}
+
+fn displaced_uv(uv: Rect, s: f32, t: f32, phase: f32, strength: f32) -> Pos2 {
+    let tau = std::f32::consts::TAU;
+    let horizontal = 0.7 * (tau * (t * 0.8 + phase)).sin()
+        + 0.3 * (tau * (s * 0.45 - t * 0.3 + phase * 0.6)).sin();
+    let vertical = 0.7 * (tau * (s * 0.7 - phase * 0.8)).sin()
+        + 0.3 * (tau * (s * 0.3 + t * 0.5 + phase * 0.5)).sin();
+    let base_x = uv.min.x + s * uv.width();
+    let base_y = uv.min.y + t * uv.height();
+    Pos2::new(
+        (base_x + horizontal * strength * LIQUID_AMPLITUDE * uv.width()).clamp(uv.min.x, uv.max.x),
+        (base_y + vertical * strength * LIQUID_AMPLITUDE * uv.height()).clamp(uv.min.y, uv.max.y),
+    )
+}
+
+/// A translucent highlight mesh drawn above the darkened wallpaper. The alpha
+/// gradient forms a soft diagonal sheen plus a faint rim light, which reads as
+/// glossy glass instead of moving water.
+fn glass_mesh(area: Rect, phase: f32, strength: f32) -> Mesh {
+    let columns = ((area.width() / 32.0).round() as u32).clamp(2, 40);
+    let rows = ((area.height() / 32.0).round() as u32).clamp(2, 28);
+    let mut mesh = Mesh::with_texture(egui::TextureId::default());
+    mesh.reserve_vertices(((columns + 1) * (rows + 1)) as usize);
+    mesh.reserve_triangles((columns * rows * 2) as usize);
+
+    for row in 0..=rows {
+        let t = row as f32 / rows as f32;
+        for column in 0..=columns {
+            let s = column as f32 / columns as f32;
+            mesh.vertices.push(Vertex {
+                pos: Pos2::new(
+                    area.min.x + area.width() * s,
+                    area.min.y + area.height() * t,
+                ),
+                uv: WHITE_UV,
+                color: glass_tint(s, t, phase, strength),
+            });
+        }
+    }
+
+    let stride = columns + 1;
+    for row in 0..rows {
+        for column in 0..columns {
+            let index = row * stride + column;
+            mesh.add_triangle(index, index + 1, index + stride);
+            mesh.add_triangle(index + stride, index + 1, index + stride + 1);
+        }
+    }
+    mesh
+}
+
+fn glass_tint(s: f32, t: f32, phase: f32, strength: f32) -> Color32 {
+    let tau = std::f32::consts::TAU;
+    let diagonal = s * 0.7 + t * 0.45 - phase * 0.22;
+    let sheen = (0.5 + 0.5 * (tau * diagonal).cos()).powf(10.0);
+    let edge_x = (s * (1.0 - s) * 4.0).max(0.0).sqrt();
+    let edge_y = (t * (1.0 - t) * 4.0).max(0.0).sqrt();
+    let rim = (1.0 - edge_x * edge_y).powf(4.0);
+    let alpha = ((0.14 * sheen + 0.07 * rim) * strength * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(210, 235, 255, alpha)
 }
 
 fn blur_weight(time: f64) -> f32 {
@@ -831,6 +984,43 @@ mod tests {
         assert_eq!(red, 0);
         assert!(blue > 200 && (0..255).contains(&alpha));
         assert!(alpha > 0);
+    }
+
+    #[test]
+    fn liquid_glass_stays_continuous_and_inside_the_crop() {
+        let mut settings: Settings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(!settings.liquid);
+        assert_eq!(settings.liquid_strength, 0.6);
+        assert_eq!(settings.liquid_speed, 1.0);
+        settings.liquid = true;
+        settings.liquid_strength = 0.8;
+        let saved: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert!(saved.liquid);
+        assert_eq!(saved.liquid_strength, 0.8);
+
+        let crop = Rect::from_min_max(Pos2::new(0.2, 0.1), Pos2::new(0.8, 0.9));
+        let still = displaced_uv(crop, 0.5, 0.5, 0.25, 0.0);
+        assert!((still.x - 0.5).abs() < 1e-6 && (still.y - 0.5).abs() < 1e-6);
+        let first = displaced_uv(crop, 0.3, 0.6, 0.1, 1.0);
+        let later = displaced_uv(crop, 0.3, 0.6, 0.4, 1.0);
+        assert_ne!(first, later);
+        for point in [first, later] {
+            assert!(point.x >= crop.min.x && point.x <= crop.max.x);
+            assert!(point.y >= crop.min.y && point.y <= crop.max.y);
+        }
+
+        let before = displaced_uv(crop, 0.3, 0.6, 0.999, 1.0);
+        let after = displaced_uv(crop, 0.3, 0.6, 1.001, 1.0);
+        assert!((before.x - after.x).abs() < 0.01);
+        assert!((before.y - after.y).abs() < 0.01);
+
+        assert_eq!(glass_tint(0.04, 0.04, 0.2, 0.0).a(), 0);
+        assert!(glass_tint(0.04, 0.04, 0.2, 1.0).a() > 0);
+        assert_ne!(
+            glass_tint(0.04, 0.04, 0.2, 1.0),
+            glass_tint(0.04, 0.04, 0.5, 1.0)
+        );
     }
 
     #[test]

@@ -57,7 +57,10 @@ fn iterator(reader: &DsdReader, out_block: u32) -> Result<DsdIter, String> {
 }
 
 impl DsdSource {
-    pub(super) fn open(path: &Path) -> Result<(Self, SourceFormat, Option<Duration>), String> {
+    pub(super) fn open(
+        path: &Path,
+        gain: Option<f32>,
+    ) -> Result<(Self, SourceFormat, Option<Duration>), String> {
         let (reader, rate, channels, duration) = open_container(path)?;
         let decimator = Decimator::new(rate, channels).map_err(|error| error.to_string())?;
         let input_block = reader.block_size().max(1);
@@ -80,7 +83,7 @@ impl DsdSource {
             mask,
             bits: None,
             kind: SampleKind::Float32,
-            gain: None,
+            gain,
         };
         Ok((
             Self {
@@ -283,7 +286,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("silent.dsf");
         write_dsf(&path, 1, None);
-        let (mut source, info, duration) = DsdSource::open(&path).unwrap();
+        let (mut source, info, duration) = DsdSource::open(&path, None).unwrap();
         assert_eq!(info.rate, 88_200);
         assert_eq!(info.channels, 2);
         assert_eq!(info.kind, SampleKind::Float32);
@@ -305,7 +308,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("long.dsf");
         write_dsf(&path, 4, None);
-        let (mut source, _, _) = DsdSource::open(&path).unwrap();
+        let (mut source, _, _) = DsdSource::open(&path, None).unwrap();
         let first = source.next::<f32>().unwrap().expect("first block").len();
         source
             .seek(Duration::from_secs_f64(0.0058))

@@ -54,7 +54,9 @@ fn replace() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     install(staged, &target)?;
-    fs::remove_file(source)?;
+    // The new player is already installed and running. A stale staged file is
+    // cosmetic; failing the whole update here would misreport success.
+    let _ = fs::remove_file(source);
     Ok(())
 }
 

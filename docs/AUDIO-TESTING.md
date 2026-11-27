@@ -2,12 +2,12 @@
 
 Run `cargo build --release --locked`, `cargo fmt --check`, `cargo clippy --release --locked --all-targets`, and `cargo test --release --locked` on Windows x64.
 
-The hardware-free tests validate resampler output length and a complete WAV decode, resample and render through the Null backend. Hardware tests cover Windows 10 and 11 independently.
+The hardware-free tests validate resampler output length and a complete WAV decode, resample and render through the Null backend. Hardware checks are performed on Windows 10 and 11 by the user or a named maintainer; they remain outstanding unless dated results are recorded. Do not describe them as completed by the build or by the release workflow.
 
 - Select the Windows default output. Play a stereo WAV and confirm the rate, channel count, output format and buffer in **Settings → Audio**. Try a different source rate and confirm that sinc resampling becomes active.
 - If two outputs are available, switch between them during playback. Check that the title and position are retained, playback is paused and resuming does not count the title again.
 - With a saved device selected, disconnect it and verify fallback to the Windows default. Reconnect it and verify that the saved preference is restored. Repeat with **Windows default** selected and change the default in Windows Sound Settings.
-- Seek forward and backward, pause and resume, and close and reopen the player. Check the paused position, saved volume, shuffle and title sorting, play counts, local lyrics, the example Rhai plugin, and the taskbar and Windows media controls.
+- Seek forward and backward, pause and resume, and close and reopen the player. Check the paused position, saved volume, shuffle and title sorting, play counts, local lyrics, the repository-only example Rhai plugin (not in the release ZIP), and the taskbar and Windows media controls.
 - Test Discord Presence with an opted-in desktop client. Verify track changes, seek position updates and clearing on pause.
 - Play while scrolling a large playlist and watch the underrun counter. On an Audient iD4 MKII, check 44.1, 48, 88.2 and 96 kHz source material. Shared output follows the Windows mix format.
 
